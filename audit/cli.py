@@ -18,12 +18,18 @@ from rich.table import Table
 from audit.auth import AuthError, configure_auth
 
 
+_FALSY_ENV = {"", "0", "false", "no", "off"}
+
+
 def _allow_api_key_from_env_or_flag(flag: bool) -> bool:
     """A user may opt into api_key mode via --allow-api-key OR via
-    AUDIT_ALLOW_API_KEY=1 in the env. Either is sufficient."""
+    AUDIT_ALLOW_API_KEY in the env. Either is sufficient. Env parsing is
+    case-insensitive and treats the usual negatives (no/off/0/false) as
+    opt-out, so `AUDIT_ALLOW_API_KEY=no` never silently enables metered
+    billing."""
     if flag:
         return True
-    return os.environ.get("AUDIT_ALLOW_API_KEY", "").strip() not in ("", "0", "false", "False")
+    return os.environ.get("AUDIT_ALLOW_API_KEY", "").strip().lower() not in _FALSY_ENV
 from audit.config import load_config
 from audit.orchestrator import CostExceeded, run_pipeline
 from audit.state import StateDB
@@ -264,6 +270,19 @@ def _show_run_detail(db: StateDB, run_id: str) -> None:
     console.print(t)
 
 
+def _code_fence(content: str) -> str:
+    """A backtick fence long enough to survive any run of backticks inside
+    `content`: target-influenced evidence that contains ``` must not be
+    able to close the code block early and inject markdown into the
+    rendered report."""
+    longest = 0
+    run = 0
+    for ch in content:
+        run = run + 1 if ch == "`" else 0
+        longest = max(longest, run)
+    return "`" * max(3, longest + 1)
+
+
 def _render_markdown_report(report: dict) -> str:
     lines: list[str] = []
     lines.append(f"# Vulnerability report — `{report['run_id']}`")
@@ -283,9 +302,10 @@ def _render_markdown_report(report: dict) -> str:
         lines.append("")
         lines.append(f["description"])
         lines.append("")
-        lines.append("```")
+        fence = _code_fence(f["evidence"])
+        lines.append(fence)
         lines.append(f["evidence"])
-        lines.append("```")
+        lines.append(fence)
         lines.append("")
         ep = f["trace"].get("entry_points", [])
         if ep:
