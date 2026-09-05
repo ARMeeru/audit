@@ -262,3 +262,47 @@ def test_anthropic_base_url_does_not_trigger_gateway(
     assert status.auth_mode == "oauth_token"
     assert status.auth_token_scrubbed is True
     assert "ANTHROPIC_AUTH_TOKEN" not in os.environ
+
+
+# ---------- gateway base-url classification (lookalike hosts) ----------
+
+
+def test_is_gateway_base_lookalike_host_is_gateway() -> None:
+    """A hostname that merely CONTAINS 'anthropic.com' is not Anthropic:
+    the substring check used to fail open and leave a hostile base URL
+    active while scrubbing ANTHROPIC_AUTH_TOKEN."""
+    assert auth_mod._is_gateway_base("https://api.anthropic.com.evil.net") is True
+    assert auth_mod._is_gateway_base("https://api.anthropic.com") is False
+    assert auth_mod._is_gateway_base("") is False
+    # scheme-less values are treated as https
+    assert auth_mod._is_gateway_base("api.z.ai/api/anthropic") is True
+
+
+def test_configure_auth_lookalike_base_url_uses_gateway_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With a lookalike base URL + auth token, gateway mode must win (the
+    user-configured token goes to that host; subscription credentials must
+    never be attached to it)."""
+    _require_claude_cli()
+    _clear_all_auth_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com.evil.net")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "sk-user-token")
+    status = configure_auth(env_file=_empty_env(tmp_path), allow_api_key=False)
+    assert status.auth_mode == "gateway"
+    assert status.gateway_base_url == "https://api.anthropic.com.evil.net"
+
+
+def test_configure_auth_base_url_without_token_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A non-Anthropic BASE_URL with no AUTH_TOKEN is a misconfiguration:
+    subscription credentials must never be pointed at a foreign host, so
+    configure_auth raises instead of scrubbing the token and proceeding."""
+    _require_claude_cli()
+    _clear_all_auth_env(monkeypatch)
+    _force_non_macos(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://attacker.example")
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    with pytest.raises(AuthError, match="non-Anthropic host"):
+        configure_auth(env_file=_empty_env(tmp_path), allow_api_key=False)

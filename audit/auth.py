@@ -51,6 +51,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -75,13 +76,20 @@ CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 
 
 def _is_gateway_base(url: str) -> bool:
-    """A non-empty BASE_URL that doesn't point at canonical Anthropic
-    counts as 'gateway mode'."""
-    u = url.strip().lower()
+    """A non-empty BASE_URL whose hostname is not canonical Anthropic
+    counts as 'gateway mode'.
+
+    The comparison is on the parsed hostname, not a substring: a lookalike
+    like `https://api.anthropic.com.evil.net` must classify as a gateway,
+    otherwise configure_auth scrubs ANTHROPIC_AUTH_TOKEN but keeps the
+    hostile base URL active for the SDK's CLI."""
+    u = (url or "").strip().lower()
     if not u:
         return False
-    # Treat anything except api.anthropic.com / console.anthropic.com as gateway.
-    return "anthropic.com" not in u
+    if "://" not in u:
+        u = f"https://{u}"
+    host = urlparse(u).hostname or ""
+    return host != "api.anthropic.com"
 
 
 def configure_auth(
@@ -151,6 +159,19 @@ def configure_auth(
         if "ANTHROPIC_AUTH_TOKEN" in os.environ:
             del os.environ["ANTHROPIC_AUTH_TOKEN"]
             auth_token_was_scrubbed = True
+
+        # A non-Anthropic BASE_URL without an AUTH_TOKEN is a
+        # misconfiguration: subscription credentials must never be pointed
+        # at a foreign host, so fail closed instead of letting the SDK's
+        # CLI run against it with the active login.
+        if _is_gateway_base(base_url):
+            raise AuthError(
+                f"ANTHROPIC_BASE_URL points at a non-Anthropic host ({base_url})\n"
+                "but ANTHROPIC_AUTH_TOKEN is not set. Subscription credentials\n"
+                "are never sent to a custom host: either set ANTHROPIC_AUTH_TOKEN\n"
+                "for the gateway, or unset ANTHROPIC_BASE_URL to use subscription\n"
+                "billing."
+            )
 
         token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
         creds_file = CREDENTIALS_PATH if CREDENTIALS_PATH.exists() else None
