@@ -242,10 +242,14 @@ async def _run_agent_once(
                 label, exc_cls = _classify_api_error(last_text)
                 _write_artifact(art, {"kind": "api_error", "classification": label,
                                       "text": last_text[:1000]})
-                raise exc_cls(
+                e = exc_cls(
                     f"[{stage}/{artifact_name}] {label}: "
                     f"{(last_text or '').strip()[:300]}"
                 )
+                # The attempt still spent API usage; carry the result
+                # message so stages can record it against the run's costs.
+                e.result_msg = last_result_msg
+                raise e
 
             attempts = 0
             errors = _validate(last_text, schema_file)
@@ -262,18 +266,22 @@ async def _run_agent_once(
                     _write_artifact(art, {"kind": "api_error_on_repair",
                                           "classification": label,
                                           "text": last_text[:1000]})
-                    raise exc_cls(
+                    e = exc_cls(
                         f"[{stage}/{artifact_name}] {label} on repair turn: "
                         f"{(last_text or '').strip()[:300]}"
                     )
+                    e.result_msg = last_result_msg
+                    raise e
                 errors = _validate(last_text, schema_file)
 
             if errors:
                 _write_artifact(art, {"kind": "schema_errors", "errors": errors})
-                raise AgentRunError(
+                e = AgentRunError(
                     f"[{stage}/{artifact_name}] schema validation failed after "
                     f"{repair_attempts} repair attempts: {errors[:5]}"
                 )
+                e.result_msg = last_result_msg
+                raise e
 
             payload = extract_json(last_text)
             _write_artifact(art, {"kind": "final_payload", "payload": payload})
