@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 
 CREATE TABLE IF NOT EXISTS findings (
-    finding_id TEXT PRIMARY KEY,
+    finding_id TEXT NOT NULL,
     task_id TEXT NOT NULL,
     run_id TEXT NOT NULL,
     file TEXT NOT NULL,
@@ -63,24 +63,27 @@ CREATE TABLE IF NOT EXISTS findings (
     validation_json TEXT,
     group_id TEXT,
     is_canonical INTEGER DEFAULT 0,
+    PRIMARY KEY (run_id, finding_id),
     FOREIGN KEY (task_id) REFERENCES tasks(task_id)
 );
 
 CREATE TABLE IF NOT EXISTS traces (
-    finding_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    finding_id TEXT NOT NULL,
     reachable INTEGER NOT NULL,
     confidence REAL,
     rationale TEXT,
     raw_json TEXT NOT NULL,
-    FOREIGN KEY (finding_id) REFERENCES findings(finding_id)
+    PRIMARY KEY (run_id, finding_id)
 );
 
 CREATE TABLE IF NOT EXISTS dedupe_groups (
-    group_id TEXT PRIMARY KEY,
+    group_id TEXT NOT NULL,
     run_id TEXT NOT NULL,
     root_cause TEXT NOT NULL,
     canonical_finding_id TEXT NOT NULL,
     raw_json TEXT NOT NULL,
+    PRIMARY KEY (run_id, group_id),
     FOREIGN KEY (run_id) REFERENCES runs(run_id)
 );
 
@@ -159,7 +162,61 @@ class StateDB:
         self._conn = sqlite3.connect(str(self.path))
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
+        self._migrate_legacy_schema()
         self._conn.commit()
+
+    def _migrate_legacy_schema(self) -> None:
+        """Rebuild tables whose PRIMARY KEY predated run-scoped ids.
+
+        finding_id and group_id were globally unique keys while their values
+        are model-emitted and only unique per run, so two runs sharing this
+        db silently dropped each other's rows. Columns are mapped by name;
+        legacy traces had no run_id column, so theirs is derived by joining
+        findings (migrated first, whose legacy rows carry it)."""
+        legacy = (
+            ("findings", "PRIMARY KEY (run_id, finding_id)", None),
+            ("traces", "PRIMARY KEY (run_id, finding_id)",
+             # legacy traces lack run_id: derive it from findings, whose
+             # legacy rows are migrated first and hold globally-unique ids
+             "SELECT f.run_id AS run_id, t.finding_id AS finding_id, "
+             "t.reachable AS reachable, t.confidence AS confidence, "
+             "t.rationale AS rationale, t.raw_json AS raw_json "
+             "FROM {table}_legacy t JOIN findings f ON f.finding_id = t.finding_id"),
+            ("dedupe_groups", "PRIMARY KEY (run_id, group_id)", None),
+        )
+        indexes = {
+            "findings": ("idx_findings_run", "idx_findings_validation", "idx_findings_group"),
+        }
+        migrated = False
+        for table, marker, custom_select in legacy:
+            row = self._conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            ).fetchone()
+            if row is None or marker in row["sql"]:
+                continue
+            for idx in indexes.get(table, ()):
+                self._conn.execute(f"DROP INDEX IF EXISTS {idx}")
+            self._conn.execute(f"ALTER TABLE {table} RENAME TO {table}_legacy")
+            self._conn.executescript(SCHEMA)
+            new_cols = [r["name"] for r in self._conn.execute(f"PRAGMA table_info({table})").fetchall()]
+            if custom_select:
+                self._conn.execute(
+                    f"INSERT INTO {table} ({', '.join(new_cols)}) "
+                    f"{custom_select.format(table=table)}"
+                )
+            else:
+                legacy_cols = [
+                    r["name"] for r in self._conn.execute(f"PRAGMA table_info({table}_legacy)").fetchall()
+                ]
+                self._conn.execute(
+                    f"INSERT OR IGNORE INTO {table} ({', '.join(new_cols)}) "
+                    f"SELECT {', '.join(legacy_cols)} FROM {table}_legacy"
+                )
+            self._conn.execute(f"DROP TABLE {table}_legacy")
+            migrated = True
+        if migrated:
+            self._conn.commit()
 
     # ---------- runs ----------
 
@@ -284,14 +341,29 @@ class StateDB:
 
     def add_finding(self, run_id: str, task_id: str, finding: dict) -> None:
         poc = finding.get("poc") or {}
+        base = finding["finding_id"]
+        fid = base
+        n = 1
+        while self._conn.execute(
+            "SELECT 1 FROM findings WHERE run_id = ? AND finding_id = ?",
+            (run_id, fid),
+        ).fetchone():
+            # Model-emitted ids are only unique per task by prompt
+            # convention; two tasks may emit the same id. Keep both
+            # findings by suffixing, and keep raw_json consistent so
+            # downstream stages reference the rewritten id.
+            n += 1
+            fid = f"{base}_{n}"
+        if fid != base:
+            finding = dict(finding, finding_id=fid)
         self._conn.execute(
-            """INSERT OR IGNORE INTO findings
+            """INSERT INTO findings
             (finding_id, task_id, run_id, file, line_start, line_end,
              vuln_class, severity, description, evidence, poc_succeeded,
              confidence, raw_json)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                finding["finding_id"],
+                fid,
                 task_id,
                 run_id,
                 finding["file"],
@@ -327,19 +399,21 @@ class StateDB:
         ).fetchall()
         return [self._row_to_finding(r) for r in rows]
 
-    def set_finding_validation(self, finding_id: str, status: str, payload: dict) -> None:
+    def set_finding_validation(self, run_id: str, finding_id: str, status: str, payload: dict) -> None:
         self._conn.execute(
-            "UPDATE findings SET validation_status = ?, validation_json = ? WHERE finding_id = ?",
-            (status, json.dumps(payload), finding_id),
+            "UPDATE findings SET validation_status = ?, validation_json = ? "
+            "WHERE run_id = ? AND finding_id = ?",
+            (status, json.dumps(payload), run_id, finding_id),
         )
         self._conn.commit()
 
     def assign_finding_group(
-        self, finding_id: str, group_id: str, is_canonical: bool
+        self, run_id: str, finding_id: str, group_id: str, is_canonical: bool
     ) -> None:
         self._conn.execute(
-            "UPDATE findings SET group_id = ?, is_canonical = ? WHERE finding_id = ?",
-            (group_id, 1 if is_canonical else 0, finding_id),
+            "UPDATE findings SET group_id = ?, is_canonical = ? "
+            "WHERE run_id = ? AND finding_id = ?",
+            (group_id, 1 if is_canonical else 0, run_id, finding_id),
         )
         self._conn.commit()
 
@@ -367,12 +441,13 @@ class StateDB:
 
     # ---------- traces ----------
 
-    def add_trace(self, finding_id: str, payload: dict) -> None:
+    def add_trace(self, run_id: str, finding_id: str, payload: dict) -> None:
         self._conn.execute(
             """INSERT OR REPLACE INTO traces
-            (finding_id, reachable, confidence, rationale, raw_json)
-            VALUES (?, ?, ?, ?, ?)""",
+            (run_id, finding_id, reachable, confidence, rationale, raw_json)
+            VALUES (?, ?, ?, ?, ?, ?)""",
             (
+                run_id,
                 finding_id,
                 1 if payload.get("reachable") else 0,
                 payload.get("confidence"),
@@ -382,16 +457,17 @@ class StateDB:
         )
         self._conn.commit()
 
-    def get_trace(self, finding_id: str) -> dict | None:
+    def get_trace(self, run_id: str, finding_id: str) -> dict | None:
         row = self._conn.execute(
-            "SELECT raw_json FROM traces WHERE finding_id = ?", (finding_id,)
+            "SELECT raw_json FROM traces WHERE run_id = ? AND finding_id = ?",
+            (run_id, finding_id),
         ).fetchone()
         return json.loads(row["raw_json"]) if row else None
 
     def get_reachable_canonical_findings(self, run_id: str) -> list[tuple[Finding, dict]]:
         out: list[tuple[Finding, dict]] = []
         for f in self.get_findings(run_id, validation_status="confirmed", canonical_only=True):
-            tr = self.get_trace(f.finding_id)
+            tr = self.get_trace(run_id, f.finding_id)
             if tr and tr.get("reachable"):
                 out.append((f, tr))
         return out

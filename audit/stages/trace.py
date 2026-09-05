@@ -7,7 +7,7 @@ import logging
 
 from audit.runner import AgentRunError, TransientAgentError, run_agent
 from audit.state import Finding, StateDB
-from audit.stages._common import StageContext, truncated_recon_summary
+from audit.stages._common import StageContext, record_failure_cost, truncated_recon_summary
 
 log = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ async def run_trace(ctx: StageContext, db: StateDB) -> int:
 
     async def _one(f: Finding) -> None:
         async with sem:
-            if db.get_trace(f.finding_id) is not None:
+            if db.get_trace(ctx.run_id, f.finding_id) is not None:
                 return  # already traced (resume)
             user_input = {
                 "finding": f.raw_json,
@@ -58,17 +58,15 @@ async def run_trace(ctx: StageContext, db: StateDB) -> int:
             except (AgentRunError, TransientAgentError) as e:
                 log.warning("[%s] trace %s failed: %s", ctx.run_id, f.finding_id, e)
                 counters["failed"] += 1
-                # Conservative: mark unreachable on failure.
-                db.add_trace(f.finding_id, {
-                    "finding_id": f.finding_id, "reachable": False,
-                    "confidence": 0.0,
-                    "rationale": f"tracer failed: {e}",
-                    "blockers": [{"kind": "other", "location": "tracer",
-                                  "description": "agent failed to emit valid trace"}],
-                })
+                # Do NOT persist an unreachable verdict for a failed tracer:
+                # that would permanently hide the finding from every future
+                # report (resume skips findings that already have a trace
+                # row). Leaving no trace lets --resume re-attempt it. The
+                # real API spend still gets recorded.
+                record_failure_cost(db, ctx.run_id, "trace", f.finding_id, e)
                 return
 
-            db.add_trace(f.finding_id, result.payload)
+            db.add_trace(ctx.run_id, f.finding_id, result.payload)
             db.record_cost(ctx.run_id, "trace", f.finding_id, result.raw_result_message)
             db.add_artifact(ctx.run_id, "trace", f.finding_id, "jsonl",
                             str(result.artifact_path))

@@ -6,7 +6,7 @@ import logging
 
 from audit.runner import AgentRunError, TransientAgentError, run_agent
 from audit.state import StateDB
-from audit.stages._common import StageContext
+from audit.stages._common import StageContext, record_failure_cost
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +45,7 @@ async def run_dedupe(ctx: StageContext, db: StateDB) -> int:
     except (AgentRunError, TransientAgentError) as e:
         log.warning("[%s] dedupe failed: %s — treating each finding as its own group",
                     ctx.run_id, e)
+        record_failure_cost(db, ctx.run_id, "dedupe", None, e)
         # Fallback: one group per finding, all canonical.
         for f in confirmed:
             gid = f"g_{f.finding_id[2:]}" if f.finding_id.startswith("f_") else f"g_{f.finding_id}"
@@ -54,7 +55,7 @@ async def run_dedupe(ctx: StageContext, db: StateDB) -> int:
                 "canonical_finding_id": f.finding_id,
                 "member_finding_ids": [f.finding_id],
             })
-            db.assign_finding_group(f.finding_id, gid, True)
+            db.assign_finding_group(ctx.run_id, f.finding_id, gid, True)
         return len(confirmed)
 
     groups = result.payload.get("groups", [])
@@ -64,7 +65,13 @@ async def run_dedupe(ctx: StageContext, db: StateDB) -> int:
         db.add_dedupe_group(ctx.run_id, g)
         canonical = g["canonical_finding_id"]
         for fid in g["member_finding_ids"]:
-            db.assign_finding_group(fid, g["group_id"], fid == canonical)
+            # Only cluster findings that exist in THIS run: the model may
+            # hallucinate ids, and unscoped assignment would reach across
+            # runs sharing this database.
+            if not any(f.finding_id == fid for f in confirmed):
+                log.warning("[%s] dedupe: ignoring unknown member %s", ctx.run_id, fid)
+                continue
+            db.assign_finding_group(ctx.run_id, fid, g["group_id"], fid == canonical)
 
     log.info("[%s] dedupe: %d findings → %d groups", ctx.run_id, len(confirmed), len(groups))
     return len(groups)

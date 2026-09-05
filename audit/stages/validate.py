@@ -7,7 +7,7 @@ import logging
 
 from audit.runner import AgentRunError, TransientAgentError, run_agent
 from audit.state import Finding, StateDB
-from audit.stages._common import StageContext
+from audit.stages._common import StageContext, record_failure_cost
 
 log = logging.getLogger(__name__)
 
@@ -64,10 +64,11 @@ async def run_validate(ctx: StageContext, db: StateDB) -> int:
             except (AgentRunError, TransientAgentError) as e:
                 log.warning("[%s] validate %s failed: %s", ctx.run_id, f.finding_id, e)
                 counters["failed"] += 1
+                record_failure_cost(db, ctx.run_id, "validate", f.finding_id, e)
                 # Treat unparseable validation as needs_more_info to avoid
                 # silently confirming.
                 db.set_finding_validation(
-                    f.finding_id, "needs_more_info",
+                    ctx.run_id, f.finding_id, "needs_more_info",
                     {"finding_id": f.finding_id, "verdict": "needs_more_info",
                      "rationale": f"validator failed to produce schema-valid output: {e}",
                      "validator_confidence": 0.0},
@@ -75,7 +76,7 @@ async def run_validate(ctx: StageContext, db: StateDB) -> int:
                 return
 
             verdict = result.payload.get("verdict", "needs_more_info")
-            db.set_finding_validation(f.finding_id, verdict, result.payload)
+            db.set_finding_validation(ctx.run_id, f.finding_id, verdict, result.payload)
             db.record_cost(ctx.run_id, "validate", f.finding_id, result.raw_result_message)
             db.add_artifact(ctx.run_id, "validate", f.finding_id, "jsonl",
                             str(result.artifact_path))

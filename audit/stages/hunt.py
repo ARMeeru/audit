@@ -13,7 +13,7 @@ from audit.runner import (
     run_agent,
 )
 from audit.state import StateDB, Task
-from audit.stages._common import StageContext, truncated_recon_summary
+from audit.stages._common import StageContext, record_failure_cost, truncated_recon_summary
 
 log = logging.getLogger(__name__)
 
@@ -86,7 +86,7 @@ async def run_hunt(
                     artifact_name=task.task_id,
                     repair_attempts=sc.repair_attempts,
                 )
-            except QuotaExhaustedError:
+            except QuotaExhaustedError as quota_error:
                 # Subscription quota/session limit hit mid-flight. Don't burn
                 # this task to 'failed' (which resume skips) — leave it
                 # 'pending' and propagate so the pipeline aborts cleanly into
@@ -96,16 +96,19 @@ async def run_hunt(
                     "[%s] hunt task %s hit subscription quota — aborting stage",
                     ctx.run_id, task.task_id,
                 )
+                record_failure_cost(db, ctx.run_id, "hunt", task.task_id, quota_error)
                 db.update_task_status(task.task_id, "pending")
                 aborted.set()
                 raise
             except (AgentRunError, TransientAgentError) as e:
                 log.warning("[%s] hunt task %s failed: %s", ctx.run_id, task.task_id, e)
+                record_failure_cost(db, ctx.run_id, "hunt", task.task_id, e)
                 db.update_task_status(task.task_id, "failed")
                 counters["tasks_failed"] += 1
                 return
             except Exception as e:
                 log.error("[%s] hunt task %s unexpected error: %s", ctx.run_id, task.task_id, e)
+                record_failure_cost(db, ctx.run_id, "hunt", task.task_id, e)
                 db.update_task_status(task.task_id, "failed")
                 counters["tasks_failed"] += 1
                 return

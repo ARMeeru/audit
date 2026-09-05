@@ -59,6 +59,16 @@ class StageContext:
         return d
 
 
+def record_failure_cost(db, run_id: str, stage: str, ref: str | None, e: Exception) -> None:
+    """Record the API usage of a failed agent attempt, if the runner was
+    able to attach it to the exception. Without this, spend on attempts
+    that end in AgentRunError/TransientAgentError/QuotaExhaustedError is
+    invisible to --max-cost-usd."""
+    msg = getattr(e, "result_msg", None)
+    if msg:
+        db.record_cost(run_id, stage, ref, msg)
+
+
 def truncated_recon_summary(full: dict, subsystem_filter: str | None = None) -> dict:
     """Pass only the architecture facts downstream agents need."""
     out: dict = {
