@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     target_files TEXT NOT NULL,
     rationale TEXT,
     priority INTEGER NOT NULL DEFAULT 3,
+    attempts INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'pending',
     raw_json TEXT NOT NULL,
     created_at REAL NOT NULL,
@@ -156,17 +157,44 @@ class Finding:
 
 
 class StateDB:
+    MIGRATION_VERSION = 1
+
     def __init__(self, db_path: Path):
         self.path = db_path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.path))
         self._conn.row_factory = sqlite3.Row
-        self._conn.executescript(SCHEMA)
-        self._migrate_legacy_schema()
+        # WAL: readers (`audit status` during a run) no longer trip the
+        # writer's lock, and a crash between checkpoint and commit is
+        # recovered from the WAL instead of corrupting the write.
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._create_schema()
+        self._migrate()
         self._conn.commit()
 
-    def _migrate_legacy_schema(self) -> None:
-        """Rebuild tables whose PRIMARY KEY predated run-scoped ids.
+    def _create_schema(self) -> None:
+        # executescript() would COMMIT any open transaction, so the schema
+        # runs statement-by-statement and migrations stay atomic.
+        for stmt in SCHEMA.split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                self._conn.execute(stmt)
+
+    def _migrate(self) -> None:
+        version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+        if version >= self.MIGRATION_VERSION:
+            return
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._migrate_v1()
+            self._conn.execute(f"PRAGMA user_version = {self.MIGRATION_VERSION}")
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def _migrate_v1(self) -> None:
+        """v0 -> v1: run-scoped identity keys, tasks.attempts column.
 
         finding_id and group_id were globally unique keys while their values
         are model-emitted and only unique per run, so two runs sharing this
@@ -187,7 +215,6 @@ class StateDB:
         indexes = {
             "findings": ("idx_findings_run", "idx_findings_validation", "idx_findings_group"),
         }
-        migrated = False
         for table, marker, custom_select in legacy:
             row = self._conn.execute(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -198,7 +225,7 @@ class StateDB:
             for idx in indexes.get(table, ()):
                 self._conn.execute(f"DROP INDEX IF EXISTS {idx}")
             self._conn.execute(f"ALTER TABLE {table} RENAME TO {table}_legacy")
-            self._conn.executescript(SCHEMA)
+            self._create_schema()
             new_cols = [r["name"] for r in self._conn.execute(f"PRAGMA table_info({table})").fetchall()]
             if custom_select:
                 self._conn.execute(
@@ -214,9 +241,9 @@ class StateDB:
                     f"SELECT {', '.join(legacy_cols)} FROM {table}_legacy"
                 )
             self._conn.execute(f"DROP TABLE {table}_legacy")
-            migrated = True
-        if migrated:
-            self._conn.commit()
+        task_cols = [r["name"] for r in self._conn.execute("PRAGMA table_info(tasks)").fetchall()]
+        if "attempts" not in task_cols:
+            self._conn.execute("ALTER TABLE tasks ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
 
     # ---------- runs ----------
 
@@ -309,18 +336,27 @@ class StateDB:
         )
         self._conn.commit()
 
-    def reset_incomplete_tasks(self, run_id: str) -> int:
-        """Flip 'running' and 'failed' tasks back to 'pending' so a resumed
-        run re-attempts work that was interrupted (quota/crash, left
-        'running') or that failed on a transient/quota error (marked
-        'failed'). Returns the number of tasks reset."""
-        cur = self._conn.execute(
+    def reset_incomplete_tasks(self, run_id: str, max_requeues: int = 3) -> int:
+        """Re-queue interrupted and failed tasks so a resumed run re-attempts
+        them. 'running' tasks (quota/crash interrupts — not the task's fault)
+        are always re-queued. 'failed' tasks are re-queued only under a retry
+        ceiling: each re-queue increments attempts, and a task that has been
+        re-queued max_requeues times stays failed, so a deterministically
+        failing task stops re-burning spend on every resume. Returns the
+        number of tasks reset."""
+        now = time.time()
+        cur_run = self._conn.execute(
             "UPDATE tasks SET status = 'pending', updated_at = ? "
-            "WHERE run_id = ? AND status IN ('running', 'failed')",
-            (time.time(), run_id),
+            "WHERE run_id = ? AND status = 'running'",
+            (now, run_id),
+        )
+        cur_fail = self._conn.execute(
+            "UPDATE tasks SET status = 'pending', attempts = attempts + 1, updated_at = ? "
+            "WHERE run_id = ? AND status = 'failed' AND attempts < ?",
+            (now, run_id, max_requeues),
         )
         self._conn.commit()
-        return cur.rowcount
+        return cur_run.rowcount + cur_fail.rowcount
 
     @staticmethod
     def _row_to_task(r: sqlite3.Row) -> Task:
@@ -474,6 +510,17 @@ class StateDB:
 
     # ---------- dedupe ----------
 
+    def clear_finding_groups(self, run_id: str) -> None:
+        """Drop all group assignments for a run before re-applying a fresh
+        dedupe pass. Without this, a finding demoted between passes keeps
+        is_canonical=1 and inflates the reported set."""
+        self._conn.execute(
+            "UPDATE findings SET group_id = NULL, is_canonical = 0 WHERE run_id = ?",
+            (run_id,),
+        )
+        self._conn.execute("DELETE FROM dedupe_groups WHERE run_id = ?", (run_id,))
+        self._conn.commit()
+
     def add_dedupe_group(self, run_id: str, group: dict) -> None:
         self._conn.execute(
             """INSERT OR REPLACE INTO dedupe_groups
@@ -528,6 +575,30 @@ class StateDB:
         return float(row["total"]) if row else 0.0
 
     # ---------- artifacts ----------
+
+    def count_artifacts(self, run_id: str, stage: str) -> int:
+        """Agent invocations already consumed for a stage. The artifacts table
+        is the source of truth for expansion-loop bounds: derived counts cannot
+        desync from the work the way persisted counters can."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM artifacts WHERE run_id = ? AND stage = ?",
+            (run_id, stage),
+        ).fetchone()
+        return int(row["c"]) if row else 0
+
+    def stage_summary(self, run_id: str) -> list[sqlite3.Row]:
+        return list(self._conn.execute(
+            "SELECT stage, status, COUNT(*) AS c FROM tasks WHERE run_id = ? "
+            "GROUP BY stage, status ORDER BY stage",
+            (run_id,),
+        ).fetchall())
+
+    def stage_costs(self, run_id: str) -> list[sqlite3.Row]:
+        return list(self._conn.execute(
+            "SELECT stage, SUM(usd) AS usd FROM costs WHERE run_id = ? "
+            "GROUP BY stage ORDER BY stage",
+            (run_id,),
+        ).fetchall())
 
     def add_artifact(
         self, run_id: str, stage: str, ref_id: str | None, kind: str, path: str
