@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from audit.runner import AgentRunError, TransientAgentError, run_agent
+from audit.runner import AgentRunError, QuotaExhaustedError, TransientAgentError, run_agent
 from audit.state import StateDB
 from audit.stages._common import StageContext, record_failure_cost, truncated_recon_summary
 
@@ -45,6 +45,9 @@ async def run_feedback(ctx: StageContext, db: StateDB,
             artifact_name="feedback",
             repair_attempts=sc.repair_attempts,
         )
+    except QuotaExhaustedError as qe:
+        record_failure_cost(db, ctx.run_id, "feedback", None, qe)
+        raise
     except (AgentRunError, TransientAgentError) as e:
         log.warning("[%s] feedback failed: %s", ctx.run_id, e)
         record_failure_cost(db, ctx.run_id, "feedback", None, e)

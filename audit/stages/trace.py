@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from audit.runner import AgentRunError, TransientAgentError, run_agent
+from audit.runner import AgentRunError, QuotaExhaustedError, TransientAgentError, run_agent
 from audit.state import Finding, StateDB
 from audit.stages._common import StageContext, record_failure_cost, truncated_recon_summary
 
@@ -27,10 +27,14 @@ async def run_trace(ctx: StageContext, db: StateDB) -> int:
         "[%s] trace: %d canonicals (concurrency=%d, model=%s)",
         ctx.run_id, len(canonicals), sc.concurrency, sc.model,
     )
-    counters = {"reachable": 0, "unreachable": 0, "failed": 0}
+    counters = {"reachable": 0, "unreachable": 0, "failed": 0, "skipped": 0}
+    aborted = asyncio.Event()
 
     async def _one(f: Finding) -> None:
         async with sem:
+            if aborted.is_set():
+                counters["skipped"] += 1
+                return
             if db.get_trace(ctx.run_id, f.finding_id) is not None:
                 return  # already traced (resume)
             user_input = {
@@ -55,6 +59,19 @@ async def run_trace(ctx: StageContext, db: StateDB) -> int:
                     artifact_name=f.finding_id,
                     repair_attempts=sc.repair_attempts,
                 )
+            except QuotaExhaustedError as qe:
+                # Quota is the pipeline's stop signal: record the spend, stop
+                # dispatching siblings, and abort into a resumable state.
+                # Unlike a real trace verdict, nothing is persisted — resume
+                # re-attempts this finding.
+                record_failure_cost(db, ctx.run_id, "trace", f.finding_id, qe)
+                log.error(
+                    "[%s] trace %s hit subscription quota — aborting stage",
+                    ctx.run_id, f.finding_id,
+                )
+                aborted.set()
+                raise
+
             except (AgentRunError, TransientAgentError) as e:
                 log.warning("[%s] trace %s failed: %s", ctx.run_id, f.finding_id, e)
                 counters["failed"] += 1

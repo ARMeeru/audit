@@ -6,7 +6,7 @@ import json
 import logging
 from pathlib import Path
 
-from audit.runner import AgentRunError, TransientAgentError, run_agent
+from audit.runner import AgentRunError, QuotaExhaustedError, TransientAgentError, run_agent
 from audit.state import StateDB
 from audit.stages._common import StageContext
 
@@ -61,7 +61,10 @@ async def run_report(ctx: StageContext, db: StateDB) -> Path:
             artifact_name="report_agent",
             repair_attempts=max(sc.repair_attempts, 2),  # report MUST validate
         )
-    except (AgentRunError, TransientAgentError) as e:
+    except (AgentRunError, TransientAgentError, QuotaExhaustedError) as e:
+        # The fallback report is deterministic (rendered from state.db), so a
+        # quota-killed report agent still yields the reachable finding set -
+        # only the prose is lost.
         log.error("[%s] report agent failed: %s — emitting fallback report",
                   ctx.run_id, e)
         fallback = _build_fallback_report(ctx, db, reachable, target)
