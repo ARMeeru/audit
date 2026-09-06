@@ -63,3 +63,11 @@ notes.db
 
 /REPORT-*.md
 /REPORT.md
+
+# Local working notes — never publish
+/FORK-PROOFS.md
+/FABLE_REVIEW_BRIEF.md
+/FABLE_REVIEW_RESPONSE.md
+/*-delta.json
+/*-report.md
+/FORK-NOTES.md

@@ -1,5 +1,10 @@
 """Pipeline driver: Recon → (Hunt → Validate → Gapfill)* → Dedupe → Trace
                   → Feedback → (Hunt → Validate → Dedupe → Trace)* → Report
+
+Resume semantics: loop-iteration budgets are derived from the artifacts already
+on disk, so a resumed run converges (total Gapfill/Feedback passes respect the
+configured bounds) instead of re-granting exploration budgets. `--finalize`
+skips exploration entirely and closes the run from current state.
 """
 
 from __future__ import annotations
@@ -27,6 +32,8 @@ async def run_pipeline(
     db: StateDB,
     config: HarnessConfig,
     max_cost_usd: float | None = None,
+    finalize: bool = False,
+    finalize_cost_usd: float | None = None,
     resume: bool = False,
     max_recon_tasks: int | None = None,
     live_target: dict | None = None,
@@ -41,9 +48,13 @@ async def run_pipeline(
     )
 
     if db.get_run(run_id) is None:
+        if finalize:
+            raise RuntimeError(
+                f"run_id {run_id!r} not found; there is nothing to finalize."
+            )
         db.create_run(str(repo_path.resolve()), run_id)
         log.info("[%s] starting fresh pipeline run against %s", run_id, repo_path)
-    elif resume:
+    elif resume or finalize:
         # Flip status back to 'running' so subsequent /status calls don't
         # report a stale 'aborted'/'failed' while resume work is ongoing.
         db._conn.execute(  # type: ignore[attr-defined]
@@ -51,20 +62,23 @@ async def run_pipeline(
             (run_id,),
         )
         db._conn.commit()  # type: ignore[attr-defined]
-        # Re-queue any task left 'running' (interrupted mid-flight by a quota
-        # abort or crash) or 'failed' (transient/quota error) so resume
-        # actually re-attempts the incomplete work instead of skipping it —
-        # Hunt only dispatches 'pending' tasks.
+        # Re-queue incomplete work so resume actually re-attempts it instead
+        # of skipping it - Hunt only dispatches 'pending' tasks. Re-queueing
+        # respects the attempts ceiling: a task that has failed deterministically
+        # too many times stays failed instead of re-burning spend every resume.
         requeued = db.reset_incomplete_tasks(run_id)
         if requeued:
             log.info("[%s] resume: re-queued %d interrupted/failed tasks", run_id, requeued)
-        log.info("[%s] resuming existing run", run_id)
+        if finalize:
+            log.info("[%s] resuming in finalize mode (no exploration)", run_id)
+        else:
+            log.info("[%s] resuming existing run", run_id)
     else:
         raise RuntimeError(
             f"run_id {run_id!r} already exists; pass --resume to continue it."
         )
 
-    def _budget_check(stage_name: str) -> None:
+    def _expansion_budget_check(stage_name: str) -> None:
         if max_cost_usd is None:
             return
         spent = db.total_cost(run_id)
@@ -74,56 +88,94 @@ async def run_pipeline(
                 f"${spent:.4f} >= ${max_cost_usd:.4f}"
             )
 
+    # Finalize's cap bounds a single invocation, never the cumulative run:
+    # a tripped finalize cap leaves the run resumable (--resume --finalize
+    # resets the per-invocation accounting), so the cap can never lock the
+    # user out of their report.
+    finalize_start_cost = db.total_cost(run_id)
+
+    def _finalize_budget_check(stage_name: str) -> None:
+        if finalize_cost_usd is None:
+            return
+        spent = db.total_cost(run_id) - finalize_start_cost
+        if spent >= finalize_cost_usd:
+            raise CostExceeded(
+                f"[{run_id}] finalize budget exhausted before {stage_name}: "
+                f"${spent:.4f} of ${finalize_cost_usd:.4f} in this invocation "
+                f"(--resume --finalize continues from here)"
+            )
+
+    _check = _finalize_budget_check if finalize else _expansion_budget_check
+
     try:
         # ---- Stage 1: Recon ----
-        _budget_check("recon")
+        _check("recon")
         recon_kwargs = {} if max_recon_tasks is None else {"max_tasks": max_recon_tasks}
         await stages.run_recon(ctx, db, **recon_kwargs)
 
-        # ---- Stages 2-3-4 loop: Hunt → Validate → Gapfill ----
-        for i in range(config.gapfill_iterations + 1):
-            _budget_check(f"hunt(iter={i})")
-            findings_added = await stages.run_hunt(ctx, db, budget_check=_budget_check)
-            if findings_added == 0 and i > 0:
-                log.info("[%s] no new findings — exiting Hunt/Gapfill loop", run_id)
-                break
+        if not finalize:
+            # ---- Stages 2-3-4 loop: Hunt → Validate → Gapfill ----
+            # Iterations already consumed are derived from the artifacts on
+            # disk (one Gapfill agent call per iteration), so across resumes
+            # the total number of Gapfill passes respects the configured
+            # bound instead of being re-granted every resume.
+            consumed_gapfill = db.count_artifacts(run_id, "gapfill")
+            if consumed_gapfill:
+                log.info(
+                    "[%s] expansion: %d gapfill iteration(s) already consumed",
+                    run_id, consumed_gapfill,
+                )
+            while True:
+                _check("hunt")
+                findings_added = await stages.run_hunt(ctx, db, budget_check=_check)
+                _check("validate")
+                await stages.run_validate(ctx, db)
 
-            _budget_check(f"validate(iter={i})")
+                if findings_added == 0 and consumed_gapfill > 0:
+                    log.info("[%s] no new findings — exiting Hunt/Gapfill loop", run_id)
+                    break
+                if consumed_gapfill >= config.gapfill_iterations:
+                    log.info("[%s] gapfill budget consumed — exiting Hunt/Gapfill loop", run_id)
+                    break
+                _check("gapfill")
+                new_tasks = await stages.run_gapfill(ctx, db)
+                consumed_gapfill += 1
+                if new_tasks == 0:
+                    log.info("[%s] gapfill produced 0 tasks — exiting loop", run_id)
+                    break
+        else:
+            # ---- Finalize: grade the remaining pile, never expand ----
+            _finalize_budget_check("finalize-validate")
             await stages.run_validate(ctx, db)
 
-            if i >= config.gapfill_iterations:
-                break  # final iteration: don't gapfill again
-            _budget_check(f"gapfill(iter={i})")
-            new_tasks = await stages.run_gapfill(ctx, db)
-            if new_tasks == 0:
-                log.info("[%s] gapfill produced 0 tasks — exiting loop", run_id)
-                break
-
         # ---- Stage 5: Dedupe ----
-        _budget_check("dedupe")
+        _check("dedupe")
         await stages.run_dedupe(ctx, db)
 
         # ---- Stage 6: Trace ----
-        _budget_check("trace")
+        _check("trace")
         await stages.run_trace(ctx, db)
 
         # ---- Stage 7: Feedback (re-runs Hunt/Validate/Dedupe/Trace) ----
-        for i in range(config.feedback_iterations):
-            _budget_check(f"feedback(iter={i})")
-            new_tasks = await stages.run_feedback(ctx, db)
-            if new_tasks == 0:
-                break
-            _budget_check(f"feedback-hunt(iter={i})")
-            await stages.run_hunt(ctx, db)
-            _budget_check(f"feedback-validate(iter={i})")
-            await stages.run_validate(ctx, db)
-            _budget_check(f"feedback-dedupe(iter={i})")
-            await stages.run_dedupe(ctx, db)
-            _budget_check(f"feedback-trace(iter={i})")
-            await stages.run_trace(ctx, db)
+        # Finalize never expands: feedback only spawns new hunts.
+        if not finalize:
+            consumed_feedback = db.count_artifacts(run_id, "feedback")
+            for i in range(max(0, config.feedback_iterations - consumed_feedback)):
+                _check(f"feedback(iter={i})")
+                new_tasks = await stages.run_feedback(ctx, db)
+                if new_tasks == 0:
+                    break
+                _check(f"feedback-hunt(iter={i})")
+                await stages.run_hunt(ctx, db)
+                _check(f"feedback-validate(iter={i})")
+                await stages.run_validate(ctx, db)
+                _check(f"feedback-dedupe(iter={i})")
+                await stages.run_dedupe(ctx, db)
+                _check(f"feedback-trace(iter={i})")
+                await stages.run_trace(ctx, db)
 
         # ---- Stage 8: Report ----
-        _budget_check("report")
+        _check("report")
         report_path = await stages.run_report(ctx, db)
 
         db.finish_run(run_id, "completed")

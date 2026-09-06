@@ -128,6 +128,14 @@ def auth_check(allow_api_key: bool) -> None:
                    "rules / exclusions; passed verbatim to every stage.")
 @click.option("--config", "config_path", default=None, type=click.Path(),
               help="Override config/stages.yaml.")
+@click.option("--finalize", "finalize", is_flag=True, default=False,
+              help="Skip exploration (no hunt/gapfill/feedback): validate any "
+                   "remaining findings, dedupe, trace, and write the report "
+                   "from current state. Combine with --resume.")
+@click.option("--finalize-cost-usd", "finalize_cost_usd", default=None, type=float,
+              help="Optional flat cap on spend within ONE finalize invocation "
+                   "(per-invocation, not cumulative - a tripped cap leaves the "
+                   "run resumable).")
 @click.option("--allow-api-key", is_flag=True, default=False,
               help="Honor ANTHROPIC_API_KEY for metered Anthropic billing "
                    "(also via AUDIT_ALLOW_API_KEY=1).")
@@ -136,6 +144,8 @@ def run(repo: str, run_id: str | None, resume: bool, max_cost_usd: float | None,
         target_url: str | None, target_creds: tuple[str, ...],
         scope_notes_path: str | None,
         config_path: str | None,
+        finalize: bool,
+        finalize_cost_usd: float | None,
         allow_api_key: bool) -> None:
     """Run the full 8-stage pipeline against a target repo."""
     allow = _allow_api_key_from_env_or_flag(allow_api_key)
@@ -182,6 +192,8 @@ def run(repo: str, run_id: str | None, resume: bool, max_cost_usd: float | None,
             db=db,
             config=config,
             max_cost_usd=max_cost_usd,
+            finalize=finalize,
+            finalize_cost_usd=finalize_cost_usd,
             resume=resume,
             max_recon_tasks=max_recon_tasks,
             live_target=live_target,
@@ -268,6 +280,38 @@ def _show_run_detail(db: StateDB, run_id: str) -> None:
     t.add_row("findings (reachable)", str(len(reachable)))
     t.add_row("total cost ($)", f"{db.total_cost(run_id):.4f}")
     console.print(t)
+
+    per_stage = Table(title="tasks by stage", show_lines=False)
+    per_stage.add_column("stage")
+    for col in ("pending", "running", "done", "failed"):
+        per_stage.add_column(col)
+    by_stage: dict[str, dict[str, int]] = {}
+    for x in tasks:
+        row = by_stage.setdefault(x.source, {"pending": 0, "running": 0, "done": 0, "failed": 0})
+        if x.status in row:
+            row[x.status] += 1
+    for stage in sorted(by_stage):
+        row = by_stage[stage]
+        per_stage.add_row(stage, *(str(row[c]) for c in ("pending", "running", "done", "failed")))
+    console.print(per_stage)
+
+    costs = Table(title="cost by stage ($)", show_lines=False)
+    costs.add_column("stage"); costs.add_column("usd")
+    for row in db.stage_costs(run_id):
+        costs.add_row(row["stage"], f"{row['usd'] or 0:.4f}")
+    console.print(costs)
+
+    unvalidated = len(db.get_unvalidated_findings(run_id))
+    untraced = len(canonical) - len(reachable)
+    remaining = Table(title="finalize remaining", show_lines=False)
+    remaining.add_column("work"); remaining.add_column("count")
+    remaining.add_row("findings to validate", str(max(0, len(findings) - len(
+        [f for f in findings if f.validation_status is not None]))))
+    remaining.add_row("canonicals to trace", str(max(0, len(canonical) - len(reachable))))
+    console.print(remaining)
+    if unvalidated:
+        console.print(f"[yellow]{unvalidated} finding(s) never validated — "
+                      "run the pipeline (or --resume --finalize) to grade them[/yellow]")
 
 
 def _code_fence(content: str) -> str:

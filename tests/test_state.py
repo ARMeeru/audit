@@ -272,3 +272,111 @@ def test_legacy_traces_derive_run_id(tmp_path: Path) -> None:
     trace = db.get_trace("run-a", "f_1")
     assert trace is not None and trace["reachable"] is True
     db.close()
+
+
+# ---------- Phase 1 sensors: attempts ceiling, group clearing, WAL/version ----------
+
+
+def test_attempts_ceiling_stops_requeue_at_limit(tmp_path: Path) -> None:
+    """A failed task at the attempts ceiling stays failed: resume must not
+    re-burn spend on a deterministically failing task forever."""
+    db = StateDB(tmp_path / "state.db")
+    rid = db.create_run("/r", "run-att")
+    _task(db, rid, "t_ceiling")
+    db.update_task_status("t_ceiling", "failed")
+    db._conn.execute("UPDATE tasks SET attempts = 3 WHERE task_id = 't_ceiling'")
+    db._conn.commit()
+
+    assert db.reset_incomplete_tasks(rid, max_requeues=3) == 0
+    row = db._conn.execute(
+        "SELECT status, attempts FROM tasks WHERE task_id = 't_ceiling'"
+    ).fetchone()
+    assert row["status"] == "failed" and row["attempts"] == 3
+    db.close()
+
+
+def test_attempts_below_ceiling_requeued_and_incremented(tmp_path: Path) -> None:
+    db = StateDB(tmp_path / "state.db")
+    rid = db.create_run("/r", "run-att2")
+    _task(db, rid, "t_below")
+    db.update_task_status("t_below", "failed")
+    db._conn.execute("UPDATE tasks SET attempts = 2 WHERE task_id = 't_below'")
+    db._conn.commit()
+
+    assert db.reset_incomplete_tasks(rid, max_requeues=3) == 1
+    row = db._conn.execute(
+        "SELECT status, attempts FROM tasks WHERE task_id = 't_below'"
+    ).fetchone()
+    assert row["status"] == "pending" and row["attempts"] == 3
+    db.close()
+
+
+def test_running_task_requeued_without_increasing_attempts(tmp_path: Path) -> None:
+    """Quota/crash interrupts are not the task's fault: 'running' tasks are
+    re-queued and the attempts counter is left untouched."""
+    db = StateDB(tmp_path / "state.db")
+    rid = db.create_run("/r", "run-att3")
+    _task(db, rid, "t_run")
+    db.update_task_status("t_run", "running")
+
+    assert db.reset_incomplete_tasks(rid, max_requeues=3) == 1
+    row = db._conn.execute(
+        "SELECT status, attempts FROM tasks WHERE task_id = 't_run'"
+    ).fetchone()
+    assert row["status"] == "pending" and row["attempts"] == 0
+    db.close()
+
+
+def test_clear_finding_groups_drops_stale_assignments(tmp_path: Path) -> None:
+    """A second dedupe pass must clear stale group assignments: a finding
+    demoted between passes can no longer keep is_canonical=1 and inflate
+    the reported set."""
+    db = StateDB(tmp_path / "state.db")
+    rid = db.create_run("/r", "run-clear")
+    _task(db, rid, "t_1")
+    db.add_finding(rid, "t_1", _finding("f_1", "stale canonical"))
+    db.set_finding_validation(rid, "f_1", "confirmed", {"verdict": "confirmed"})
+    db.add_dedupe_group(rid, {
+        "group_id": "g_1", "root_cause": "rc",
+        "canonical_finding_id": "f_1", "member_finding_ids": ["f_1"],
+    })
+    db.assign_finding_group(rid, "f_1", "g_1", True)
+    assert len(db.get_findings(rid, canonical_only=True)) == 1
+
+    db.clear_finding_groups(rid)
+
+    f = db.get_findings(rid)[0]
+    assert f.group_id is None and not f.is_canonical
+    stale_groups = db._conn.execute(
+        "SELECT COUNT(*) AS c FROM dedupe_groups WHERE run_id = ?", (rid,)
+    ).fetchone()["c"]
+    assert stale_groups == 0
+    db.close()
+
+
+def test_wal_mode_and_user_version_after_migration(tmp_path: Path) -> None:
+    """WAL keeps status-during-run lock-free, and the migration stamps
+    PRAGMA user_version so future migrations gate on a number instead of
+    substring-sniffing CREATE TABLE text."""
+    import sqlite3
+    p = tmp_path / "legacy.db"
+    conn = sqlite3.connect(p)
+    conn.executescript(LEGACY_FINDINGS_SQL)
+    conn.execute(
+        "INSERT INTO tasks (task_id, run_id, source, attack_class, scope_hint,"
+        " target_files, rationale, priority, status, raw_json, created_at, updated_at)"
+        " VALUES ('t_1', 'run-a', 'recon', 'sqli', 'x', '[]', '', 3, 'done', '{}', 1, 1)"
+    )
+    conn.execute(
+        "INSERT INTO findings (finding_id, task_id, run_id, file, line_start,"
+        " line_end, vuln_class, severity, description, evidence, raw_json)"
+        " VALUES ('f_1', 't_1', 'run-a', 'a.py', 1, 2, 'sqli', 'high', 'd', 'e', '{}')"
+    )
+    conn.commit()
+    conn.close()
+
+    db = StateDB(p)
+    assert db._conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert len(db.get_findings("run-a")) == 1
+    db.close()
