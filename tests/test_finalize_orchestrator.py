@@ -19,6 +19,12 @@ from audit.state import StateDB
 
 @pytest.fixture()
 def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import audit.stages._common as common_mod
+    # ctx.results_dir() must resolve into tmp_path: _common resolves
+    # RESULTS/WORK from REPO_ROOT, and an unpatched fixture once let a
+    # stub overwrite a real run's report.json.
+    monkeypatch.setattr(common_mod, "RESULTS", tmp_path / "results")
+    monkeypatch.setattr(common_mod, "WORK", tmp_path / "work")
     db = StateDB(tmp_path / "state.db")
     cfg = load_config()
     calls: list[str] = []
@@ -92,8 +98,12 @@ def test_finalize_grades_the_remaining_pile(env):
     })
     db.create_run(str(tmp), "t")
     _run(db, cfg, tmp, finalize=True)
-    # recon first, then validate (the remaining pile), then the closing stages
-    assert calls.index("run_recon") == 0
+    # finalize never explores: no recon. It grades the remaining pile
+    # (validate), then the closing stages. (An earlier revision of this
+    # test asserted recon runs first in finalize mode — that pinned the
+    # defect where --finalize fires a full opus recon on a run that died
+    # during recon.)
+    assert "run_recon" not in calls, "finalize must not launch recon"
     assert "run_validate" in calls
     assert calls[-1] == "run_report"
 

@@ -31,6 +31,7 @@ async def run_validate(ctx: StageContext, db: StateDB) -> int:
     tasks_by_id = {t.task_id: t for t in db.get_all_tasks(ctx.run_id)}
     counters = {"confirmed": 0, "rejected": 0, "needs_more_info": 0, "failed": 0, "skipped": 0}
     aborted = asyncio.Event()
+    running: list[asyncio.Task] = []
 
     async def _one(f: Finding) -> None:
         async with sem:
@@ -67,45 +68,59 @@ async def run_validate(ctx: StageContext, db: StateDB) -> int:
                     on_attempt=lambda msg, _fid=f.finding_id: db.record_cost(
                         ctx.run_id, "validate", _fid, msg),
                 )
-            except QuotaExhaustedError as qe:
+            except QuotaExhaustedError:
                 # Quota is the pipeline's stop signal, not this finding's
-                # failure: record the spend, stop dispatching siblings, and
-                # re-raise so the run aborts into a resumable state. The
-                # finding stays unvalidated and is re-attempted on resume.
+                # failure: stop dispatching siblings AND cancel the ones
+                # already in flight (gating only the queued ones left them
+                # running to completion past the abort). Re-raise so the
+                # run aborts into a resumable state. The finding stays
+                # unvalidated and is re-attempted on resume.
                 log.error(
                     "[%s] validate %s hit subscription quota — aborting stage",
                     ctx.run_id, f.finding_id,
                 )
                 aborted.set()
+                for t in running:
+                    t.cancel()
                 raise
 
             except (AgentRunError, TransientAgentError) as e:
                 log.warning("[%s] validate %s failed: %s", ctx.run_id, f.finding_id, e)
                 counters["failed"] += 1
-                # Treat unparseable validation as needs_more_info to avoid
-                # silently confirming.
-                db.set_finding_validation(
-                    ctx.run_id, f.finding_id, "needs_more_info",
-                    {"finding_id": f.finding_id, "verdict": "needs_more_info",
-                     "rationale": f"validator failed to produce schema-valid output: {e}",
-                     "validator_confidence": 0.0},
-                )
+                # Persist NO verdict: get_unvalidated_findings filters on
+                # validation_status IS NULL, so a persisted needs_more_info
+                # would bury this finding for every future resume (the
+                # validate-side twin of the trace fix). NULL is not
+                # confirmed either — "avoid silently confirming" still
+                # holds. A deterministically failing validation stops
+                # re-burning spend via the dispatch attempts ceiling.
                 return
 
             verdict = result.payload.get("verdict", "needs_more_info")
             db.set_finding_validation(ctx.run_id, f.finding_id, verdict, result.payload)
-            db.record_cost(ctx.run_id, "validate", f.finding_id, result.raw_result_message)
             db.add_artifact(ctx.run_id, "validate", f.finding_id, "jsonl",
                             str(result.artifact_path))
             counters[verdict] = counters.get(verdict, 0) + 1
 
-    await asyncio.gather(*(_one(f) for f in unvalidated))
+    running.extend(asyncio.ensure_future(_one(f)) for f in unvalidated)
+    results = await asyncio.gather(*running, return_exceptions=True)
+    quota_hit = None
+    for r in results:
+        if isinstance(r, asyncio.CancelledError):
+            counters["skipped"] += 1
+        elif isinstance(r, QuotaExhaustedError):
+            quota_hit = r
+        elif isinstance(r, BaseException):
+            raise r
     log.info(
-        "[%s] validate: confirmed=%d rejected=%d needs_more_info=%d failed=%d",
+        "[%s] validate: confirmed=%d rejected=%d needs_more_info=%d failed=%d skipped=%d",
         ctx.run_id,
         counters.get("confirmed", 0),
         counters.get("rejected", 0),
         counters.get("needs_more_info", 0),
         counters["failed"],
+        counters["skipped"],
     )
+    if quota_hit is not None:
+        raise quota_hit
     return counters.get("confirmed", 0)

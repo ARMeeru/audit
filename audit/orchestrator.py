@@ -66,9 +66,12 @@ async def run_pipeline(
         # of skipping it - Hunt only dispatches 'pending' tasks. Re-queueing
         # respects the attempts ceiling: a task that has failed deterministically
         # too many times stays failed instead of re-burning spend every resume.
-        requeued = db.reset_incomplete_tasks(run_id)
-        if requeued:
-            log.info("[%s] resume: re-queued %d interrupted/failed tasks", run_id, requeued)
+        # Finalize skips this: it never dispatches hunt, so re-queueing would
+        # only burn the attempts ceiling on tasks with no consumer.
+        if not finalize:
+            requeued = db.reset_incomplete_tasks(run_id)
+            if requeued:
+                log.info("[%s] resume: re-queued %d interrupted/failed tasks", run_id, requeued)
         if finalize:
             log.info("[%s] resuming in finalize mode (no exploration)", run_id)
         else:
@@ -108,12 +111,15 @@ async def run_pipeline(
     _check = _finalize_budget_check if finalize else _expansion_budget_check
 
     try:
-        # ---- Stage 1: Recon ----
-        _check("recon")
-        recon_kwargs = {} if max_recon_tasks is None else {"max_tasks": max_recon_tasks}
-        await stages.run_recon(ctx, db, **recon_kwargs)
-
         if not finalize:
+            # ---- Stage 1: Recon ----
+            # Recon is exploration: --finalize on a run that died during
+            # recon must close from current state, not launch a full opus
+            # recon pass and queue hunts it will never dispatch.
+            _check("recon")
+            recon_kwargs = {} if max_recon_tasks is None else {"max_tasks": max_recon_tasks}
+            await stages.run_recon(ctx, db, **recon_kwargs)
+
             # ---- Stages 2-3-4 loop: Hunt → Validate → Gapfill ----
             # Iterations already consumed are derived from the artifacts on
             # disk (one Gapfill agent call per iteration), so across resumes
@@ -166,7 +172,7 @@ async def run_pipeline(
                 if new_tasks == 0:
                     break
                 _check(f"feedback-hunt(iter={i})")
-                await stages.run_hunt(ctx, db)
+                await stages.run_hunt(ctx, db, budget_check=_check)
                 _check(f"feedback-validate(iter={i})")
                 await stages.run_validate(ctx, db)
                 _check(f"feedback-dedupe(iter={i})")

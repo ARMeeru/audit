@@ -521,6 +521,63 @@ class StateDB:
         self._conn.execute("DELETE FROM dedupe_groups WHERE run_id = ?", (run_id,))
         self._conn.commit()
 
+    def latest_artifact_path(self, run_id: str, stage: str, kind: str) -> str | None:
+        """Path of the most recent artifact row matching (stage, kind), or
+        None. Used for content markers like the dedupe confirmed-set hash."""
+        row = self._conn.execute(
+            "SELECT path FROM artifacts WHERE run_id = ? AND stage = ? AND kind = ? "
+            "ORDER BY artifact_id DESC LIMIT 1",
+            (run_id, stage, kind),
+        ).fetchone()
+        return row["path"] if row else None
+
+    def count_dedupe_groups(self, run_id: str) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM dedupe_groups WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        return int(row["c"]) if row else 0
+
+    def apply_dedupe_groups(
+        self, run_id: str, prepared: list[tuple[dict, list[str], str]]
+    ) -> int:
+        """Atomically replace the run's grouping: clear stale assignments,
+        insert the new groups, assign members. One transaction, so a crash
+        mid-apply cannot leave a run with no canonicals, and a finding the
+        second pass omits cannot keep is_canonical=1 (the stale-canonical
+        defect). Each tuple is (group_dict, validated_member_ids, canonical_id).
+        Returns the number of groups applied."""
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                "UPDATE findings SET group_id = NULL, is_canonical = 0 WHERE run_id = ?",
+                (run_id,),
+            )
+            self._conn.execute("DELETE FROM dedupe_groups WHERE run_id = ?", (run_id,))
+            for group, member_ids, canonical in prepared:
+                self._conn.execute(
+                    """INSERT OR REPLACE INTO dedupe_groups
+                    (group_id, run_id, root_cause, canonical_finding_id, raw_json)
+                    VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        group["group_id"],
+                        run_id,
+                        group["root_cause"],
+                        canonical,
+                        json.dumps(group),
+                    ),
+                )
+                for fid in member_ids:
+                    self._conn.execute(
+                        "UPDATE findings SET group_id = ?, is_canonical = ? "
+                        "WHERE run_id = ? AND finding_id = ?",
+                        (group["group_id"], 1 if fid == canonical else 0, run_id, fid),
+                    )
+            self._conn.commit()
+            return len(prepared)
+        except Exception:
+            self._conn.rollback()
+            raise
+
     def add_dedupe_group(self, run_id: str, group: dict) -> None:
         self._conn.execute(
             """INSERT OR REPLACE INTO dedupe_groups

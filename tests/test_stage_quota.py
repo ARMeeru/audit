@@ -45,9 +45,14 @@ def _quota(spend: float = 0.02) -> QuotaExhaustedError:
 
 
 def test_validate_quota_records_cost_drains_and_aborts(stage_env, monkeypatch):
-    """Quota on the first validation: spend is ledgered, siblings are not
-    dispatched (drain), the exception aborts the stage, and NO finding is
-    graded (it stays unvalidated for resume)."""
+    """Quota on the first validation: the attempt's spend is ledgered, the
+    stage aborts, in-flight siblings are CANCELLED (not merely gated), and
+    NO finding is graded — everything stays unvalidated for resume.
+
+    The stub awaits before raising so the tasks genuinely interleave: an
+    earlier revision used a raise-without-await stub, which ran the first
+    task to completion before the second started and so could not tell a
+    working drain from a broken one."""
     db, ctx, tmp = stage_env
     _seed_task(db)
     for fid in ("f_1", "f_2", "f_3"):
@@ -59,20 +64,42 @@ def test_validate_quota_records_cost_drains_and_aborts(stage_env, monkeypatch):
 
     calls = []
 
+    class _R:
+        def __init__(self, payload):
+            self.payload = payload
+            self.raw_result_message = {"total_cost_usd": 0.0, "usage": {}}
+            from pathlib import Path as _P
+            self.artifact_path = tmp / "results" / "validate" / "fake.jsonl"
+            self.cost_usd = 0.0
+
     async def quota_agent(**kwargs):
         calls.append("called")
         on_attempt = kwargs.get("on_attempt")
         assert on_attempt is not None, "stage must pass on_attempt for spend ledgering"
         on_attempt({"total_cost_usd": 0.03, "usage": {"input_tokens": 10}})
-        raise _quota(0.03)
+        await asyncio.sleep(0)   # yield: siblings must be in flight by now
+        if kwargs["artifact_name"] == "f_1":
+            raise _quota(0.03)
+        # If the drain works, siblings are cancelled inside this await and
+        # never get here. If the drain is broken, they land a verdict —
+        # which the assertion below treats as the defect it is.
+        return _R({"verdict": "confirmed", "finding_id": kwargs["artifact_name"]})
 
     monkeypatch.setattr(validate_mod, "run_agent", quota_agent)
     with pytest.raises(QuotaExhaustedError):
         asyncio.run(validate_mod.run_validate(ctx, db))
 
-    assert len(calls) == 1, "drain: siblings must not be dispatched after quota abort"
-    assert db.total_cost("q") == pytest.approx(0.03)
-    assert all(f.validation_status is None for f in db.get_findings("q"))
+    # concurrency (10) exceeds the finding count (3): all three dispatch.
+    # The drain contract is that the survivors get CANCELLED, not that
+    # they were never dispatched.
+    assert len(calls) == 3
+    # on_attempt fires only after a completed round-trip, so the ledger
+    # holds exactly the spend that really happened: the aborting attempt's
+    # 0.03 plus any sibling round-trip that drained before cancellation.
+    assert db.total_cost("q") >= 0.03
+    assert all(f.validation_status is None for f in db.get_findings("q")), (
+        "cancelled or aborted validations must persist no verdict"
+    )
 
 
 def test_trace_quota_records_cost_and_stays_retryable(stage_env, monkeypatch):
@@ -99,13 +126,14 @@ def test_trace_quota_records_cost_and_stays_retryable(stage_env, monkeypatch):
         on_attempt = kwargs.get("on_attempt")
         assert on_attempt is not None, "stage must pass on_attempt for spend ledgering"
         on_attempt({"total_cost_usd": 0.05, "usage": {"input_tokens": 10}})
+        await asyncio.sleep(0)
         raise _quota(0.05)
 
     monkeypatch.setattr(trace_mod, "run_agent", quota_agent)
     with pytest.raises(QuotaExhaustedError):
         asyncio.run(trace_mod.run_trace(ctx, db))
 
-    assert len(calls) == 1
+    assert len(calls) == 1, "single canonical: exactly one dispatch"
     assert db.total_cost("q") == pytest.approx(0.05)
     # nothing permanent was persisted for the killed trace
     assert db.get_trace("q", "f_1") is None

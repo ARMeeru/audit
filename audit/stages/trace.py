@@ -29,6 +29,7 @@ async def run_trace(ctx: StageContext, db: StateDB) -> int:
     )
     counters = {"reachable": 0, "unreachable": 0, "failed": 0, "skipped": 0}
     aborted = asyncio.Event()
+    running: list[asyncio.Task] = []
 
     async def _one(f: Finding) -> None:
         async with sem:
@@ -61,16 +62,18 @@ async def run_trace(ctx: StageContext, db: StateDB) -> int:
                     on_attempt=lambda msg, _fid=f.finding_id: db.record_cost(
                         ctx.run_id, "trace", _fid, msg),
                 )
-            except QuotaExhaustedError as qe:
-                # Quota is the pipeline's stop signal: record the spend, stop
-                # dispatching siblings, and abort into a resumable state.
-                # Unlike a real trace verdict, nothing is persisted — resume
-                # re-attempts this finding.
+            except QuotaExhaustedError:
+                # Quota is the pipeline's stop signal: stop dispatching
+                # siblings AND cancel the ones already in flight. Nothing
+                # is persisted for the killed tracer — resume re-attempts
+                # the finding.
                 log.error(
                     "[%s] trace %s hit subscription quota — aborting stage",
                     ctx.run_id, f.finding_id,
                 )
                 aborted.set()
+                for t in running:
+                    t.cancel()
                 raise
 
             except (AgentRunError, TransientAgentError) as e:
@@ -84,7 +87,6 @@ async def run_trace(ctx: StageContext, db: StateDB) -> int:
                 return
 
             db.add_trace(ctx.run_id, f.finding_id, result.payload)
-            db.record_cost(ctx.run_id, "trace", f.finding_id, result.raw_result_message)
             db.add_artifact(ctx.run_id, "trace", f.finding_id, "jsonl",
                             str(result.artifact_path))
             if result.payload.get("reachable"):
@@ -92,9 +94,21 @@ async def run_trace(ctx: StageContext, db: StateDB) -> int:
             else:
                 counters["unreachable"] += 1
 
-    await asyncio.gather(*(_one(f) for f in canonicals))
+    running.extend(asyncio.ensure_future(_one(f)) for f in canonicals)
+    results = await asyncio.gather(*running, return_exceptions=True)
+    quota_hit = None
+    for r in results:
+        if isinstance(r, asyncio.CancelledError):
+            counters["skipped"] += 1
+        elif isinstance(r, QuotaExhaustedError):
+            quota_hit = r
+        elif isinstance(r, BaseException):
+            raise r
     log.info(
-        "[%s] trace: reachable=%d unreachable=%d failed=%d",
-        ctx.run_id, counters["reachable"], counters["unreachable"], counters["failed"],
+        "[%s] trace: reachable=%d unreachable=%d failed=%d skipped=%d",
+        ctx.run_id, counters["reachable"], counters["unreachable"],
+        counters["failed"], counters["skipped"],
     )
+    if quota_hit is not None:
+        raise quota_hit
     return counters["reachable"]

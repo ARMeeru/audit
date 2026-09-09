@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 
 from audit.runner import AgentRunError, QuotaExhaustedError, TransientAgentError, run_agent
@@ -11,11 +12,50 @@ from audit.stages._common import StageContext
 log = logging.getLogger(__name__)
 
 
+def _prepare_groups(run_id: str, groups: list[dict],
+                    confirmed_ids: set[str]) -> list[tuple[dict, list[str], str]]:
+    """Validate agent-emitted groups against this run's confirmed set.
+
+    Drops unknown members; a canonical that is not among the (surviving)
+    members falls back to the first member — a hallucinated canonical would
+    otherwise make `fid == canonical` false for every member and empty the
+    report's canonical set."""
+    prepared = []
+    for g in groups:
+        members = [fid for fid in g.get("member_finding_ids", [])
+                   if fid in confirmed_ids]
+        if not members:
+            log.warning("[%s] dedupe: group %s has no known members — dropped",
+                        run_id, g.get("group_id"))
+            continue
+        canonical = g.get("canonical_finding_id")
+        if canonical not in members:
+            log.warning("[%s] dedupe: canonical %s not among members; using %s",
+                        run_id, canonical, members[0])
+            canonical = members[0]
+        prepared.append((g, members, canonical))
+    return prepared
+
+
 async def run_dedupe(ctx: StageContext, db: StateDB) -> int:
     confirmed = db.get_findings(ctx.run_id, validation_status="confirmed")
     if not confirmed:
         log.info("[%s] dedupe: no confirmed findings to cluster", ctx.run_id)
         return 0
+
+    confirmed_ids = {f.finding_id for f in confirmed}
+    set_hash = hashlib.sha256(
+        "\n".join(sorted(confirmed_ids)).encode()
+    ).hexdigest()
+
+    # Repeat invocations over an unchanged confirmed set are idempotent:
+    # --finalize is designed for repeated use, and re-paying the dedupe
+    # agent call for an identical input is pure waste.
+    if db.latest_artifact_path(ctx.run_id, "dedupe", "confirmed_set_hash") == set_hash:
+        n = db.count_dedupe_groups(ctx.run_id)
+        log.info("[%s] dedupe: confirmed set unchanged since last pass "
+                 "(%d groups) — skipping", ctx.run_id, n)
+        return n
 
     sc = ctx.stage("dedupe")
     payload = []
@@ -43,36 +83,31 @@ async def run_dedupe(ctx: StageContext, db: StateDB) -> int:
             repair_attempts=sc.repair_attempts,
             on_attempt=lambda msg: db.record_cost(ctx.run_id, "dedupe", None, msg),
         )
-    except QuotaExhaustedError as qe:
+    except QuotaExhaustedError:
         raise
     except (AgentRunError, TransientAgentError) as e:
         log.warning("[%s] dedupe failed: %s — treating each finding as its own group",
                     ctx.run_id, e)
         # Fallback: one group per finding, all canonical.
+        fallback = []
         for f in confirmed:
             gid = f"g_{f.finding_id[2:]}" if f.finding_id.startswith("f_") else f"g_{f.finding_id}"
-            db.add_dedupe_group(ctx.run_id, {
+            fallback.append({
                 "group_id": gid,
                 "root_cause": f.description[:200],
                 "canonical_finding_id": f.finding_id,
                 "member_finding_ids": [f.finding_id],
             })
-            db.assign_finding_group(ctx.run_id, f.finding_id, gid, True)
-        return len(confirmed)
+        prepared = _prepare_groups(ctx.run_id, fallback, confirmed_ids)
+        applied = db.apply_dedupe_groups(ctx.run_id, prepared)
+        db.add_artifact(ctx.run_id, "dedupe", None, "confirmed_set_hash", set_hash)
+        return applied
 
     groups = result.payload.get("groups", [])
     db.add_artifact(ctx.run_id, "dedupe", None, "jsonl", str(result.artifact_path))
-    for g in groups:
-        db.add_dedupe_group(ctx.run_id, g)
-        canonical = g["canonical_finding_id"]
-        for fid in g["member_finding_ids"]:
-            # Only cluster findings that exist in THIS run: the model may
-            # hallucinate ids, and unscoped assignment would reach across
-            # runs sharing this database.
-            if not any(f.finding_id == fid for f in confirmed):
-                log.warning("[%s] dedupe: ignoring unknown member %s", ctx.run_id, fid)
-                continue
-            db.assign_finding_group(ctx.run_id, fid, g["group_id"], fid == canonical)
+    prepared = _prepare_groups(ctx.run_id, groups, confirmed_ids)
+    applied = db.apply_dedupe_groups(ctx.run_id, prepared)
+    db.add_artifact(ctx.run_id, "dedupe", None, "confirmed_set_hash", set_hash)
 
-    log.info("[%s] dedupe: %d findings → %d groups", ctx.run_id, len(confirmed), len(groups))
-    return len(groups)
+    log.info("[%s] dedupe: %d findings → %d groups", ctx.run_id, len(confirmed), applied)
+    return applied
