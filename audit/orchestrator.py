@@ -9,6 +9,7 @@ skips exploration entirely and closes the run from current state.
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
@@ -184,11 +185,25 @@ async def run_pipeline(
         _check("report")
         report_path = await stages.run_report(ctx, db)
 
-        db.finish_run(run_id, "completed")
-        log.info(
-            "[%s] pipeline complete: total cost $%.4f — report at %s",
-            run_id, db.total_cost(run_id), report_path,
-        )
+        # A report that names untraced canonicals or was built by the
+        # fallback is not a clean completion: mark it partial so operators
+        # and CI can tell "everything assessed" from "closed with gaps"
+        # (--resume re-attempts the missing pieces).
+        payload = json.loads(report_path.read_text())
+        if payload.get("degraded") or payload.get("untraced_findings"):
+            db.finish_run(run_id, "partial")
+            log.warning(
+                "[%s] pipeline closed PARTIAL (report degraded or %s untraced "
+                "canonical(s)): total cost $%.4f — report at %s",
+                run_id, len(payload.get("untraced_findings", [])),
+                db.total_cost(run_id), report_path,
+            )
+        else:
+            db.finish_run(run_id, "completed")
+            log.info(
+                "[%s] pipeline complete: total cost $%.4f — report at %s",
+                run_id, db.total_cost(run_id), report_path,
+            )
         return report_path
 
     except CostExceeded as e:

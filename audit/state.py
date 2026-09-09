@@ -531,6 +531,21 @@ class StateDB:
         ).fetchone()
         return row["path"] if row else None
 
+    def untraced_canonical_ids(self, run_id: str) -> list[str]:
+        """Confirmed canonical findings with no trace row. Trace failures
+        are retryable (no verdict persisted), so "every canonical has a
+        trace" is no longer an invariant — the report must say which
+        canonicals it could not assess instead of silently omitting them."""
+        rows = self._conn.execute(
+            """SELECT f.finding_id FROM findings f
+            WHERE f.run_id = ? AND f.validation_status = 'confirmed'
+              AND f.is_canonical = 1
+              AND NOT EXISTS (SELECT 1 FROM traces t
+                              WHERE t.run_id = f.run_id AND t.finding_id = f.finding_id)""",
+            (run_id,),
+        ).fetchall()
+        return [r["finding_id"] for r in rows]
+
     def count_dedupe_groups(self, run_id: str) -> int:
         row = self._conn.execute(
             "SELECT COUNT(*) AS c FROM dedupe_groups WHERE run_id = ?", (run_id,)

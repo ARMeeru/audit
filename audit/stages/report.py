@@ -15,6 +15,11 @@ log = logging.getLogger(__name__)
 
 async def run_report(ctx: StageContext, db: StateDB) -> Path:
     reachable = db.get_reachable_canonical_findings(ctx.run_id)
+    # Trace failures are retryable and persist no row, so confirmed
+    # canonicals can exist without a trace. They must be named in the
+    # report — a silent omission reads as "no finding here" when the truth
+    # is "never assessed".
+    untraced = db.untraced_canonical_ids(ctx.run_id)
     ready = []
     for f, trace in reachable:
         ready.append({
@@ -39,6 +44,12 @@ async def run_report(ctx: StageContext, db: StateDB) -> Path:
             "target": target,
             "summary": {"total": 0, "by_severity": {}},
             "findings": [],
+            "untraced_findings": untraced,
+            "degraded": bool(untraced),
+            "degraded_reason": (
+                f"{len(untraced)} confirmed canonical(s) have no trace row "
+                "(tracer failed or quota killed the stage); they are not assessed"
+            ) if untraced else None,
         }
         out_path.write_text(json.dumps(empty, indent=2))
         log.info("[%s] report: no reachable findings — wrote empty report to %s",
@@ -65,14 +76,23 @@ async def run_report(ctx: StageContext, db: StateDB) -> Path:
     except (AgentRunError, TransientAgentError, QuotaExhaustedError) as e:
         # The fallback report is deterministic (rendered from state.db), so a
         # quota-killed report agent still yields the reachable finding set -
-        # only the prose is lost.
+        # only the prose is lost. Marked degraded: a CI consumer must be able
+        # to tell this from a clean run, and the orchestrator must not mark
+        # the run plainly "completed".
         log.error("[%s] report agent failed: %s — emitting fallback report",
                   ctx.run_id, e)
         fallback = _build_fallback_report(ctx, db, reachable, target)
+        fallback["untraced_findings"] = untraced
+        fallback["degraded"] = True
+        fallback["degraded_reason"] = (
+            f"report agent failed: {str(e)[:300]}"
+        )
         out_path.write_text(json.dumps(fallback, indent=2))
         return out_path
 
     db.add_artifact(ctx.run_id, "report", None, "jsonl", str(result.artifact_path))
+    result.payload["untraced_findings"] = untraced
+    result.payload.setdefault("degraded", False)
     out_path.write_text(json.dumps(result.payload, indent=2))
     log.info("[%s] report: %d findings written to %s",
              ctx.run_id, len(result.payload.get("findings", [])), out_path)

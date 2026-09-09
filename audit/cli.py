@@ -204,6 +204,14 @@ def run(repo: str, run_id: str | None, resume: bool, max_cost_usd: float | None,
             live_target=live_target,
             scope_notes=scope_notes,
         ))
+        run_row = db.get_run(run_id)
+        if run_row is not None and run_row["status"] == "partial":
+            console.print(
+                f"[yellow]partial[/yellow] run_id={run_id} report={report} — "
+                "closed with gaps (untraced canonicals or fallback report); "
+                "--resume re-attempts the missing pieces"
+            )
+            sys.exit(4)
         console.print(f"[green]done[/green] run_id={run_id} report={report}")
     except CostExceeded as e:
         console.print(f"[yellow]aborted[/yellow] {e}")

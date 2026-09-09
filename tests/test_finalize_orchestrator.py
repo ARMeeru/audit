@@ -7,6 +7,7 @@ would mean a defect, and the test doubles as a green-when-fixed sensor."""
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -220,3 +221,45 @@ def test_resume_runs_one_remaining_expansion_iteration(env):
     gapfill_calls = [c for c in calls if c == "run_gapfill"]
     assert len(gapfill_calls) == 1, "exactly the one remaining gapfill iteration ran"
     assert "run_report" in calls
+
+
+def test_report_run_marks_partial_when_report_degrades(env):
+    """F3/F20: a degraded report (fallback or untraced canonicals) must not
+    let the run finish as plain "completed" — operators and CI need to tell
+    'everything assessed' from 'closed with gaps'."""
+    db, cfg, tmp, calls, stub, install, _ = env
+
+    def degraded_report_stub():
+        async def _fn(ctx, db, **kwargs):
+            calls.append("run_report")
+            out = ctx.results_dir("report") / "report.json"
+            out.write_text(json.dumps({
+                "run_id": ctx.run_id,
+                "target": {"repo_path": str(ctx.repo_path)},
+                "summary": {"total": 0, "by_severity": {}},
+                "findings": [],
+                "untraced_findings": ["f_never_traced"],
+                "degraded": True,
+                "degraded_reason": "report agent failed: quota",
+            }))
+            return out
+        return _fn
+
+    install({
+        "run_recon": stub("run_recon", {}),
+        "run_hunt": stub("run_hunt", findings=0),
+        "run_validate": stub("run_validate"),
+        "run_gapfill": stub("run_gapfill", new_tasks=0),
+        "run_dedupe": stub("run_dedupe"),
+        "run_trace": stub("run_trace"),
+        "run_feedback": stub("run_feedback", new_tasks=0),
+        "run_report": degraded_report_stub(),
+    })
+    db.create_run(str(tmp), "t")
+    _run(db, cfg, tmp, finalize=True)
+
+    status = db._conn.execute(
+        "SELECT status FROM runs WHERE run_id='t'").fetchone()["status"]
+    assert status == "partial", (
+        "a degraded report must not close the run as completed"
+    )

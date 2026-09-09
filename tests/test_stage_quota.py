@@ -172,3 +172,6 @@ def test_report_quota_emits_fallback_report(stage_env, tmp_path: Path, monkeypat
     payload = json.loads(out.read_text())
     assert payload["summary"]["total"] >= 1
     assert payload["findings"], "fallback report must carry the reachable finding"
+    # F20: the fallback must be distinguishable from a clean run
+    assert payload["degraded"] is True
+    assert payload["degraded_reason"]

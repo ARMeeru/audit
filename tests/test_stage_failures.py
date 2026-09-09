@@ -294,3 +294,31 @@ def test_failed_validation_leaves_finding_unvalidated(
         "a transient validation failure must leave the finding retryable"
     )
     assert db.get_findings("poc")[0].validation_status is None
+
+def test_failed_tracer_is_named_in_the_report(
+    stage_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F3: a deterministically failing tracer used to make the finding
+    vanish — no trace row, no warning, exit 0, report written without it.
+    Correct behavior: the report names untraced canonicals explicitly."""
+    db, ctx = stage_env
+    _add_confirmed_canonical_finding(db, "f_1")
+
+    def failing_agent(**kwargs):
+        on_attempt = kwargs.get("on_attempt")
+        assert on_attempt is not None
+        on_attempt({"total_cost_usd": 0.02, "usage": {"input_tokens": 10}})
+        raise AgentRunError("[trace/f_1] schema validation failed after retries")
+
+    import audit.stages.trace as trace_mod
+    monkeypatch.setattr(trace_mod, "run_agent", failing_agent)
+    asyncio.run(trace_mod.run_trace(ctx, db))
+
+    import json
+    import audit.stages.report as report_mod
+    out = asyncio.run(report_mod.run_report(ctx, db))
+    payload = json.loads(out.read_text())
+    assert payload["untraced_findings"] == ["f_1"], (
+        "the report must name canonicals it could not assess"
+    )
+    assert payload["degraded"] is True
