@@ -1,3 +1,38 @@
+> **This fork** (`ARMeeru/audit`, branch `fix/self-audit-hardening`) diverges from
+> upstream `evilsocket/audit` in the following ways:
+>
+> - **Run-scoped state keys**: findings, traces and dedupe groups are keyed
+>   `(run_id, id)` instead of globally, so concurrent runs sharing one `state.db`
+>   can no longer silently drop each other's findings. Legacy databases migrate
+>   on open (`PRAGMA user_version` gates future migrations).
+> - **Failure-cost ledger**: API spend on failed agent attempts (retries, repair
+>   turns, quota aborts) is recorded, so `--max-cost-usd` no longer under-counts
+>   runs that are going wrong.
+> - **`--finalize`**: skip exploration entirely and close a run from current
+>   state (validate remaining -> dedupe -> trace -> report). The optional
+>   `--finalize-cost-usd` caps a single finalize invocation (per-invocation, not
+>   cumulative - a tripped cap leaves the run resumable).
+> - **Resume converges**: expansion-loop budgets are derived from artifacts, so
+>   resuming no longer re-grants exploration rounds. A deterministically failing
+>   task stops being re-queued after 3 attempts.
+> - **Trace failures are retryable**: a quota-killed tracer no longer persists a
+>   permanent unreachable verdict.
+> - **Quota deaths degrade safely**: quota-killed validate/dedupe/report stages
+>   fall back to deterministic behavior (retryable work, or a report built
+>   straight from state.db) instead of persisting corrupt state.
+> - **Exact-host gateway check** and fail-closed behavior for a gateway base URL
+>   without an auth token.
+> - **Report evidence is fence-safe**: target-influenced evidence renders inside
+>   a fence it cannot break; `AUDIT_ALLOW_API_KEY=no/off` parse as opt-out.
+> - **Egress correction**: network egress is NOT restricted to the target host
+>   by any enforced mechanism. It is a prompt-level instruction only; recon
+>   credentials are stored plaintext in result artifacts. Run in a disposable
+>   VM or container when the target is sensitive.
+>
+> The original MIT LICENSE applies; changes are documented here rather than in
+> the license file. The bundled Claude Code CLI inside `claude_agent_sdk` remains
+> Anthropic proprietary and is never committed or redistributed by this fork.
+
 # audit
 
 An 8-stage vulnerability-discovery agent, driven by your **Claude Pro / Max
