@@ -89,3 +89,13 @@ def test_on_attempt_fires_when_all_retries_exhausted(tmp_path: Path, monkeypatch
         ))
 
     assert seen == [1.0, 2.0, 3.0]
+
+def test_weekly_limit_classifies_as_quota_not_transient():
+    """A weekly-limit response is terminal quota, not a transient blip:
+    classifying it transient burned 25 minutes of backoff across 136
+    attempts on a live run instead of aborting into a resumable state."""
+    from audit.runner import _classify_api_error, QuotaExhaustedError
+    label, exc_cls = _classify_api_error(
+        "You've hit your weekly limit · resets 1pm (Asia/Dhaka)")
+    assert label == "quota_exhausted"
+    assert exc_cls is QuotaExhaustedError

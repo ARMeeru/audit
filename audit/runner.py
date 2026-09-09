@@ -79,6 +79,7 @@ _QUOTA_MARKERS = (
     # often hours out, so backoff-retrying is futile — treat it as terminal
     # and let the caller abort into a resumable state.
     "session limit",
+    "weekly limit",
     "your plan has no remaining",
 )
 
