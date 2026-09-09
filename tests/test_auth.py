@@ -306,3 +306,64 @@ def test_configure_auth_base_url_without_token_fails_closed(
     monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
     with pytest.raises(AuthError, match="non-Anthropic host"):
         configure_auth(env_file=_empty_env(tmp_path), allow_api_key=False)
+
+# ---------- F1/F27: lookalike base URL fails closed in every mode ----------
+
+def test_lookalike_base_url_raises_in_all_three_modes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A non-Anthropic BASE_URL without a gateway token must raise AuthError
+    in subscription, --allow-api-key, and gateway-without-token modes alike.
+    Each case builds a fresh environment: a prior configure_auth call deletes
+    ANTHROPIC_API_KEY from os.environ and would mask the api_key case."""
+    _require_claude_cli()
+    hostile = "https://api.anthropic.com.evil.net"
+
+    # (a) subscription mode (the original fix)
+    _clear_all_auth_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", hostile)
+    _force_non_macos(monkeypatch)
+    with pytest.raises(auth_mod.AuthError, match="non-Anthropic host"):
+        auth_mod.configure_auth()
+
+    # (b) --allow-api-key mode: the real key must never reach the hostile host
+    _clear_all_auth_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-REAL-USER-KEY")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", hostile)
+    with pytest.raises(auth_mod.AuthError, match="non-Anthropic host"):
+        auth_mod.configure_auth(allow_api_key=True)
+    # fail closed means the key never left the process, but the run refused
+    assert os.environ.get("ANTHROPIC_API_KEY") == "sk-ant-REAL-USER-KEY"
+
+    # (c) gateway base without token lands in the same guard
+    _clear_all_auth_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gw.example.com")
+    _force_non_macos(monkeypatch)
+    with pytest.raises(auth_mod.AuthError, match="non-Anthropic host"):
+        auth_mod.configure_auth()
+
+
+def test_api_key_mode_surfaces_base_url(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A green preflight in api_key mode must say WHERE the key is going:
+    AuthStatus carries the base URL in every mode, not just gateway."""
+    _require_claude_cli()
+    _clear_all_auth_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-fake")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+    status = auth_mod.configure_auth(allow_api_key=True)
+    assert status.auth_mode == "api_key"
+    assert status.gateway_base_url == "https://api.anthropic.com"
+
+
+def test_unparseable_base_url_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A malformed BASE_URL (raises ValueError inside urlparse) must classify
+    as a gateway host and fail closed with AuthError — not escape as a raw
+    ValueError past the AuthError-handling call sites (F27)."""
+    _require_claude_cli()
+    _clear_all_auth_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://[")
+    _force_non_macos(monkeypatch)
+    with pytest.raises(auth_mod.AuthError, match="non-Anthropic host"):
+        auth_mod.configure_auth()

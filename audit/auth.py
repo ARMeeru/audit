@@ -88,7 +88,16 @@ def _is_gateway_base(url: str) -> bool:
         return False
     if "://" not in u:
         u = f"https://{u}"
-    host = urlparse(u).hostname or ""
+    try:
+        host = urlparse(u).hostname or ""
+    except ValueError:
+        # Unparseable URL (e.g. malformed IPv6 literal): treat as a
+        # foreign host and fail closed rather than raising past the
+        # AuthError-handling call sites.
+        return True
+    # Deliberate single-host allowlist: only the canonical API host counts
+    # as Anthropic. Console/docs hosts are not API endpoints, so pointing
+    # BASE_URL at them is a misconfiguration and fails closed.
     return host != "api.anthropic.com"
 
 
@@ -127,6 +136,19 @@ def configure_auth(
     auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN", "").strip()
     gateway = _is_gateway_base(base_url) and bool(auth_token)
 
+    # Credential-independent rule, checked above the mode fork: a
+    # non-Anthropic BASE_URL without a gateway token must never proceed.
+    # The subscription branch used to check this, but the --allow-api-key
+    # branch skipped it, so a real API key would be sent to the hostile
+    # host with a green preflight. Validate once, for every mode.
+    if _is_gateway_base(base_url) and not auth_token:
+        raise AuthError(
+            f"ANTHROPIC_BASE_URL points at a non-Anthropic host ({base_url})\n"
+            "but ANTHROPIC_AUTH_TOKEN is not set. Credentials are never sent\n"
+            "to a custom host without an explicit gateway token: either set\n"
+            "ANTHROPIC_AUTH_TOKEN for the gateway, or unset ANTHROPIC_BASE_URL."
+        )
+
     api_key_scrubbed = False
     auth_token_was_scrubbed = False
     creds_file: Path | None = None
@@ -159,19 +181,6 @@ def configure_auth(
         if "ANTHROPIC_AUTH_TOKEN" in os.environ:
             del os.environ["ANTHROPIC_AUTH_TOKEN"]
             auth_token_was_scrubbed = True
-
-        # A non-Anthropic BASE_URL without an AUTH_TOKEN is a
-        # misconfiguration: subscription credentials must never be pointed
-        # at a foreign host, so fail closed instead of letting the SDK's
-        # CLI run against it with the active login.
-        if _is_gateway_base(base_url):
-            raise AuthError(
-                f"ANTHROPIC_BASE_URL points at a non-Anthropic host ({base_url})\n"
-                "but ANTHROPIC_AUTH_TOKEN is not set. Subscription credentials\n"
-                "are never sent to a custom host: either set ANTHROPIC_AUTH_TOKEN\n"
-                "for the gateway, or unset ANTHROPIC_BASE_URL to use subscription\n"
-                "billing."
-            )
 
         token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
         creds_file = CREDENTIALS_PATH if CREDENTIALS_PATH.exists() else None
@@ -222,6 +231,6 @@ def configure_auth(
         claude_cli_path=cli_path,
         claude_cli_version=cli_version,
         credentials_file=creds_file,
-        gateway_base_url=base_url if mode == "gateway" else None,
+        gateway_base_url=base_url or None,
         gateway_model=os.environ.get("ANTHROPIC_MODEL") if mode == "gateway" else None,
     )

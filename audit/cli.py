@@ -76,6 +76,11 @@ def auth_check(allow_api_key: bool) -> None:
     if status.auth_mode == "oauth_token":
         console.print("[green]OK[/green] using CLAUDE_CODE_OAUTH_TOKEN")
     elif status.auth_mode == "api_key":
+        if status.gateway_base_url:
+            console.print(
+                f"[green]OK[/green] using ANTHROPIC_API_KEY against "
+                f"{status.gateway_base_url} (metered API billing)"
+            )
         console.print(
             "[green]OK[/green] using ANTHROPIC_API_KEY (metered Anthropic API billing)"
         )
