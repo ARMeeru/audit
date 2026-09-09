@@ -426,6 +426,17 @@ class StateDB:
             self._conn.rollback()
             raise
 
+    def max_stage_cost(self, run_id: str, stage: str) -> float | None:
+        """Most expensive single completed task in this stage of this run.
+        Used as the per-task in-flight estimate for budget checks: an upper
+        bound, not a mean — a mean under-shoots exactly when a stage runs
+        long, which is when the cap matters."""
+        row = self._conn.execute(
+            "SELECT MAX(usd) AS m FROM costs WHERE run_id = ? AND stage = ?",
+            (run_id, stage),
+        ).fetchone()
+        return float(row["m"]) if row and row["m"] is not None else None
+
     def count_abandoned_tasks(self, run_id: str) -> int:
         """Failed tasks past the requeue ceiling — work silently given up
         on. surfaced so an operator can see the abandonment, not just the

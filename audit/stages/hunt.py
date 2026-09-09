@@ -13,6 +13,10 @@ from audit.runner import (
     run_agent,
 )
 from audit.state import StateDB, Task
+
+# Per-task estimate when this run has no hunt history yet. Upper-bound by
+# intent; a historical max replaces it as soon as one task completes.
+DEFAULT_TASK_ESTIMATE_USD = 1.0
 from audit.stages._common import StageContext, truncated_recon_summary
 
 log = logging.getLogger(__name__)
@@ -35,6 +39,13 @@ async def run_hunt(
     recon_summary = db.get_recon_output(ctx.run_id) or {}
     sem = asyncio.Semaphore(sc.concurrency)
     aborted = asyncio.Event()
+    # In-flight reservation: the cap reads committed spend, but hunt runs
+    # up to `concurrency` agents at once and committed only grows when a
+    # task COMPLETES. Reserving the per-task estimate at dispatch keeps the
+    # cap conservative: overrun is bounded by one task's estimate, not by
+    # concurrency x actual.
+    estimate = db.max_stage_cost(ctx.run_id, "hunt") or DEFAULT_TASK_ESTIMATE_USD
+    in_flight = [0.0]
 
     log.info(
         "[%s] hunt: dispatching %d tasks (concurrency=%d, model=%s)",
@@ -49,9 +60,14 @@ async def run_hunt(
                 counters["skipped"] += 1
                 return
             if budget_check is not None:
+                # check-and-increment with no await between: single-threaded
+                # event loop makes this atomic; a yield in the middle would
+                # let every concurrent task read in_flight = 0 and pass.
+                in_flight[0] += estimate
                 try:
-                    budget_check(f"hunt/{task.task_id}")
+                    budget_check(f"hunt/{task.task_id}", in_flight[0])
                 except Exception as e:
+                    in_flight[0] -= estimate
                     log.warning("[%s] hunt aborting: %s", ctx.run_id, e)
                     aborted.set()
                     counters["skipped"] += 1
@@ -105,11 +121,15 @@ async def run_hunt(
                 log.warning("[%s] hunt task %s failed: %s", ctx.run_id, task.task_id, e)
                 db.update_task_status(ctx.run_id, task.task_id, "failed")
                 counters["tasks_failed"] += 1
+                # decrement only after the callback has recorded the final
+                # attempt (on_attempt fires inside run_agent before return)
+                in_flight[0] -= estimate
                 return
             except Exception as e:
                 log.error("[%s] hunt task %s unexpected error: %s", ctx.run_id, task.task_id, e)
                 db.update_task_status(ctx.run_id, task.task_id, "failed")
                 counters["tasks_failed"] += 1
+                in_flight[0] -= estimate
                 return
 
             payload = result.payload
@@ -128,6 +148,7 @@ async def run_hunt(
             db.add_artifact(ctx.run_id, "hunt", task.task_id, "scratch_dir",
                             str(scratch))
             counters["tasks_done"] += 1
+            in_flight[0] -= estimate
             log.info(
                 "[%s] hunt %s: %d findings (cost=$%.4f)",
                 ctx.run_id, task.task_id, len(findings), result.cost_usd or 0.0,

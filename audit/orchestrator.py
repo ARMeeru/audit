@@ -89,34 +89,42 @@ async def run_pipeline(
             f"run_id {run_id!r} already exists; pass --resume to continue it."
         )
 
-    def _expansion_budget_check(stage_name: str) -> None:
-        if max_cost_usd is None:
-            return
-        spent = db.total_cost(run_id)
-        if spent >= max_cost_usd:
-            raise CostExceeded(
-                f"[{run_id}] budget exhausted before {stage_name}: "
-                f"${spent:.4f} >= ${max_cost_usd:.4f}"
-            )
-
     # Finalize's cap bounds a single invocation, never the cumulative run:
     # a tripped finalize cap leaves the run resumable (--resume --finalize
     # resets the per-invocation accounting), so the cap can never lock the
     # user out of their report.
     finalize_start_cost = db.total_cost(run_id)
 
-    def _finalize_budget_check(stage_name: str) -> None:
-        if finalize_cost_usd is None:
-            return
-        spent = db.total_cost(run_id) - finalize_start_cost
-        if spent >= finalize_cost_usd:
-            raise CostExceeded(
-                f"[{run_id}] finalize budget exhausted before {stage_name}: "
-                f"${spent:.4f} of ${finalize_cost_usd:.4f} in this invocation "
-                f"(--resume --finalize continues from here)"
-            )
+    # Composed caps, not either/or: --finalize used to REPLACE the
+    # cumulative check, silently voiding --max-cost-usd for the expensive
+    # half of the pipeline (validate and trace run opus at concurrency 10).
+    # Semantics now:
+    #   expansion: --max-cost-usd is the cumulative cap, as before.
+    #   finalize with --finalize-cost-usd: that bounds this invocation.
+    #   finalize without it: the run budget bounds this invocation too --
+    #     but only while it is not already blown, because --finalize must
+    #     stay an escape hatch that can close a run whose budget is gone.
+    checks: list[tuple[str, float, float]] = []
+    if not finalize:
+        if max_cost_usd is not None:
+            checks.append(("run", max_cost_usd, 0.0))
+    else:
+        if finalize_cost_usd is not None:
+            checks.append(("finalize", finalize_cost_usd, finalize_start_cost))
+        elif max_cost_usd is not None and finalize_start_cost < max_cost_usd:
+            checks.append(
+                ("finalize", max_cost_usd - finalize_start_cost, 0.0))
 
-    _check = _finalize_budget_check if finalize else _expansion_budget_check
+    def _check(stage_name: str, in_flight_usd: float = 0.0) -> None:
+        spent_total = db.total_cost(run_id)
+        for label, cap, baseline in checks:
+            spent = spent_total - baseline
+            if spent + in_flight_usd >= cap:
+                raise CostExceeded(
+                    f"[{run_id}] {label} budget exhausted before {stage_name}: "
+                    f"${spent + in_flight_usd:.4f} >= ${cap:.4f}"
+                    + (" (incl. in-flight estimates)" if in_flight_usd else "")
+                )
 
     try:
         if not finalize:
@@ -159,7 +167,7 @@ async def run_pipeline(
                     break
         else:
             # ---- Finalize: grade the remaining pile, never expand ----
-            _finalize_budget_check("finalize-validate")
+            _check("finalize-validate")
             await stages.run_validate(ctx, db)
 
         # ---- Stage 5: Dedupe ----
