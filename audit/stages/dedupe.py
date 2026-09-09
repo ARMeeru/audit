@@ -6,7 +6,7 @@ import logging
 
 from audit.runner import AgentRunError, QuotaExhaustedError, TransientAgentError, run_agent
 from audit.state import StateDB
-from audit.stages._common import StageContext, record_failure_cost
+from audit.stages._common import StageContext
 
 log = logging.getLogger(__name__)
 
@@ -41,14 +41,13 @@ async def run_dedupe(ctx: StageContext, db: StateDB) -> int:
             artifact_dir=ctx.results_dir("dedupe"),
             artifact_name="dedupe",
             repair_attempts=sc.repair_attempts,
+            on_attempt=lambda msg: db.record_cost(ctx.run_id, "dedupe", None, msg),
         )
     except QuotaExhaustedError as qe:
-        record_failure_cost(db, ctx.run_id, "dedupe", None, qe)
         raise
     except (AgentRunError, TransientAgentError) as e:
         log.warning("[%s] dedupe failed: %s — treating each finding as its own group",
                     ctx.run_id, e)
-        record_failure_cost(db, ctx.run_id, "dedupe", None, e)
         # Fallback: one group per finding, all canonical.
         for f in confirmed:
             gid = f"g_{f.finding_id[2:]}" if f.finding_id.startswith("f_") else f"g_{f.finding_id}"
@@ -62,7 +61,6 @@ async def run_dedupe(ctx: StageContext, db: StateDB) -> int:
         return len(confirmed)
 
     groups = result.payload.get("groups", [])
-    db.record_cost(ctx.run_id, "dedupe", None, result.raw_result_message)
     db.add_artifact(ctx.run_id, "dedupe", None, "jsonl", str(result.artifact_path))
     for g in groups:
         db.add_dedupe_group(ctx.run_id, g)

@@ -1,7 +1,9 @@
 """Stage failure-path tests: cost accounting and trace retry semantics.
 
 These run the real stage code with a stubbed `run_agent`, so no API calls
-are made."""
+are made. The stubs invoke the on_attempt kwarg the stage passes in, which
+is the stage side of the spend-ledger contract; the runner side (per-attempt
+firing inside run_agent) is covered in test_runner_cost.py."""
 
 from __future__ import annotations
 
@@ -60,8 +62,10 @@ def test_failed_hunt_attempt_records_cost(
     _add_task(db)
 
     def failing_agent(**kwargs):
+        on_attempt = kwargs.get("on_attempt")
+        assert on_attempt is not None, "stage must pass on_attempt for spend ledgering"
+        on_attempt({"total_cost_usd": 0.05, "usage": {"input_tokens": 10}})
         e = AgentRunError("[hunt/t_1] schema validation failed after retries")
-        e.result_msg = {"total_cost_usd": 0.05, "usage": {"input_tokens": 10}}
         raise e
 
     monkeypatch.setattr(hunt_mod, "run_agent", failing_agent)
@@ -79,8 +83,10 @@ def test_failed_trace_attempt_is_retryable_on_resume(
     _add_confirmed_canonical_finding(db)
 
     def failing_agent(**kwargs):
+        on_attempt = kwargs.get("on_attempt")
+        assert on_attempt is not None, "stage must pass on_attempt for spend ledgering"
+        on_attempt({"total_cost_usd": 0.02, "usage": {"input_tokens": 10}})
         e = AgentRunError("[trace/f_1] schema validation failed after retries")
-        e.result_msg = {"total_cost_usd": 0.02, "usage": {"input_tokens": 10}}
         raise e
 
     monkeypatch.setattr(trace_mod, "run_agent", failing_agent)

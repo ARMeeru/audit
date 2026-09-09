@@ -13,7 +13,7 @@ from audit.runner import (
     run_agent,
 )
 from audit.state import StateDB, Task
-from audit.stages._common import StageContext, record_failure_cost, truncated_recon_summary
+from audit.stages._common import StageContext, truncated_recon_summary
 
 log = logging.getLogger(__name__)
 
@@ -85,6 +85,8 @@ async def run_hunt(
                     artifact_dir=ctx.results_dir("hunt"),
                     artifact_name=task.task_id,
                     repair_attempts=sc.repair_attempts,
+                    on_attempt=lambda msg, _ref=task.task_id: db.record_cost(
+                        ctx.run_id, "hunt", _ref, msg),
                 )
             except QuotaExhaustedError as quota_error:
                 # Subscription quota/session limit hit mid-flight. Don't burn
@@ -96,19 +98,16 @@ async def run_hunt(
                     "[%s] hunt task %s hit subscription quota — aborting stage",
                     ctx.run_id, task.task_id,
                 )
-                record_failure_cost(db, ctx.run_id, "hunt", task.task_id, quota_error)
                 db.update_task_status(task.task_id, "pending")
                 aborted.set()
                 raise
             except (AgentRunError, TransientAgentError) as e:
                 log.warning("[%s] hunt task %s failed: %s", ctx.run_id, task.task_id, e)
-                record_failure_cost(db, ctx.run_id, "hunt", task.task_id, e)
                 db.update_task_status(task.task_id, "failed")
                 counters["tasks_failed"] += 1
                 return
             except Exception as e:
                 log.error("[%s] hunt task %s unexpected error: %s", ctx.run_id, task.task_id, e)
-                record_failure_cost(db, ctx.run_id, "hunt", task.task_id, e)
                 db.update_task_status(task.task_id, "failed")
                 counters["tasks_failed"] += 1
                 return
@@ -119,7 +118,6 @@ async def run_hunt(
                 db.add_finding(ctx.run_id, task.task_id, f)
                 counters["findings"] += 1
             db.update_task_status(task.task_id, "done")
-            db.record_cost(ctx.run_id, "hunt", task.task_id, result.raw_result_message)
             db.add_artifact(ctx.run_id, "hunt", task.task_id, "jsonl",
                             str(result.artifact_path))
             db.add_artifact(ctx.run_id, "hunt", task.task_id, "scratch_dir",

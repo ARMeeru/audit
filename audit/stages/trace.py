@@ -7,7 +7,7 @@ import logging
 
 from audit.runner import AgentRunError, QuotaExhaustedError, TransientAgentError, run_agent
 from audit.state import Finding, StateDB
-from audit.stages._common import StageContext, record_failure_cost, truncated_recon_summary
+from audit.stages._common import StageContext, truncated_recon_summary
 
 log = logging.getLogger(__name__)
 
@@ -58,13 +58,14 @@ async def run_trace(ctx: StageContext, db: StateDB) -> int:
                     artifact_dir=ctx.results_dir("trace"),
                     artifact_name=f.finding_id,
                     repair_attempts=sc.repair_attempts,
+                    on_attempt=lambda msg, _fid=f.finding_id: db.record_cost(
+                        ctx.run_id, "trace", _fid, msg),
                 )
             except QuotaExhaustedError as qe:
                 # Quota is the pipeline's stop signal: record the spend, stop
                 # dispatching siblings, and abort into a resumable state.
                 # Unlike a real trace verdict, nothing is persisted — resume
                 # re-attempts this finding.
-                record_failure_cost(db, ctx.run_id, "trace", f.finding_id, qe)
                 log.error(
                     "[%s] trace %s hit subscription quota — aborting stage",
                     ctx.run_id, f.finding_id,
@@ -80,7 +81,6 @@ async def run_trace(ctx: StageContext, db: StateDB) -> int:
                 # report (resume skips findings that already have a trace
                 # row). Leaving no trace lets --resume re-attempt it. The
                 # real API spend still gets recorded.
-                record_failure_cost(db, ctx.run_id, "trace", f.finding_id, e)
                 return
 
             db.add_trace(ctx.run_id, f.finding_id, result.payload)

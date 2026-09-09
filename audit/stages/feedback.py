@@ -6,7 +6,7 @@ import logging
 
 from audit.runner import AgentRunError, QuotaExhaustedError, TransientAgentError, run_agent
 from audit.state import StateDB
-from audit.stages._common import StageContext, record_failure_cost, truncated_recon_summary
+from audit.stages._common import StageContext, truncated_recon_summary
 
 log = logging.getLogger(__name__)
 
@@ -44,13 +44,12 @@ async def run_feedback(ctx: StageContext, db: StateDB,
             artifact_dir=ctx.results_dir("feedback"),
             artifact_name="feedback",
             repair_attempts=sc.repair_attempts,
+            on_attempt=lambda msg: db.record_cost(ctx.run_id, "feedback", None, msg),
         )
-    except QuotaExhaustedError as qe:
-        record_failure_cost(db, ctx.run_id, "feedback", None, qe)
+    except QuotaExhaustedError:
         raise
     except (AgentRunError, TransientAgentError) as e:
         log.warning("[%s] feedback failed: %s", ctx.run_id, e)
-        record_failure_cost(db, ctx.run_id, "feedback", None, e)
         return 0
 
     new_tasks = result.payload.get("new_hunt_tasks", []) or []
@@ -62,7 +61,6 @@ async def run_feedback(ctx: StageContext, db: StateDB,
             continue
         db.add_task(ctx.run_id, t)
         added += 1
-    db.record_cost(ctx.run_id, "feedback", None, result.raw_result_message)
     db.add_artifact(ctx.run_id, "feedback", None, "jsonl", str(result.artifact_path))
     log.info("[%s] feedback: %d new tasks from %d reachable traces",
              ctx.run_id, added, len(reachable))

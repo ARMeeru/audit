@@ -7,7 +7,7 @@ import logging
 
 from audit.runner import AgentRunError, QuotaExhaustedError, TransientAgentError, run_agent
 from audit.state import Finding, StateDB
-from audit.stages._common import StageContext, record_failure_cost
+from audit.stages._common import StageContext
 
 log = logging.getLogger(__name__)
 
@@ -64,13 +64,14 @@ async def run_validate(ctx: StageContext, db: StateDB) -> int:
                     artifact_dir=ctx.results_dir("validate"),
                     artifact_name=f.finding_id,
                     repair_attempts=sc.repair_attempts,
+                    on_attempt=lambda msg, _fid=f.finding_id: db.record_cost(
+                        ctx.run_id, "validate", _fid, msg),
                 )
             except QuotaExhaustedError as qe:
                 # Quota is the pipeline's stop signal, not this finding's
                 # failure: record the spend, stop dispatching siblings, and
                 # re-raise so the run aborts into a resumable state. The
                 # finding stays unvalidated and is re-attempted on resume.
-                record_failure_cost(db, ctx.run_id, "validate", f.finding_id, qe)
                 log.error(
                     "[%s] validate %s hit subscription quota — aborting stage",
                     ctx.run_id, f.finding_id,
@@ -81,7 +82,6 @@ async def run_validate(ctx: StageContext, db: StateDB) -> int:
             except (AgentRunError, TransientAgentError) as e:
                 log.warning("[%s] validate %s failed: %s", ctx.run_id, f.finding_id, e)
                 counters["failed"] += 1
-                record_failure_cost(db, ctx.run_id, "validate", f.finding_id, e)
                 # Treat unparseable validation as needs_more_info to avoid
                 # silently confirming.
                 db.set_finding_validation(

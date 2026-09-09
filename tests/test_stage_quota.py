@@ -22,12 +22,9 @@ from audit.stages._common import StageContext
 
 @pytest.fixture()
 def stage_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(
-        __import__("audit.stages._common", fromlist=["RESULTS"]),
-        "RESULTS", tmp_path / "results")
-    monkeypatch.setattr(
-        __import__("audit.stages._common", fromlist=["RESULTS"]),
-        "WORK", tmp_path / "work")
+    import audit.stages._common as common_mod
+    monkeypatch.setattr(common_mod, "RESULTS", tmp_path / "results")
+    monkeypatch.setattr(common_mod, "WORK", tmp_path / "work")
     db = StateDB(tmp_path / "state.db")
     ctx = StageContext(run_id="q", repo_path=tmp_path / "repo", config=load_config())
     return db, ctx, tmp_path
@@ -64,6 +61,9 @@ def test_validate_quota_records_cost_drains_and_aborts(stage_env, monkeypatch):
 
     async def quota_agent(**kwargs):
         calls.append("called")
+        on_attempt = kwargs.get("on_attempt")
+        assert on_attempt is not None, "stage must pass on_attempt for spend ledgering"
+        on_attempt({"total_cost_usd": 0.03, "usage": {"input_tokens": 10}})
         raise _quota(0.03)
 
     monkeypatch.setattr(validate_mod, "run_agent", quota_agent)
@@ -96,6 +96,9 @@ def test_trace_quota_records_cost_and_stays_retryable(stage_env, monkeypatch):
 
     async def quota_agent(**kwargs):
         calls.append("called")
+        on_attempt = kwargs.get("on_attempt")
+        assert on_attempt is not None, "stage must pass on_attempt for spend ledgering"
+        on_attempt({"total_cost_usd": 0.05, "usage": {"input_tokens": 10}})
         raise _quota(0.05)
 
     monkeypatch.setattr(trace_mod, "run_agent", quota_agent)
@@ -128,6 +131,9 @@ def test_report_quota_emits_fallback_report(stage_env, tmp_path: Path, monkeypat
                               "entry_points": [], "call_chain": []})
 
     async def quota_agent(**kwargs):
+        on_attempt = kwargs.get("on_attempt")
+        assert on_attempt is not None, "stage must pass on_attempt for spend ledgering"
+        on_attempt({"total_cost_usd": 0.01, "usage": {"input_tokens": 10}})
         raise _quota(0.01)
 
     monkeypatch.setattr(report_mod, "run_agent", quota_agent)

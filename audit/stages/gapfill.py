@@ -7,7 +7,7 @@ from collections import defaultdict
 
 from audit.runner import AgentRunError, QuotaExhaustedError, TransientAgentError, run_agent
 from audit.state import StateDB
-from audit.stages._common import StageContext, record_failure_cost, truncated_recon_summary
+from audit.stages._common import StageContext, truncated_recon_summary
 
 log = logging.getLogger(__name__)
 
@@ -69,13 +69,12 @@ async def run_gapfill(ctx: StageContext, db: StateDB,
             artifact_dir=ctx.results_dir("gapfill"),
             artifact_name=f"gapfill_{_iter_tag(ctx.run_id, db)}",
             repair_attempts=sc.repair_attempts,
+            on_attempt=lambda msg: db.record_cost(ctx.run_id, "gapfill", None, msg),
         )
-    except QuotaExhaustedError as qe:
-        record_failure_cost(db, ctx.run_id, "gapfill", None, qe)
+    except QuotaExhaustedError:
         raise
     except (AgentRunError, TransientAgentError) as e:
         log.warning("[%s] gapfill failed: %s — skipping iteration", ctx.run_id, e)
-        record_failure_cost(db, ctx.run_id, "gapfill", None, e)
         return 0
 
     new_tasks = result.payload.get("new_tasks", []) or []
@@ -87,7 +86,6 @@ async def run_gapfill(ctx: StageContext, db: StateDB,
             continue  # skip duplicate id
         db.add_task(ctx.run_id, t)
         added += 1
-    db.record_cost(ctx.run_id, "gapfill", None, result.raw_result_message)
     db.add_artifact(ctx.run_id, "gapfill", None, "jsonl", str(result.artifact_path))
     log.info("[%s] gapfill: added %d new tasks", ctx.run_id, added)
     return added

@@ -60,6 +60,7 @@ async def run_report(ctx: StageContext, db: StateDB) -> Path:
             artifact_dir=ctx.results_dir("report"),
             artifact_name="report_agent",
             repair_attempts=max(sc.repair_attempts, 2),  # report MUST validate
+            on_attempt=lambda msg: db.record_cost(ctx.run_id, "report", None, msg),
         )
     except (AgentRunError, TransientAgentError, QuotaExhaustedError) as e:
         # The fallback report is deterministic (rendered from state.db), so a
@@ -71,7 +72,6 @@ async def run_report(ctx: StageContext, db: StateDB) -> Path:
         out_path.write_text(json.dumps(fallback, indent=2))
         return out_path
 
-    db.record_cost(ctx.run_id, "report", None, result.raw_result_message)
     db.add_artifact(ctx.run_id, "report", None, "jsonl", str(result.artifact_path))
     out_path.write_text(json.dumps(result.payload, indent=2))
     log.info("[%s] report: %d findings written to %s",

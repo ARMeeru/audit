@@ -21,6 +21,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 from claude_agent_sdk import (
@@ -122,6 +123,7 @@ async def run_agent(
     repair_attempts: int = 1,
     transient_retries: int = 3,
     transient_base_delay: float = 30.0,
+    on_attempt: "Callable[[dict], None] | None" = None,
 ) -> AgentResult:
     """Run one agent, retrying transient API errors with exponential backoff.
 
@@ -130,6 +132,12 @@ async def run_agent(
     backoff retries are exhausted. Raises `AgentRunError` if the model
     produced parseable output that doesn't match the schema even after
     repair turns.
+
+    `on_attempt` is invoked once per completed API round-trip (initial
+    response, every repair turn) with that response's result-message dict,
+    regardless of whether the attempt ultimately succeeds. Callers use it
+    to record spend against the run's ledger: retries and repair turns
+    cost real money and must be visible to --max-cost-usd.
     """
     last_exc: RuntimeError | None = None
     for attempt in range(transient_retries + 1):
@@ -148,6 +156,7 @@ async def run_agent(
                 artifact_dir=artifact_dir,
                 artifact_name=artifact_name,
                 repair_attempts=repair_attempts,
+                on_attempt=on_attempt,
             )
         except QuotaExhaustedError:
             raise
@@ -181,6 +190,7 @@ async def _run_agent_once(
     artifact_dir: Path,
     artifact_name: str,
     repair_attempts: int,
+    on_attempt: Callable[[dict], None] | None = None,
 ) -> AgentResult:
     """Single attempt. Raises TransientAgentError / QuotaExhaustedError
     before schema validation if the API returned is_error=True."""
@@ -235,6 +245,8 @@ async def _run_agent_once(
         try:
             await client.query(initial_prompt)
             last_text, last_result_msg = await _drain(client, art)
+            if on_attempt is not None and last_result_msg:
+                on_attempt(last_result_msg)
 
             # Before schema validation: was this a real model response, or
             # did the CLI surface an API error as the assistant text?
@@ -260,6 +272,8 @@ async def _run_agent_once(
                 _write_artifact(art, {"kind": "repair_request", "text": repair_prompt[:50000]})
                 await client.query(repair_prompt)
                 last_text, last_result_msg = await _drain(client, art)
+                if on_attempt is not None and last_result_msg:
+                    on_attempt(last_result_msg)
                 # An API error on the repair turn is also retry-worthy.
                 if last_result_msg.get("is_error"):
                     label, exc_cls = _classify_api_error(last_text)
