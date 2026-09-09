@@ -73,6 +73,13 @@ async def run_pipeline(
             requeued = db.reset_incomplete_tasks(run_id)
             if requeued:
                 log.info("[%s] resume: re-queued %d interrupted/failed tasks", run_id, requeued)
+            abandoned = db.count_abandoned_tasks(run_id)
+            if abandoned:
+                log.warning(
+                    "[%s] %d failed task(s) past the retry ceiling were NOT "
+                    "re-queued (permanently abandoned) — see audit status",
+                    run_id, abandoned,
+                )
         if finalize:
             log.info("[%s] resuming in finalize mode (no exploration)", run_id)
         else:

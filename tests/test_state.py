@@ -25,7 +25,7 @@ def test_run_and_task_lifecycle(tmp_path: Path) -> None:
     assert len(pending) == 1
     assert pending[0].task_id == "t_1"
 
-    db.update_task_status("t_1", "done")
+    db.update_task_status(rid, "t_1", "done")
     assert db.get_pending_tasks(rid) == []
     assert any(t.status == "done" for t in db.get_all_tasks(rid))
 
@@ -44,7 +44,7 @@ def test_reset_incomplete_tasks(tmp_path: Path) -> None:
             "target_files": ["a.py"], "rationale": "r", "priority": 1,
             "source": "recon",
         })
-        db.update_task_status(tid, status)
+        db.update_task_status(rid, tid, status)
 
     n = db.reset_incomplete_tasks(rid)
     assert n == 2  # only running + failed are re-queued
@@ -187,31 +187,211 @@ def test_traces_are_run_scoped(tmp_path: Path) -> None:
     db.close()
 
 
-LEGACY_FINDINGS_SQL = """
-CREATE TABLE tasks (
-    task_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, source TEXT NOT NULL,
-    attack_class TEXT NOT NULL, scope_hint TEXT NOT NULL, target_files TEXT NOT NULL,
-    rationale TEXT, priority INTEGER NOT NULL DEFAULT 3,
-    status TEXT NOT NULL DEFAULT 'pending', raw_json TEXT NOT NULL,
-    created_at REAL NOT NULL, updated_at REAL NOT NULL
+V0_SCHEMA_SQL = """\
+
+CREATE TABLE IF NOT EXISTS runs (
+    run_id TEXT PRIMARY KEY,
+    repo_path TEXT NOT NULL,
+    started_at REAL NOT NULL,
+    finished_at REAL,
+    status TEXT NOT NULL DEFAULT 'running'
 );
-CREATE TABLE traces (
+
+CREATE TABLE IF NOT EXISTS recon_outputs (
+    run_id TEXT PRIMARY KEY,
+    raw_json TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(run_id)
+);
+
+CREATE TABLE IF NOT EXISTS tasks (
+    task_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    attack_class TEXT NOT NULL,
+    scope_hint TEXT NOT NULL,
+    target_files TEXT NOT NULL,
+    rationale TEXT,
+    priority INTEGER NOT NULL DEFAULT 3,
+    status TEXT NOT NULL DEFAULT 'pending',
+    raw_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(run_id)
+);
+
+CREATE TABLE IF NOT EXISTS findings (
+    finding_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    file TEXT NOT NULL,
+    line_start INTEGER NOT NULL,
+    line_end INTEGER NOT NULL,
+    vuln_class TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    description TEXT NOT NULL,
+    evidence TEXT NOT NULL,
+    poc_succeeded INTEGER DEFAULT 0,
+    confidence REAL,
+    raw_json TEXT NOT NULL,
+    validation_status TEXT,
+    validation_json TEXT,
+    group_id TEXT,
+    is_canonical INTEGER DEFAULT 0,
+    FOREIGN KEY (task_id) REFERENCES tasks(task_id)
+);
+
+CREATE TABLE IF NOT EXISTS traces (
     finding_id TEXT PRIMARY KEY,
     reachable INTEGER NOT NULL,
     confidence REAL,
     rationale TEXT,
-    raw_json TEXT NOT NULL
+    raw_json TEXT NOT NULL,
+    FOREIGN KEY (finding_id) REFERENCES findings(finding_id)
 );
-CREATE TABLE findings (
+
+CREATE TABLE IF NOT EXISTS dedupe_groups (
+    group_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    root_cause TEXT NOT NULL,
+    canonical_finding_id TEXT NOT NULL,
+    raw_json TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(run_id)
+);
+
+CREATE TABLE IF NOT EXISTS costs (
+    cost_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    ref_id TEXT,
+    usd REAL,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    cache_read_tokens INTEGER,
+    cache_creation_tokens INTEGER,
+    num_turns INTEGER,
+    duration_ms INTEGER,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS artifacts (
+    artifact_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    ref_id TEXT,
+    kind TEXT NOT NULL,
+    path TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_run_status ON tasks(run_id, status);
+CREATE INDEX IF NOT EXISTS idx_findings_run ON findings(run_id);
+CREATE INDEX IF NOT EXISTS idx_findings_validation ON findings(validation_status);
+CREATE INDEX IF NOT EXISTS idx_findings_group ON findings(group_id);
+CREATE INDEX IF NOT EXISTS idx_costs_run_stage ON costs(run_id, stage);
+"""
+
+# executescript form of the same constant (the constant above documents
+# provenance; this is the body the tests execute)
+LEGACY_V0_SQL = """
+CREATE TABLE IF NOT EXISTS runs (
+    run_id TEXT PRIMARY KEY,
+    repo_path TEXT NOT NULL,
+    started_at REAL NOT NULL,
+    finished_at REAL,
+    status TEXT NOT NULL DEFAULT 'running'
+);
+
+CREATE TABLE IF NOT EXISTS recon_outputs (
+    run_id TEXT PRIMARY KEY,
+    raw_json TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(run_id)
+);
+
+CREATE TABLE IF NOT EXISTS tasks (
+    task_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    attack_class TEXT NOT NULL,
+    scope_hint TEXT NOT NULL,
+    target_files TEXT NOT NULL,
+    rationale TEXT,
+    priority INTEGER NOT NULL DEFAULT 3,
+    status TEXT NOT NULL DEFAULT 'pending',
+    raw_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(run_id)
+);
+
+CREATE TABLE IF NOT EXISTS findings (
     finding_id TEXT PRIMARY KEY,
-    task_id TEXT NOT NULL, run_id TEXT NOT NULL, file TEXT NOT NULL,
-    line_start INTEGER NOT NULL, line_end INTEGER NOT NULL,
-    vuln_class TEXT NOT NULL, severity TEXT NOT NULL,
-    description TEXT NOT NULL, evidence TEXT NOT NULL,
-    poc_succeeded INTEGER DEFAULT 0, confidence REAL, raw_json TEXT NOT NULL,
-    validation_status TEXT, validation_json TEXT, group_id TEXT,
-    is_canonical INTEGER DEFAULT 0
+    task_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    file TEXT NOT NULL,
+    line_start INTEGER NOT NULL,
+    line_end INTEGER NOT NULL,
+    vuln_class TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    description TEXT NOT NULL,
+    evidence TEXT NOT NULL,
+    poc_succeeded INTEGER DEFAULT 0,
+    confidence REAL,
+    raw_json TEXT NOT NULL,
+    validation_status TEXT,
+    validation_json TEXT,
+    group_id TEXT,
+    is_canonical INTEGER DEFAULT 0,
+    FOREIGN KEY (task_id) REFERENCES tasks(task_id)
 );
+
+CREATE TABLE IF NOT EXISTS traces (
+    finding_id TEXT PRIMARY KEY,
+    reachable INTEGER NOT NULL,
+    confidence REAL,
+    rationale TEXT,
+    raw_json TEXT NOT NULL,
+    FOREIGN KEY (finding_id) REFERENCES findings(finding_id)
+);
+
+CREATE TABLE IF NOT EXISTS dedupe_groups (
+    group_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    root_cause TEXT NOT NULL,
+    canonical_finding_id TEXT NOT NULL,
+    raw_json TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(run_id)
+);
+
+CREATE TABLE IF NOT EXISTS costs (
+    cost_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    ref_id TEXT,
+    usd REAL,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    cache_read_tokens INTEGER,
+    cache_creation_tokens INTEGER,
+    num_turns INTEGER,
+    duration_ms INTEGER,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS artifacts (
+    artifact_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    ref_id TEXT,
+    kind TEXT NOT NULL,
+    path TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_run_status ON tasks(run_id, status);
+CREATE INDEX IF NOT EXISTS idx_findings_run ON findings(run_id);
+CREATE INDEX IF NOT EXISTS idx_findings_validation ON findings(validation_status);
+CREATE INDEX IF NOT EXISTS idx_findings_group ON findings(group_id);
+CREATE INDEX IF NOT EXISTS idx_costs_run_stage ON costs(run_id, stage);
 """
 
 
@@ -221,11 +401,11 @@ def test_legacy_db_migrates_to_run_scoped_keys(tmp_path: Path) -> None:
     import sqlite3
     p = tmp_path / "legacy.db"
     conn = sqlite3.connect(p)
-    conn.executescript(LEGACY_FINDINGS_SQL)
+    conn.executescript(LEGACY_V0_SQL)
     conn.execute(
         "INSERT INTO tasks (task_id, run_id, source, attack_class, scope_hint,"
         " target_files, rationale, priority, status, raw_json, created_at, updated_at)"
-        " VALUES ('t_1', 'run-a', 'recon', 'sqli', 'x', '[]', '', 3, 'done', '{}', 1, 1)"
+        " VALUES ('t_1', 'run-a', 'recon', 'sqli', 'x', '[]', '', 3, 'pending', '{}', 1, 1)"
     )
     conn.execute(
         "INSERT INTO findings (finding_id, task_id, run_id, file, line_start,"
@@ -250,11 +430,11 @@ def test_legacy_traces_derive_run_id(tmp_path: Path) -> None:
     import sqlite3
     p = tmp_path / "legacy.db"
     conn = sqlite3.connect(p)
-    conn.executescript(LEGACY_FINDINGS_SQL)
+    conn.executescript(LEGACY_V0_SQL)
     conn.execute(
         "INSERT INTO tasks (task_id, run_id, source, attack_class, scope_hint,"
         " target_files, rationale, priority, status, raw_json, created_at, updated_at)"
-        " VALUES ('t_1', 'run-a', 'recon', 'sqli', 'x', '[]', '', 3, 'done', '{}', 1, 1)"
+        " VALUES ('t_1', 'run-a', 'recon', 'sqli', 'x', '[]', '', 3, 'pending', '{}', 1, 1)"
     )
     conn.execute(
         "INSERT INTO findings (finding_id, task_id, run_id, file, line_start,"
@@ -283,7 +463,7 @@ def test_attempts_ceiling_stops_requeue_at_limit(tmp_path: Path) -> None:
     db = StateDB(tmp_path / "state.db")
     rid = db.create_run("/r", "run-att")
     _task(db, rid, "t_ceiling")
-    db.update_task_status("t_ceiling", "failed")
+    db.update_task_status(rid, "t_ceiling", "failed")
     db._conn.execute("UPDATE tasks SET attempts = 3 WHERE task_id = 't_ceiling'")
     db._conn.commit()
 
@@ -299,7 +479,7 @@ def test_attempts_below_ceiling_requeued_and_incremented(tmp_path: Path) -> None
     db = StateDB(tmp_path / "state.db")
     rid = db.create_run("/r", "run-att2")
     _task(db, rid, "t_below")
-    db.update_task_status("t_below", "failed")
+    db.update_task_status(rid, "t_below", "failed")
     db._conn.execute("UPDATE tasks SET attempts = 2 WHERE task_id = 't_below'")
     db._conn.commit()
 
@@ -317,7 +497,7 @@ def test_running_task_requeued_without_increasing_attempts(tmp_path: Path) -> No
     db = StateDB(tmp_path / "state.db")
     rid = db.create_run("/r", "run-att3")
     _task(db, rid, "t_run")
-    db.update_task_status("t_run", "running")
+    db.update_task_status(rid, "t_run", "running")
 
     assert db.reset_incomplete_tasks(rid, max_requeues=3) == 1
     row = db._conn.execute(
@@ -361,11 +541,11 @@ def test_wal_mode_and_user_version_after_migration(tmp_path: Path) -> None:
     import sqlite3
     p = tmp_path / "legacy.db"
     conn = sqlite3.connect(p)
-    conn.executescript(LEGACY_FINDINGS_SQL)
+    conn.executescript(LEGACY_V0_SQL)
     conn.execute(
         "INSERT INTO tasks (task_id, run_id, source, attack_class, scope_hint,"
         " target_files, rationale, priority, status, raw_json, created_at, updated_at)"
-        " VALUES ('t_1', 'run-a', 'recon', 'sqli', 'x', '[]', '', 3, 'done', '{}', 1, 1)"
+        " VALUES ('t_1', 'run-a', 'recon', 'sqli', 'x', '[]', '', 3, 'pending', '{}', 1, 1)"
     )
     conn.execute(
         "INSERT INTO findings (finding_id, task_id, run_id, file, line_start,"
@@ -377,6 +557,101 @@ def test_wal_mode_and_user_version_after_migration(tmp_path: Path) -> None:
 
     db = StateDB(p)
     assert db._conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-    assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 2
     assert len(db.get_findings("run-a")) == 1
     db.close()
+
+import asyncio
+
+
+def test_v2_migration_scopes_tasks_and_keeps_fk_intact(tmp_path: Path) -> None:
+    """F7: v2 run-scopes tasks. The rename must not leave findings'
+    FOREIGN KEY pointing at the dropped tasks_legacy table (verified
+    hazard: ALTER TABLE RENAME rewrites the reference and DROP strands
+    it). The migrated schema must reference plain `tasks`, and a second
+    run must be able to hold a task_id a first run already used."""
+    import sqlite3
+    p = tmp_path / "legacy.db"
+    conn = sqlite3.connect(p)
+    conn.executescript(LEGACY_V0_SQL)
+    conn.execute(
+        "INSERT INTO tasks (task_id, run_id, source, attack_class, scope_hint,"
+        " target_files, rationale, priority, status, raw_json, created_at, updated_at)"
+        " VALUES ('t_1', 'run-a', 'recon', 'sqli', 'x', '[]', '', 3, 'pending', '{}', 1, 1)"
+    )
+    conn.commit()
+    conn.close()
+
+    db = StateDB(p)
+    fk_sql = db._conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='findings'"
+    ).fetchone()["sql"]
+    assert 'REFERENCES "tasks_legacy"' not in fk_sql, "dangling FK after migration"
+    assert "REFERENCES tasks(task_id)" in fk_sql
+    assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+
+    # two runs, same task_id: both rows survive (the old global PK dropped one)
+    db.add_task("run-a", {"task_id": "t_1", "attack_class": "sqli",
+                          "scope_hint": "x", "target_files": ["a.py"],
+                          "rationale": "r", "priority": 1, "source": "recon"})
+    db.add_task("run-b", {"task_id": "t_1", "attack_class": "sqli",
+                          "scope_hint": "x", "target_files": ["a.py"],
+                          "rationale": "r", "priority": 1, "source": "recon"})
+    assert len(db.get_all_tasks("run-a")) == 1
+    assert len(db.get_all_tasks("run-b")) == 1
+    # and run B marking its copy done must not touch run A's
+    db.update_task_status("run-b", "t_1", "done")
+    assert db.get_all_tasks("run-a")[0].status == "pending"
+
+
+def test_add_finding_replay_noops_but_cross_task_collision_suffixes(tmp_path: Path) -> None:
+    """F8: replaying the same hunt task (crash between finding writes and
+    the done flip) must not duplicate findings; the same id from a
+    DIFFERENT task is a real collision and keeps both via suffix."""
+    db = StateDB(tmp_path / "state.db")
+    rid = db.create_run("/r", "test_run")
+    db.add_task(rid, {"task_id": "t_1", "attack_class": "sqli",
+                      "scope_hint": "x", "target_files": ["a.py"],
+                      "rationale": "r", "priority": 1, "source": "recon"})
+    db.add_task(rid, {"task_id": "t_2", "attack_class": "sqli",
+                      "scope_hint": "x", "target_files": ["a.py"],
+                      "rationale": "r", "priority": 1, "source": "recon"})
+    finding = {"finding_id": "f_1", "file": "a.py", "line_start": 1,
+               "line_end": 2, "vuln_class": "sqli", "severity": "high",
+               "description": "d", "evidence_snippet": "e", "confidence": 0.9}
+
+    for _ in range(3):
+        db.add_finding(rid, "t_1", dict(finding))
+    rows = [f.finding_id for f in db.get_findings(rid)]
+    assert rows == ["f_1"], "same-task replay must no-op, not duplicate"
+
+    db.add_finding(rid, "t_2", dict(finding))
+    rows = sorted(f.finding_id for f in db.get_findings(rid))
+    assert rows == ["f_1", "f_1_2"], "cross-task collision must keep both"
+
+
+def test_dispatch_spends_an_attempt_and_ceiling_filters(tmp_path: Path) -> None:
+    """F10: the attempts counter belongs at dispatch (a crash leaves
+    'running' without passing any handler; hunt's quota path writes
+    'pending' directly — neither was counted before). Pending dispatch
+    must also skip tasks past the ceiling."""
+    db = StateDB(tmp_path / "state.db")
+    rid = db.create_run("/r", "test_run")
+    for tid in ("t_a", "t_b", "t_c"):
+        db.add_task(rid, {"task_id": tid, "attack_class": "sqli",
+                          "scope_hint": "x", "target_files": ["a.py"],
+                          "rationale": "r", "priority": 1, "source": "recon"})
+    # crash-simulate: dispatch burns an attempt even though no handler runs
+    for _ in range(3):
+        db.begin_task(rid, "t_a")
+    assert db.get_all_tasks(rid)[0].status == "running"
+    db.update_task_status(rid, "t_a", "pending")
+    pending = [t.task_id for t in db.get_pending_tasks(rid)]
+    assert "t_a" not in pending, "task past the attempt ceiling must not re-dispatch"
+    assert {"t_b", "t_c"} <= set(pending)
+    # completing resets the strike
+    db.begin_task(rid, "t_b")
+    db.complete_task(rid, "t_b", [])
+    t_b = [t for t in db.get_all_tasks(rid) if t.task_id == "t_b"][0]
+    assert t_b.status == "done" and t_b.attempts == 0
+

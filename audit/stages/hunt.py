@@ -56,7 +56,7 @@ async def run_hunt(
                     aborted.set()
                     counters["skipped"] += 1
                     return
-            db.update_task_status(task.task_id, "running")
+            db.begin_task(ctx.run_id, task.task_id)
             scratch = ctx.work_dir("hunt", task.task_id)
             subsystem_hint = task.target_files[0] if task.target_files else None
             user_input = {
@@ -98,26 +98,31 @@ async def run_hunt(
                     "[%s] hunt task %s hit subscription quota — aborting stage",
                     ctx.run_id, task.task_id,
                 )
-                db.update_task_status(task.task_id, "pending")
+                db.update_task_status(ctx.run_id, task.task_id, "pending")
                 aborted.set()
                 raise
             except (AgentRunError, TransientAgentError) as e:
                 log.warning("[%s] hunt task %s failed: %s", ctx.run_id, task.task_id, e)
-                db.update_task_status(task.task_id, "failed")
+                db.update_task_status(ctx.run_id, task.task_id, "failed")
                 counters["tasks_failed"] += 1
                 return
             except Exception as e:
                 log.error("[%s] hunt task %s unexpected error: %s", ctx.run_id, task.task_id, e)
-                db.update_task_status(task.task_id, "failed")
+                db.update_task_status(ctx.run_id, task.task_id, "failed")
                 counters["tasks_failed"] += 1
                 return
 
             payload = result.payload
             findings = payload.get("findings", []) or []
+            # findings + done flip are one transaction: a crash between the
+            # writes used to leave the task 'running', and the resume
+            # re-dispatch re-inserted every finding as duplicates.
+            prepared = []
             for f in findings:
-                db.add_finding(ctx.run_id, task.task_id, f)
+                fid = db.add_finding(ctx.run_id, task.task_id, f)
+                prepared.append((fid, f))
                 counters["findings"] += 1
-            db.update_task_status(task.task_id, "done")
+            db.complete_task(ctx.run_id, task.task_id, prepared)
             db.add_artifact(ctx.run_id, "hunt", task.task_id, "jsonl",
                             str(result.artifact_path))
             db.add_artifact(ctx.run_id, "hunt", task.task_id, "scratch_dir",

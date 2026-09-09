@@ -24,6 +24,12 @@ async def run_feedback(ctx: StageContext, db: StateDB,
     recon_summary = db.get_recon_output(ctx.run_id) or {}
     payload = [{"finding": f.raw_json, "trace": tr} for f, tr in reachable]
 
+    # Row before call, same contract as gapfill: a failed attempt consumes
+    # its feedback-loop slot, and retries don't truncate a prior attempt's
+    # JSONL (the fixed "feedback" name reused one path forever).
+    iter_tag = f"iter_{db.count_artifacts(ctx.run_id, 'feedback') + 1}"
+    artifact_path = ctx.results_dir("feedback") / f"feedback_{iter_tag}.jsonl"
+    db.add_artifact(ctx.run_id, "feedback", None, "jsonl", str(artifact_path))
     try:
         result = await run_agent(
             stage="feedback",
@@ -42,7 +48,7 @@ async def run_feedback(ctx: StageContext, db: StateDB,
             max_turns=sc.max_turns,
             permission_mode=sc.permission_mode,
             artifact_dir=ctx.results_dir("feedback"),
-            artifact_name="feedback",
+            artifact_name=f"feedback_{iter_tag}",
             repair_attempts=sc.repair_attempts,
             on_attempt=lambda msg: db.record_cost(ctx.run_id, "feedback", None, msg),
         )
@@ -61,7 +67,6 @@ async def run_feedback(ctx: StageContext, db: StateDB,
             continue
         db.add_task(ctx.run_id, t)
         added += 1
-    db.add_artifact(ctx.run_id, "feedback", None, "jsonl", str(result.artifact_path))
     log.info("[%s] feedback: %d new tasks from %d reachable traces",
              ctx.run_id, added, len(reachable))
     return added

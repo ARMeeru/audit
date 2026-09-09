@@ -322,3 +322,26 @@ def test_failed_tracer_is_named_in_the_report(
         "the report must name canonicals it could not assess"
     )
     assert payload["degraded"] is True
+def test_failed_gapfill_attempt_consumes_its_loop_slot(
+    stage_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F15: gapfill/feedback used to write their artifact row only on
+    success, so a failed attempt re-granted its own budget on the next
+    resume. The row must be reserved before the agent call."""
+    db, ctx = stage_env
+    _add_task(db)
+    # gapfill only iterates when a prior hunt completed: give it one done task
+    db.complete_task("poc", "t_1", [])
+
+    async def failing_agent(**kwargs):
+        on_attempt = kwargs.get("on_attempt")
+        assert on_attempt is not None
+        on_attempt({"total_cost_usd": 0.10, "usage": {"input_tokens": 10}})
+        raise AgentRunError("[gapfill/x] schema validation failed after retries")
+
+    import audit.stages.gapfill as gapfill_mod
+    monkeypatch.setattr(gapfill_mod, "run_agent", failing_agent)
+    asyncio.run(gapfill_mod.run_gapfill(ctx, db))
+    assert db.count_artifacts("poc", "gapfill") == 1, (
+        "a failed attempt must consume its iteration slot"
+    )

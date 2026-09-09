@@ -9,7 +9,7 @@ import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS recon_outputs (
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
-    task_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
     run_id TEXT NOT NULL,
     source TEXT NOT NULL,
     attack_class TEXT NOT NULL,
@@ -43,7 +43,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     raw_json TEXT NOT NULL,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
-    FOREIGN KEY (run_id) REFERENCES runs(run_id)
+    FOREIGN KEY (run_id) REFERENCES runs(run_id),
+    PRIMARY KEY (run_id, task_id)
 );
 
 CREATE TABLE IF NOT EXISTS findings (
@@ -133,6 +134,7 @@ class Task:
     priority: int
     status: str
     raw_json: dict
+    attempts: int = 0
 
 
 @dataclass
@@ -157,7 +159,7 @@ class Finding:
 
 
 class StateDB:
-    MIGRATION_VERSION = 1
+    MIGRATION_VERSION = 2
 
     def __init__(self, db_path: Path):
         self.path = db_path
@@ -187,6 +189,7 @@ class StateDB:
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             self._migrate_v1()
+            self._migrate_v2()
             self._conn.execute(f"PRAGMA user_version = {self.MIGRATION_VERSION}")
             self._conn.commit()
         except Exception:
@@ -244,6 +247,41 @@ class StateDB:
         task_cols = [r["name"] for r in self._conn.execute("PRAGMA table_info(tasks)").fetchall()]
         if "attempts" not in task_cols:
             self._conn.execute("ALTER TABLE tasks ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+
+    def _migrate_v2(self) -> None:
+        """v1 -> v2: tasks joined the run-scoped key family.
+
+        task_id stayed a global PRIMARY KEY in v1 while its values are
+        model-emitted and only unique per run — exactly the argument v1's
+        docstring makes for findings — so two runs sharing this database
+        dropped each other's tasks (INSERT OR IGNORE), and update_task_status
+        hit whichever run's row came first.
+
+        FK hazard (verified against a real database): renaming tasks to
+        tasks_legacy rewrites findings' FOREIGN KEY to reference
+        tasks_legacy, and DROP leaves it dangling there permanently. v1 got
+        away with the same pattern only because traces — the FK holder it
+        renamed — was itself rebuilt in the same transaction. v2 renames and
+        rebuilds all three tables in one transaction, so no dangling
+        reference ever survives. Runs after v1, so traces carry run_id."""
+        row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'"
+        ).fetchone()
+        if row is None or "PRIMARY KEY (run_id, task_id)" in row["sql"]:
+            return
+        for table in ("tasks", "findings", "traces"):
+            self._conn.execute(f"ALTER TABLE {table} RENAME TO {table}_legacy")
+        self._create_schema()
+        for table in ("tasks", "findings", "traces"):
+            new_cols = [r["name"] for r in self._conn.execute(f"PRAGMA table_info({table})").fetchall()]
+            legacy_cols = [r["name"] for r in self._conn.execute(f"PRAGMA table_info({table}_legacy)").fetchall()]
+            # map by name; tasks.attempts is new (SCHEMA default covers it)
+            shared = [c for c in new_cols if c in legacy_cols]
+            self._conn.execute(
+                f"INSERT INTO {table} ({', '.join(shared)}) "
+                f"SELECT {', '.join(shared)} FROM {table}_legacy"
+            )
+            self._conn.execute(f"DROP TABLE {table}_legacy")
 
     # ---------- runs ----------
 
@@ -315,10 +353,11 @@ class StateDB:
         )
         self._conn.commit()
 
-    def get_pending_tasks(self, run_id: str) -> list[Task]:
+    def get_pending_tasks(self, run_id: str, max_attempts: int = 3) -> list[Task]:
         rows = self._conn.execute(
-            "SELECT * FROM tasks WHERE run_id = ? AND status = 'pending' ORDER BY priority, created_at",
-            (run_id,),
+            "SELECT * FROM tasks WHERE run_id = ? AND status = 'pending' "
+            "AND attempts < ? ORDER BY priority, created_at",
+            (run_id, max_attempts),
         ).fetchall()
         return [self._row_to_task(r) for r in rows]
 
@@ -329,12 +368,74 @@ class StateDB:
         ).fetchall()
         return [self._row_to_task(r) for r in rows]
 
-    def update_task_status(self, task_id: str, status: str) -> None:
+    def update_task_status(self, run_id: str, task_id: str, status: str) -> None:
         self._conn.execute(
-            "UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?",
-            (status, time.time(), task_id),
+            "UPDATE tasks SET status = ?, updated_at = ? WHERE run_id = ? AND task_id = ?",
+            (status, time.time(), run_id, task_id),
         )
         self._conn.commit()
+
+    def begin_task(self, run_id: str, task_id: str) -> None:
+        """Flip a task to 'running' and spend one attempt, atomically.
+
+        The attempts counter belongs at the point the attempt is spent
+        (dispatch), not where the task is re-queued: a crash leaves status
+        'running' without passing through any handler, and hunt's quota
+        path writes 'pending' directly — neither increments a requeue-side
+        counter, so a deterministically hanging task re-burned full spend
+        on every resume."""
+        self._conn.execute(
+            "UPDATE tasks SET status = 'running', attempts = attempts + 1, "
+            "updated_at = ? WHERE run_id = ? AND task_id = ?",
+            (time.time(), run_id, task_id),
+        )
+        self._conn.commit()
+
+    def complete_task(self, run_id: str, task_id: str, findings: list[tuple[str, dict]]) -> None:
+        """Persist a hunt task's findings and flip it to done in one
+        transaction, resetting the attempt strike. A crash between the
+        finding writes and the status flip used to leave the task 'running';
+        the resume re-dispatch then re-inserted every finding (the findings
+        and the done flip are now indivisible)."""
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            for fid, finding in findings:
+                self._conn.execute(
+                    """INSERT INTO findings
+                    (finding_id, task_id, run_id, file, line_start, line_end,
+                     vuln_class, severity, description, evidence, poc_succeeded,
+                     confidence, raw_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        fid, task_id, run_id,
+                        finding["file"], finding["line_start"], finding["line_end"],
+                        finding["vuln_class"], finding["severity"],
+                        finding["description"], finding["evidence_snippet"],
+                        1 if (finding.get("poc") or {}).get("succeeded") else 0,
+                        finding.get("confidence"),
+                        json.dumps(finding),
+                    ),
+                )
+            self._conn.execute(
+                "UPDATE tasks SET status = 'done', attempts = 0, updated_at = ? "
+                "WHERE run_id = ? AND task_id = ?",
+                (time.time(), run_id, task_id),
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def count_abandoned_tasks(self, run_id: str) -> int:
+        """Failed tasks past the requeue ceiling — work silently given up
+        on. surfaced so an operator can see the abandonment, not just the
+        green completion."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM tasks WHERE run_id = ? AND status = 'failed' "
+            "AND attempts >= 3",
+            (run_id,),
+        ).fetchone()
+        return int(row["c"]) if row else 0
 
     def reset_incomplete_tasks(self, run_id: str, max_requeues: int = 3) -> int:
         """Re-queue interrupted and failed tasks so a resumed run re-attempts
@@ -371,13 +472,27 @@ class StateDB:
             priority=r["priority"],
             status=r["status"],
             raw_json=json.loads(r["raw_json"]),
+            attempts=r["attempts"] if "attempts" in r.keys() else 0,
         )
 
     # ---------- findings ----------
 
-    def add_finding(self, run_id: str, task_id: str, finding: dict) -> None:
+    def add_finding(self, run_id: str, task_id: str, finding: dict) -> str:
+        """Insert one finding. Returns the (possibly suffixed) finding_id.
+
+        A row already held by the SAME task means this is a replay of an
+        interrupted dispatch (crash between the finding writes and the done
+        flip): no-op. The same id from a DIFFERENT task is a genuine
+        model-emitted collision and gets a suffix — model ids are only
+        unique per task by prompt convention."""
         poc = finding.get("poc") or {}
         base = finding["finding_id"]
+        existing = self._conn.execute(
+            "SELECT task_id FROM findings WHERE run_id = ? AND finding_id = ?",
+            (run_id, base),
+        ).fetchone()
+        if existing is not None and existing["task_id"] == task_id:
+            return base
         fid = base
         n = 1
         while self._conn.execute(
