@@ -375,3 +375,36 @@ def test_fallback_report_validates_against_report_schema(stage_env):
     errors = validate_schema(payload, SCHEMAS / "report.schema.json")
     assert errors == [], f"fallback must validate: {errors[:3]}"
     assert payload["findings"][0]["variants"] == []
+
+def test_hunt_success_persists_findings_once_and_completes(
+    stage_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The success path's own sensor: findings land exactly once, the task
+    completes with its attempt strike reset. (The findings+done refactor
+    briefly double-inserted here and no existing test could see it.)"""
+    db, ctx = stage_env
+    _add_task(db)
+
+    async def ok_agent(**kwargs):
+        on_attempt = kwargs.get("on_attempt")
+        on_attempt({"total_cost_usd": 0.20, "usage": {"input_tokens": 10}})
+        class R:
+            payload = {"findings": [{
+                "finding_id": "f_1", "file": "a.py", "line_start": 1,
+                "line_end": 2, "vuln_class": "sqli", "severity": "high",
+                "description": "d", "evidence_snippet": "e", "confidence": 0.9,
+            }]}
+            raw_result_message = {"total_cost_usd": 0.20, "usage": {}}
+            from pathlib import Path as _P
+            artifact_path = _P("/tmp/h.jsonl")
+            cost_usd = 0.20
+        return R()
+
+    monkeypatch.setattr(hunt_mod, "run_agent", ok_agent)
+    asyncio.run(hunt_mod.run_hunt(ctx, db))
+
+    rows = [f.finding_id for f in db.get_findings("poc")]
+    assert rows == ["f_1"], f"findings must persist exactly once, got {rows}"
+    task = db.get_all_tasks("poc")[0]
+    assert task.status == "done" and task.attempts == 0
+    assert db.total_cost("poc") == pytest.approx(0.20)

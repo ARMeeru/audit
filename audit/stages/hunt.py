@@ -137,12 +137,8 @@ async def run_hunt(
             # findings + done flip are one transaction: a crash between the
             # writes used to leave the task 'running', and the resume
             # re-dispatch re-inserted every finding as duplicates.
-            prepared = []
-            for f in findings:
-                fid = db.add_finding(ctx.run_id, task.task_id, f)
-                prepared.append((fid, f))
-                counters["findings"] += 1
-            db.complete_task(ctx.run_id, task.task_id, prepared)
+            inserted = db.complete_task(ctx.run_id, task.task_id, findings)
+            counters["findings"] += inserted
             db.add_artifact(ctx.run_id, "hunt", task.task_id, "jsonl",
                             str(result.artifact_path))
             db.add_artifact(ctx.run_id, "hunt", task.task_id, "scratch_dir",

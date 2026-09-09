@@ -391,15 +391,23 @@ class StateDB:
         )
         self._conn.commit()
 
-    def complete_task(self, run_id: str, task_id: str, findings: list[tuple[str, dict]]) -> None:
+    def complete_task(self, run_id: str, task_id: str, findings: list[dict]) -> int:
         """Persist a hunt task's findings and flip it to done in one
         transaction, resetting the attempt strike. A crash between the
         finding writes and the status flip used to leave the task 'running';
         the resume re-dispatch then re-inserted every finding (the findings
-        and the done flip are now indivisible)."""
+        and the done flip are now indivisible). Same-task replays no-op.
+        Returns the number of NEW findings inserted."""
         self._conn.execute("BEGIN IMMEDIATE")
         try:
-            for fid, finding in findings:
+            inserted = 0
+            for finding in findings:
+                fid, insert = self._resolve_finding_id(run_id, task_id,
+                                                       finding["finding_id"])
+                if not insert:
+                    continue
+                if fid != finding["finding_id"]:
+                    finding = dict(finding, finding_id=fid)
                 self._conn.execute(
                     """INSERT INTO findings
                     (finding_id, task_id, run_id, file, line_start, line_end,
@@ -416,12 +424,14 @@ class StateDB:
                         json.dumps(finding),
                     ),
                 )
+                inserted += 1
             self._conn.execute(
                 "UPDATE tasks SET status = 'done', attempts = 0, updated_at = ? "
                 "WHERE run_id = ? AND task_id = ?",
                 (time.time(), run_id, task_id),
             )
             self._conn.commit()
+            return inserted
         except Exception:
             self._conn.rollback()
             raise
@@ -488,35 +498,44 @@ class StateDB:
 
     # ---------- findings ----------
 
-    def add_finding(self, run_id: str, task_id: str, finding: dict) -> str:
-        """Insert one finding. Returns the (possibly suffixed) finding_id.
+    def _resolve_finding_id(
+        self, run_id: str, task_id: str, base: str
+    ) -> tuple[str, bool]:
+        """Resolve a model-emitted finding id for (run_id, task_id).
 
-        A row already held by the SAME task means this is a replay of an
-        interrupted dispatch (crash between the finding writes and the done
-        flip): no-op. The same id from a DIFFERENT task is a genuine
-        model-emitted collision and gets a suffix — model ids are only
-        unique per task by prompt convention."""
-        poc = finding.get("poc") or {}
-        base = finding["finding_id"]
+        Returns (finding_id, insert_needed). A row already held by the SAME
+        task means this is a replay of an interrupted dispatch (crash
+        between the finding writes and the done flip): no insert. The same
+        id from a DIFFERENT task is a genuine model-emitted collision and
+        gets a suffix — model ids are only unique per task by prompt
+        convention."""
         existing = self._conn.execute(
             "SELECT task_id FROM findings WHERE run_id = ? AND finding_id = ?",
             (run_id, base),
         ).fetchone()
         if existing is not None and existing["task_id"] == task_id:
-            return base
+            return base, False
         fid = base
         n = 1
         while self._conn.execute(
             "SELECT 1 FROM findings WHERE run_id = ? AND finding_id = ?",
             (run_id, fid),
         ).fetchone():
-            # Model-emitted ids are only unique per task by prompt
-            # convention; two tasks may emit the same id. Keep both
-            # findings by suffixing, and keep raw_json consistent so
-            # downstream stages reference the rewritten id.
+            # Two tasks may emit the same id; keep both by suffixing and
+            # keep raw_json consistent so downstream stages reference the
+            # rewritten id.
             n += 1
             fid = f"{base}_{n}"
-        if fid != base:
+        return fid, True
+
+    def add_finding(self, run_id: str, task_id: str, finding: dict) -> str:
+        """Insert one finding. Returns the (possibly suffixed) finding_id."""
+        poc = finding.get("poc") or {}
+        fid, insert = self._resolve_finding_id(run_id, task_id,
+                                               finding["finding_id"])
+        if not insert:
+            return fid
+        if fid != finding["finding_id"]:
             finding = dict(finding, finding_id=fid)
         self._conn.execute(
             """INSERT INTO findings
