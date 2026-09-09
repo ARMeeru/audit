@@ -345,3 +345,33 @@ def test_failed_gapfill_attempt_consumes_its_loop_slot(
     assert db.count_artifacts("poc", "gapfill") == 1, (
         "a failed attempt must consume its iteration slot"
     )
+
+def test_fallback_report_validates_against_report_schema(stage_env):
+    """F21: the fallback bypasses the report agent and its repair budget,
+    so it must validate like agent output would — trace sub-objects carry
+    keys (auth_required, note) that report.schema.json forbids, and short
+    descriptions violate its minLength."""
+    db, ctx = stage_env
+    _add_confirmed_canonical_finding(db, "f_1")
+    db.set_finding_validation("poc", "f_1", "confirmed", {"verdict": "confirmed"})
+    # shorten the description below the report schema's minLength 30
+    db._conn.execute(
+        "UPDATE findings SET description = 'raw sql built' WHERE run_id='poc'")
+    db._conn.commit()
+    db.add_trace("poc", "f_1", {
+        "finding_id": "f_1", "reachable": True,
+        "entry_points": [{"kind": "http", "location": "POST /search",
+                          "auth_required": False}],
+        "call_chain": [{"file": "a.py", "function": "search", "line": 10,
+                        "note": "tainted"}],
+    })
+
+    import json
+    import audit.stages.report as report_mod
+    from audit.json_utils import validate_schema
+    from audit.stages._common import SCHEMAS
+    out = asyncio.run(report_mod.run_report(ctx, db))
+    payload = json.loads(out.read_text())
+    errors = validate_schema(payload, SCHEMAS / "report.schema.json")
+    assert errors == [], f"fallback must validate: {errors[:3]}"
+    assert payload["findings"][0]["variants"] == []

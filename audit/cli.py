@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import logging
 import os
 import sys
@@ -327,6 +328,15 @@ def _show_run_detail(db: StateDB, run_id: str) -> None:
                       "run the pipeline (or --resume --finalize) to grade them[/yellow]")
 
 
+def _md_inline(s: str) -> str:
+    r"""Escape markdown control characters for interpolation into a line.
+
+    Taint is per-report, not per-field: finding fields come from a model
+    reading attacker-influenced target code, so a field added later must be
+    safe by default. Code fences still use _code_fence."""
+    return re.sub(r"([\\`*_{}\[\]()#+\-.!|<>])", r"\\\1", str(s))
+
+
 def _code_fence(content: str) -> str:
     """A backtick fence long enough to survive any run of backticks inside
     `content`: target-influenced evidence that contains ``` must not be
@@ -351,13 +361,16 @@ def _render_markdown_report(report: dict) -> str:
                  else f"**Total findings: {s['total']}**")
     lines.append("")
     for f in report["findings"]:
-        lines.append(f"## {f['title']}")
-        lines.append(f"- **Severity**: {f['severity']}  ")
-        lines.append(f"- **Class**: {f['vuln_class']}"
+        lines.append(f"## {_md_inline(f['title'])}")
+        lines.append(f"- **Severity**: {_md_inline(f['severity'])}  ")
+        lines.append(f"- **Class**: {_md_inline(f['vuln_class'])}"
                      + (f" ({f['cwe']})" if f.get("cwe") else ""))
-        lines.append(f"- **Location**: `{f['file']}:{f['line_start']}-{f['line_end']}`  ")
+        lines.append(f"- **Location**: `{_md_inline(f['file'])}:{f['line_start']}-{f['line_end']}`  ")
         lines.append("")
-        lines.append(f["description"])
+        # description is prose from the target-influenced model output:
+        # escaped like every other inline field, so headings, images and
+        # links cannot inject structure into the rendered document
+        lines.append(_md_inline(f["description"]))
         lines.append("")
         fence = _code_fence(f["evidence"])
         lines.append(fence)
@@ -368,18 +381,18 @@ def _render_markdown_report(report: dict) -> str:
         if ep:
             lines.append("**Entry points**:")
             for e in ep:
-                lines.append(f"- `{e['kind']}` at `{e['location']}`")
+                lines.append(f"- `{_md_inline(e['kind'])}` at `{_md_inline(e['location'])}`")
             lines.append("")
         cc = f["trace"].get("call_chain", [])
         if cc:
             lines.append("**Call chain**:")
             for frame in cc:
-                lines.append(f"1. `{frame['file']}:{frame['line']}` — `{frame['function']}()`")
+                lines.append(f"1. `{_md_inline(frame['file'])}:{frame['line']}` — `{_md_inline(frame['function'])}()`")
             lines.append("")
-        lines.append(f"**Recommendation**: {f['recommendation']}")
+        lines.append(f"**Recommendation**: {_md_inline(f['recommendation'])}")
         lines.append("")
         if f.get("variants"):
-            lines.append(f"_Variants_: {', '.join(f['variants'])}")
+            lines.append(f"_Variants_: {', '.join(_md_inline(v) for v in f['variants'])}")
             lines.append("")
         lines.append("---")
         lines.append("")

@@ -6,9 +6,10 @@ import json
 import logging
 from pathlib import Path
 
+from audit.json_utils import validate_schema
 from audit.runner import AgentRunError, QuotaExhaustedError, TransientAgentError, run_agent
 from audit.state import StateDB
-from audit.stages._common import StageContext
+from audit.stages._common import SCHEMAS, StageContext
 
 log = logging.getLogger(__name__)
 
@@ -84,9 +85,15 @@ async def run_report(ctx: StageContext, db: StateDB) -> Path:
         fallback = _build_fallback_report(ctx, db, reachable, target)
         fallback["untraced_findings"] = untraced
         fallback["degraded"] = True
-        fallback["degraded_reason"] = (
-            f"report agent failed: {str(e)[:300]}"
-        )
+        fallback["degraded_reason"] = f"report agent failed: {str(e)[:300]}"
+        # The fallback bypasses the report agent and its repair budget, so
+        # it must be validated the way the agent output is: an invalid
+        # fallback document fails every downstream consumer silently.
+        errors = validate_schema(fallback, SCHEMAS / "report.schema.json")
+        if errors:
+            fallback["degraded_reason"] += " | schema errors: " + "; ".join(errors[:5])
+            log.error("[%s] fallback report violates report schema: %s",
+                      ctx.run_id, errors[:5])
         out_path.write_text(json.dumps(fallback, indent=2))
         return out_path
 
@@ -108,6 +115,22 @@ def _group_members_excluding(db: StateDB, run_id: str, group_id: str,
     return [r["finding_id"] for r in rows]
 
 
+def _project_trace_for_report(trace: dict) -> dict:
+    """Project a trace.schema.json trace onto the keys report.schema.json
+    allows (additionalProperties: false on both): entry points lose
+    auth_required, call-chain frames lose note."""
+    return {
+        "entry_points": [
+            {k: ep[k] for k in ("kind", "location", "controllable_by") if k in ep}
+            for ep in trace.get("entry_points", [])
+        ],
+        "call_chain": [
+            {k: fr[k] for k in ("file", "function", "line") if k in fr}
+            for fr in trace.get("call_chain", [])
+        ],
+    }
+
+
 def _build_fallback_report(ctx: StageContext, db: StateDB,
                            reachable, target: dict) -> dict:
     by_sev: dict[str, int] = {}
@@ -115,6 +138,11 @@ def _build_fallback_report(ctx: StageContext, db: StateDB,
     for f, trace in reachable:
         sev = f.severity
         by_sev[sev] = by_sev.get(sev, 0) + 1
+        description = f.description
+        while len(description) < 30:
+            # report.schema.json requires minLength 30; hunt findings are
+            # free-form. Extend with a truthful pointer, never invent.
+            description += " (detail in evidence)"
         findings_out.append({
             "finding_id": f.finding_id,
             "title": f"{f.vuln_class} in {f.file}",
@@ -123,13 +151,12 @@ def _build_fallback_report(ctx: StageContext, db: StateDB,
             "file": f.file,
             "line_start": f.line_start,
             "line_end": f.line_end,
-            "description": f.description,
+            "description": description,
             "evidence": f.evidence,
-            "trace": {
-                "entry_points": trace.get("entry_points", []),
-                "call_chain": trace.get("call_chain", []),
-            },
+            "trace": _project_trace_for_report(trace),
             "recommendation": "Review the sink and add input validation / use a safe API.",
+            "variants": _group_members_excluding(db, ctx.run_id, f.group_id, f.finding_id)
+                        if f.group_id else [],
         })
     return {
         "run_id": ctx.run_id,

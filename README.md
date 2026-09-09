@@ -7,6 +7,9 @@
 >   on open (`PRAGMA user_version` gates future migrations).
 > - **Failure-cost ledger**: API spend on failed agent attempts (retries, repair
 >   turns, quota aborts) is recorded, so `--max-cost-usd` no longer under-counts
+>   failing runs. Caps are enforced conservatively: hunt reserves a per-task
+>   estimate at dispatch (this run's max completed hunt cost), so overrun is
+>   bounded by one task's estimate rather than by concurrency.
 >   runs that are going wrong.
 > - **`--finalize`**: skip exploration entirely and close a run from current
 >   state (validate remaining -> dedupe -> trace -> report). The optional
@@ -207,8 +210,10 @@ audit run --repo /path/to/target --run-id live \
 ```
 
 Rules the agents follow when `--target-url` is set:
-- Network egress is restricted to that host + `127.0.0.1`. No other external
-  hosts.
+- Network egress is NOT enforced to that host: it is a prompt-level
+  instruction only, and the CLI itself contacts isbndb/OpenLibrary-style
+  services and your gateway. Run sensitive targets inside a disposable VM
+  or container.
 - A finding that doesn't reproduce against the live target is dropped or
   rejected (depending on stage) — "no fabrication".
 - Credentials flow into every relevant stage's user_input as a dict.
