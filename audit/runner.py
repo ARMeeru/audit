@@ -151,11 +151,14 @@ async def run_agent(
     produced parseable output that doesn't match the schema even after
     repair turns.
 
-    `on_attempt` is invoked once per completed API round-trip (initial
-    response, every repair turn) with that response's result-message dict,
-    regardless of whether the attempt ultimately succeeds. Callers use it
-    to record spend against the run's ledger: retries and repair turns
-    cost real money and must be visible to --max-cost-usd.
+    `on_attempt` is invoked ONCE per SDK session with that session's
+    final result-message dict, whether the session succeeded or raised.
+    Each transient retry opens a new session, so the retry loop's calls
+    sum correctly across attempts.
+
+    Do NOT call it per repair turn: ResultMessage.total_cost_usd is a
+    RUNNING SESSION TOTAL, so summing per-turn values recorded
+    1.00 + 1.80 + 2.40 for a session that cost 2.40.
     """
     last_exc: RuntimeError | None = None
     for attempt in range(transient_retries + 1):

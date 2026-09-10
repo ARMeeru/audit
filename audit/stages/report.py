@@ -101,9 +101,10 @@ def _write_report(ctx: StageContext, out_path, payload: dict):
     """Single write path for every report shape (empty, fallback, agent
     success). Drops None-valued optional keys -- the schema types
     degraded_reason as a string and the empty-report branch emitted null
-    -- and validates before writing, so no path can skip the check: the
-    most common report of all (a clean run with no reachable findings)
-    used to ship invalid."""
+    -- and validates before writing. A payload that still fails validation
+    is written ANYWAY, marked degraded with the schema errors folded into
+    degraded_reason: a flagged invalid report beats no report. Callers
+    must not assume the file validates."""
     payload = {k: v for k, v in payload.items() if v is not None}
     errors = validate_schema(payload, SCHEMAS / "report.schema.json")
     if errors:

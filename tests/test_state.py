@@ -843,3 +843,24 @@ def test_migration_completes_despite_a_concurrent_reader(tmp_path: Path) -> None
     db = StateDB(p)
     assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 3
     db.close()
+
+def test_rebuild_preserves_hand_added_indexes(tmp_path: Path) -> None:
+    """F7/R6: _rebuild drops every index by lookup but only recreates
+    SCHEMA's own -- a hand-added index on a real operator's database used
+    to be destroyed without a trace."""
+    import sqlite3
+    p = tmp_path / "legacy.db"
+    conn = sqlite3.connect(p)
+    conn.executescript(LEGACY_V0_SQL)
+    conn.execute(
+        "CREATE INDEX idx_user_custom ON findings(severity)")
+    conn.commit()
+    conn.close()
+
+    db = StateDB(p)
+    db.close()
+    conn = sqlite3.connect(p)
+    names = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'")}
+    assert "idx_user_custom" in names, "hand-added index must survive the rebuild"
+    conn.close()

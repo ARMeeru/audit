@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import time
 import uuid
@@ -218,6 +219,21 @@ class StateDB:
         version = self._conn.execute("PRAGMA user_version").fetchone()[0]
         if version >= self.MIGRATION_VERSION:
             return
+        # Any index NOT declared in SCHEMA (a hand-added performance index
+        # on a real operator's database) is destroyed by the rename+rebuild
+        # migrations -- v1's hardcoded drop list, v2's index loss, and
+        # _rebuild's lookup drop all remove it. Capture up front; replay
+        # whatever the migrations did not recreate.
+        schema_index_names = set(re.findall(
+            r"CREATE INDEX IF NOT EXISTS (\w+)", SCHEMA))
+        preserved = [
+            row["sql"] for row in self._conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'index' "
+                "AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+            if row["name"] not in schema_index_names and row["sql"]
+        ]
+
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             self._migrate_v1()
@@ -227,6 +243,9 @@ class StateDB:
             # destroyed four of five on every database it touched. CREATE
             # INDEX IF NOT EXISTS is a no-op for those still present.
             self._create_schema()
+            for sql in preserved:
+                self._conn.execute(
+                    sql.replace("CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1))
             self._conn.execute(f"PRAGMA user_version = {self.MIGRATION_VERSION}")
             self._conn.commit()
         except Exception:
@@ -298,6 +317,10 @@ class StateDB:
                 "SELECT name FROM sqlite_master WHERE type = 'index' "
                 "AND tbl_name = ? AND name NOT LIKE 'sqlite_%'", (table,)
             ).fetchall():
+                # An index follows its table on rename, so CREATE INDEX IF
+                # NOT EXISTS would no-op against the old name -- drop by
+                # lookup so SCHEMA's indexes can be recreated. Non-SCHEMA
+                # indexes are preserved and replayed at the _migrate level.
                 self._conn.execute(f"DROP INDEX IF EXISTS {row['name']}")
         for table in tables:
             self._conn.execute(f"ALTER TABLE {table} RENAME TO {table}_legacy")
