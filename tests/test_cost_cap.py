@@ -146,7 +146,13 @@ def test_first_hunt_stage_with_no_history_stays_bounded(
         db.add_task("poc", {"task_id": f"t_{i}", "attack_class": "sqli",
                             "scope_hint": "x", "target_files": ["a.py"],
                             "rationale": "r", "priority": 1, "source": "recon"})
-    # deliberately NO history: estimate starts at DEFAULT_TASK_ESTIMATE_USD
+    # deliberately NO history: estimate starts at DEFAULT_TASK_ESTIMATE_USD.
+    # Unproven configuration, stated per the sensor-arrangement rule: with a
+    # fully concurrent first wave and actuals far above the default, the
+    # one-estimate bound cannot hold even post-fix (all wave reservations
+    # use the default before any completion corrects it). This sensor
+    # exercises the synchronous-completion configuration, where the
+    # self-correction demonstrably tightens the trip point.
     from audit.stages.hunt import DEFAULT_TASK_ESTIMATE_USD
 
     def spending_agent(**kwargs):
