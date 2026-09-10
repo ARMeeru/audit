@@ -231,3 +231,31 @@ def test_retries_still_sum_across_sessions(tmp_path: Path, monkeypatch):
 
     assert out.payload == {"ok": True}
     assert seen == [1.0, 3.0], "per-session rows must sum across retries"
+
+def test_quota_classification_covers_limit_wordings_and_status():
+    """F9/R8: exact-phrase markers missed 'your usage limit vs', '5-hour
+    limit' and 'Opus limit' rewordings -- each reproduces the incident of
+    136 futile backoff attempts. Status 429 is quota regardless of prose;
+    the approaching-limit warning stays transient."""
+    from audit.runner import _classify_api_error, QuotaExhaustedError, TransientAgentError
+
+    terminal = [
+        "You've hit your weekly limit · resets 1pm (Asia/Dhaka)",
+        "You've hit your session limit · resets 5:10am (UTC)",
+        "Claude usage limit reached. Your limit will reset at 3pm",
+        "You've hit your usage limit · resets 3pm (UTC)",
+        "You've hit your 5-hour limit · resets 9pm",
+        "You've hit your Opus limit for this week",
+    ]
+    for text in terminal:
+        label, exc_cls = _classify_api_error(text)
+        assert (label, exc_cls) == ("quota_exhausted", QuotaExhaustedError), text
+
+    # status 429: quota whatever the prose says
+    label, exc_cls = _classify_api_error("totally unrecognized prose", 429)
+    assert (label, exc_cls) == ("quota_exhausted", QuotaExhaustedError)
+
+    # the upgrade warning is a throttle notice, not a block: transient
+    label, exc_cls = _classify_api_error(
+        "Approaching your usage limit; upgrade for more")
+    assert exc_cls is TransientAgentError

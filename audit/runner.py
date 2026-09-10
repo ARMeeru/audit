@@ -18,6 +18,7 @@ import asyncio
 import dataclasses
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -83,6 +84,14 @@ _QUOTA_MARKERS = (
     "your plan has no remaining",
 )
 
+# Subscription limit wording changes ("usage limit reached" vs "your usage
+# limit ·" vs "5-hour limit"); an exact-phrase allowlist needed a new entry
+# for every rewording and one miss cost 136 attempts of backoff on a live
+# run. Match the limit-plus-reset SHAPE instead: "hit your ... limit".
+# "Approaching your usage limit; upgrade for more" is a warning, not a
+# block, and does not match -- keep that case in the sensor.
+_LIMIT_SHAPE_RE = re.compile(r"hit your\b[^.]{0,32}\blimit")
+
 _TRANSIENT_MARKERS = (
     "api error: 529",
     "overloaded",
@@ -96,10 +105,18 @@ _TRANSIENT_MARKERS = (
 )
 
 
-def _classify_api_error(text: str) -> tuple[str, type[RuntimeError]]:
-    """Return (label, exception_class) for an is_error response."""
+def _classify_api_error(
+    text: str, status: int | None = None
+) -> tuple[str, type[RuntimeError]]:
+    """Return (label, exception_class) for an is_error response.
+
+    Status first: a 429 is a usage limit whatever the prose says (the SDK
+    has exposed api_error_status since CLI v2.1.110). The text fallback
+    matches exact markers and the limit-plus-reset shape."""
+    if status == 429:
+        return "quota_exhausted", QuotaExhaustedError
     t = (text or "").lower()
-    if any(m in t for m in _QUOTA_MARKERS):
+    if any(m in t for m in _QUOTA_MARKERS) or _LIMIT_SHAPE_RE.search(t):
         return "quota_exhausted", QuotaExhaustedError
     if any(m in t for m in _TRANSIENT_MARKERS):
         return "transient", TransientAgentError
@@ -250,7 +267,8 @@ async def _run_agent_once(
             # Before schema validation: was this a real model response, or
             # did the CLI surface an API error as the assistant text?
             if last_result_msg.get("is_error"):
-                label, exc_cls = _classify_api_error(last_text)
+                label, exc_cls = _classify_api_error(
+                    last_text, last_result_msg.get("api_error_status"))
                 _write_artifact(art, {"kind": "api_error", "classification": label,
                                       "text": last_text[:1000]})
                 e = exc_cls(
@@ -273,7 +291,8 @@ async def _run_agent_once(
                 last_text, last_result_msg = await _drain(client, art)
                 # An API error on the repair turn is also retry-worthy.
                 if last_result_msg.get("is_error"):
-                    label, exc_cls = _classify_api_error(last_text)
+                    label, exc_cls = _classify_api_error(
+                        last_text, last_result_msg.get("api_error_status"))
                     _write_artifact(art, {"kind": "api_error_on_repair",
                                           "classification": label,
                                           "text": last_text[:1000]})
@@ -420,6 +439,7 @@ def _result_to_dict(msg: ResultMessage) -> dict[str, Any]:
     return {
         "subtype": msg.subtype,
         "is_error": msg.is_error,
+        "api_error_status": getattr(msg, "api_error_status", None),
         "duration_ms": msg.duration_ms,
         "duration_api_ms": msg.duration_api_ms,
         "num_turns": msg.num_turns,
