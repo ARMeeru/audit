@@ -57,6 +57,9 @@ async def run_gapfill(ctx: StageContext, db: StateDB,
     # The artifact row is written BEFORE the agent call: a failed attempt
     # must consume its loop-budget slot, or the next resume re-grants the
     # iteration (the exact re-expansion the derived bounds exist to stop).
+    # The trade is deliberate: a quota-killed gapfill consumes its slot
+    # permanently, on the theory that an aborted iteration's remaining
+    # exploration is worth less than an unbounded loop.
     # It also makes the iter tag collision-free — the tag is derived from
     # the count at reservation time, and retries reuse the same path.
     iter_tag = _iter_tag(ctx.run_id, db)
