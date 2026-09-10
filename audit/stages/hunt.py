@@ -120,7 +120,7 @@ async def run_hunt(
                     "[%s] hunt task %s hit subscription quota — aborting stage",
                     ctx.run_id, task.task_id,
                 )
-                db.update_task_status(ctx.run_id, task.task_id, "pending")
+                db.release_task(ctx.run_id, task.task_id)
                 aborted.set()
                 raise
             except (AgentRunError, TransientAgentError) as e:

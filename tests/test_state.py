@@ -487,7 +487,15 @@ def test_attempts_below_ceiling_requeued_and_incremented(tmp_path: Path) -> None
     row = db._conn.execute(
         "SELECT status, attempts FROM tasks WHERE task_id = 't_below'"
     ).fetchone()
-    assert row["status"] == "pending" and row["attempts"] == 3
+    # Requeue does NOT charge an attempt: begin_task spent one at dispatch,
+    # and the failed dispatch that produced this 'failed' row already made
+    # it 2. The requeue flips status only; the NEXT dispatch reaches 3.
+    assert row["status"] == "pending" and row["attempts"] == 2
+    db.begin_task(rid, "t_below")
+    row = db._conn.execute(
+        "SELECT status, attempts FROM tasks WHERE task_id = 't_below'"
+    ).fetchone()
+    assert row["status"] == "running" and row["attempts"] == 3
     db.close()
 
 
@@ -655,3 +663,42 @@ def test_dispatch_spends_an_attempt_and_ceiling_filters(tmp_path: Path) -> None:
     t_b = [t for t in db.get_all_tasks(rid) if t.task_id == "t_b"][0]
     assert t_b.status == "done" and t_b.attempts == 0
 
+
+def test_failure_cycle_gets_three_real_dispatches(tmp_path: Path) -> None:
+    """F5/R3: attempts used to be charged at BOTH dispatch and requeue, so
+    a ceiling of 3 delivered 2 real dispatches. The full cycle — dispatch,
+    fail, requeue, repeat — must give exactly max_requeues dispatches."""
+    db = StateDB(tmp_path / "state.db")
+    rid = db.create_run("/r", "test_run")
+    db.add_task(rid, {"task_id": "t_1", "attack_class": "sqli",
+                      "scope_hint": "x", "target_files": ["a.py"],
+                      "rationale": "r", "priority": 1, "source": "recon"})
+    dispatches = 0
+    for _ in range(10):
+        pending = db.get_pending_tasks(rid)
+        if not pending:
+            break
+        db.begin_task(rid, "t_1")           # dispatch spends an attempt
+        dispatches += 1
+        db.update_task_status(rid, "t_1", "failed")
+        requeued = db.reset_incomplete_tasks(rid)  # resume
+        if requeued == 0:
+            break
+    assert dispatches == 3, f"ceiling of 3 must mean 3 dispatches, got {dispatches}"
+
+
+def test_quota_release_hands_back_the_attempt(tmp_path: Path) -> None:
+    """A quota abort is the pipeline stopping, not the task failing: three
+    quota-killed resumes must not abandon a never-failed task."""
+    db = StateDB(tmp_path / "state.db")
+    rid = db.create_run("/r", "test_run")
+    db.add_task(rid, {"task_id": "t_1", "attack_class": "sqli",
+                      "scope_hint": "x", "target_files": ["a.py"],
+                      "rationale": "r", "priority": 1, "source": "recon"})
+    for _ in range(3):
+        db.begin_task(rid, "t_1")
+        db.release_task(rid, "t_1")
+    pending = db.get_pending_tasks(rid)
+    assert [t.task_id for t in pending] == ["t_1"], (
+        "released task must stay dispatchable after repeated quota kills"
+    )

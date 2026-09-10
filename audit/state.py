@@ -457,6 +457,19 @@ class StateDB:
         ).fetchone()
         return float(row["m"]) if row and row["m"] is not None else None
 
+    def release_task(self, run_id: str, task_id: str) -> None:
+        """Return a task to 'pending' WITHOUT keeping the attempt charge: a
+        quota abort is the pipeline stopping, not the task failing. Three
+        quota-killed resumes must not abandon a task that never genuinely
+        failed."""
+        self._conn.execute(
+            "UPDATE tasks SET status = 'pending', "
+            "attempts = MAX(0, attempts - 1), updated_at = ? "
+            "WHERE run_id = ? AND task_id = ?",
+            (time.time(), run_id, task_id),
+        )
+        self._conn.commit()
+
     def count_abandoned_tasks(self, run_id: str) -> int:
         """Failed tasks past the requeue ceiling — work silently given up
         on. surfaced so an operator can see the abandonment, not just the
@@ -483,7 +496,11 @@ class StateDB:
             (now, run_id),
         )
         cur_fail = self._conn.execute(
-            "UPDATE tasks SET status = 'pending', attempts = attempts + 1, updated_at = ? "
+            # No increment here: begin_task spends the attempt at dispatch,
+            # and get_pending_tasks filters on the ceiling. Incrementing in
+            # both places charged two attempts per failure cycle, so a task
+            # got 2 dispatches under a ceiling of 3.
+            "UPDATE tasks SET status = 'pending', updated_at = ? "
             "WHERE run_id = ? AND status = 'failed' AND attempts < ?",
             (now, run_id, max_requeues),
         )
