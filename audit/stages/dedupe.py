@@ -21,13 +21,19 @@ def _prepare_groups(run_id: str, groups: list[dict],
     otherwise make `fid == canonical` false for every member and empty the
     report's canonical set."""
     prepared = []
+    claimed: set[str] = set()
     for g in groups:
-        members = [fid for fid in g.get("member_finding_ids", [])
-                   if fid in confirmed_ids]
+        # dict.fromkeys dedupes inside the group; `claimed` enforces that a
+        # finding belongs to at most one group -- a finding named twice was
+        # assigned last-write-wins and lost canonical status entirely, the
+        # same emptied-report outcome F4 causes through the canonical door.
+        members = [fid for fid in dict.fromkeys(g.get("member_finding_ids", []))
+                   if fid in confirmed_ids and fid not in claimed]
         if not members:
-            log.warning("[%s] dedupe: group %s has no known members — dropped",
+            log.warning("[%s] dedupe: group %s has no unclaimed known members — dropped",
                         run_id, g.get("group_id"))
             continue
+        claimed.update(members)
         canonical = g.get("canonical_finding_id")
         if canonical not in members:
             log.warning("[%s] dedupe: canonical %s not among members; using %s",

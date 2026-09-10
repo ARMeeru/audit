@@ -408,3 +408,71 @@ def test_hunt_success_persists_findings_once_and_completes(
     task = db.get_all_tasks("poc")[0]
     assert task.status == "done" and task.attempts == 0
     assert db.total_cost("poc") == pytest.approx(0.20)
+
+def test_finding_claimed_by_second_group_keeps_canonical_status(
+    stage_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F8/R7: a finding named in two groups was assigned last-write-wins,
+    so g_1 survived declaring a canonical that was no longer canonical and
+    the finding dropped out of trace/report (canonical_only=True). First
+    group to claim a finding keeps it."""
+    db, ctx = stage_env
+    _add_confirmed_canonical_finding(db, "f_1")
+    _add_task(db, "t_2")
+    db.add_finding("poc", "t_2", {
+        "finding_id": "f_2", "file": "b.py", "line_start": 3, "line_end": 4,
+        "vuln_class": "xss", "severity": "medium", "description": "d2",
+        "evidence_snippet": "e2", "confidence": 0.8,
+    })
+    db.set_finding_validation("poc", "f_2", "confirmed", {"verdict": "confirmed"})
+
+    async def overlapping_agent(**kwargs):
+        class R:
+            payload = {"groups": [
+                {"group_id": "g_1", "root_cause": "rc" * 10,
+                 "member_finding_ids": ["f_1"], "canonical_finding_id": "f_1"},
+                {"group_id": "g_2", "root_cause": "rc" * 11,
+                 "member_finding_ids": ["f_2", "f_1"], "canonical_finding_id": "f_2"},
+            ]}
+            raw_result_message = {"total_cost_usd": 0.0, "usage": {}}
+            artifact_path = Path("/tmp/x.jsonl")
+            cost_usd = 0.0
+        return R()
+
+    import audit.stages.dedupe as dedupe_mod
+    monkeypatch.setattr(dedupe_mod, "run_agent", overlapping_agent)
+    asyncio.run(dedupe_mod.run_dedupe(ctx, db))
+
+    f_1 = [f for f in db.get_findings("poc") if f.finding_id == "f_1"][0]
+    f_2 = [f for f in db.get_findings("poc") if f.finding_id == "f_2"][0]
+    assert f_1.group_id == "g_1" and f_1.is_canonical, (
+        "first claim must win and stay canonical"
+    )
+    assert f_2.group_id == "g_2" and f_2.is_canonical
+    # the emptied group must be dropped, not left orphaned in dedupe_groups
+    groups = db._conn.execute(
+        "SELECT group_id FROM dedupe_groups WHERE run_id='poc'").fetchall()
+    assert sorted(g["group_id"] for g in groups) == ["g_1", "g_2"]
+
+
+def test_group_listing_same_id_twice_dedupes(stage_env, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A group naming the same id twice attaches it once, not twice."""
+    db, ctx = stage_env
+    _add_confirmed_canonical_finding(db, "f_1")
+
+    async def dup_agent(**kwargs):
+        class R:
+            payload = {"groups": [{
+                "group_id": "g_1", "root_cause": "rc" * 10,
+                "member_finding_ids": ["f_1", "f_1"],
+                "canonical_finding_id": "f_1",
+            }]}
+            raw_result_message = {"total_cost_usd": 0.0, "usage": {}}
+            artifact_path = Path("/tmp/x.jsonl")
+            cost_usd = 0.0
+        return R()
+
+    import audit.stages.dedupe as dedupe_mod
+    monkeypatch.setattr(dedupe_mod, "run_agent", dup_agent)
+    asyncio.run(dedupe_mod.run_dedupe(ctx, db))
+    assert db.get_findings("poc", canonical_only=True)[0].finding_id == "f_1"
