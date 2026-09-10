@@ -52,10 +52,7 @@ async def run_report(ctx: StageContext, db: StateDB) -> Path:
                 "(tracer failed or quota killed the stage); they are not assessed"
             ) if untraced else None,
         }
-        out_path.write_text(json.dumps(empty, indent=2))
-        log.info("[%s] report: no reachable findings — wrote empty report to %s",
-                 ctx.run_id, out_path)
-        return out_path
+        return _write_report(ctx, out_path, empty)
 
     try:
         result = await run_agent(
@@ -87,22 +84,38 @@ async def run_report(ctx: StageContext, db: StateDB) -> Path:
         fallback["degraded"] = True
         fallback["degraded_reason"] = f"report agent failed: {str(e)[:300]}"
         # The fallback bypasses the report agent and its repair budget, so
-        # it must be validated the way the agent output is: an invalid
-        # fallback document fails every downstream consumer silently.
-        errors = validate_schema(fallback, SCHEMAS / "report.schema.json")
-        if errors:
-            fallback["degraded_reason"] += " | schema errors: " + "; ".join(errors[:5])
-            log.error("[%s] fallback report violates report schema: %s",
-                      ctx.run_id, errors[:5])
-        out_path.write_text(json.dumps(fallback, indent=2))
-        return out_path
+        # it is validated like agent output: an invalid fallback document
+        # fails every downstream consumer silently.
+        return _write_report(ctx, out_path, fallback)
 
     db.add_artifact(ctx.run_id, "report", None, "jsonl", str(result.artifact_path))
     result.payload["untraced_findings"] = untraced
     result.payload.setdefault("degraded", False)
-    out_path.write_text(json.dumps(result.payload, indent=2))
+    return _write_report(ctx, out_path, result.payload)
     log.info("[%s] report: %d findings written to %s",
              ctx.run_id, len(result.payload.get("findings", [])), out_path)
+    return out_path
+
+
+def _write_report(ctx: StageContext, out_path, payload: dict):
+    """Single write path for every report shape (empty, fallback, agent
+    success). Drops None-valued optional keys -- the schema types
+    degraded_reason as a string and the empty-report branch emitted null
+    -- and validates before writing, so no path can skip the check: the
+    most common report of all (a clean run with no reachable findings)
+    used to ship invalid."""
+    payload = {k: v for k, v in payload.items() if v is not None}
+    errors = validate_schema(payload, SCHEMAS / "report.schema.json")
+    if errors:
+        log.error("[%s] report payload fails report.schema.json: %s",
+                  ctx.run_id, errors[:5])
+        payload.setdefault("degraded", True)
+        payload["degraded_reason"] = (
+            payload.get("degraded_reason", "") + " | schema errors: "
+            + "; ".join(errors[:5])
+        ).lstrip(" |")
+        payload = {k: v for k, v in payload.items() if v is not None}
+    out_path.write_text(json.dumps(payload, indent=2))
     return out_path
 
 

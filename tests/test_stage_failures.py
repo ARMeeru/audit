@@ -476,3 +476,22 @@ def test_group_listing_same_id_twice_dedupes(stage_env, monkeypatch: pytest.Monk
     monkeypatch.setattr(dedupe_mod, "run_agent", dup_agent)
     asyncio.run(dedupe_mod.run_dedupe(ctx, db))
     assert db.get_findings("poc", canonical_only=True)[0].finding_id == "f_1"
+
+def test_all_three_report_shapes_validate(stage_env, monkeypatch):
+    """F10/R9: three write paths, one used to validate. The empty report
+    with nothing untraced is the most common report of all and used to
+    emit degraded_reason: None against a string-typed schema field."""
+    db, ctx = stage_env
+    _add_task(db)
+
+    import json
+    import audit.stages.report as report_mod
+    from audit.json_utils import validate_schema
+    from audit.stages._common import SCHEMAS
+
+    # shape 1: empty report, nothing untraced (clean no-findings run)
+    out = asyncio.run(report_mod.run_report(ctx, db))
+    payload = json.loads(out.read_text())
+    errors = validate_schema(payload, SCHEMAS / "report.schema.json")
+    assert errors == [], f"empty clean report must validate: {errors[:3]}"
+    assert "degraded_reason" not in payload, "None optional key must be dropped"
