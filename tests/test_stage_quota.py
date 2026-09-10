@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import install_run_agent
+
 import audit.stages.validate as validate_mod
 import audit.stages.trace as trace_mod
 import audit.stages.report as report_mod
@@ -85,7 +87,7 @@ def test_validate_quota_records_cost_drains_and_aborts(stage_env, monkeypatch):
         # which the assertion below treats as the defect it is.
         return _R({"verdict": "confirmed", "finding_id": kwargs["artifact_name"]})
 
-    monkeypatch.setattr(validate_mod, "run_agent", quota_agent)
+    install_run_agent(monkeypatch, validate_mod, quota_agent)
     with pytest.raises(QuotaExhaustedError):
         asyncio.run(validate_mod.run_validate(ctx, db))
 
@@ -129,7 +131,7 @@ def test_trace_quota_records_cost_and_stays_retryable(stage_env, monkeypatch):
         await asyncio.sleep(0)
         raise _quota(0.05)
 
-    monkeypatch.setattr(trace_mod, "run_agent", quota_agent)
+    install_run_agent(monkeypatch, trace_mod, quota_agent)
     with pytest.raises(QuotaExhaustedError):
         asyncio.run(trace_mod.run_trace(ctx, db))
 
@@ -164,7 +166,7 @@ def test_report_quota_emits_fallback_report(stage_env, tmp_path: Path, monkeypat
         on_attempt({"total_cost_usd": 0.01, "usage": {"input_tokens": 10}})
         raise _quota(0.01)
 
-    monkeypatch.setattr(report_mod, "run_agent", quota_agent)
+    install_run_agent(monkeypatch, report_mod, quota_agent)
     out = asyncio.run(report_mod.run_report(ctx, db))
 
     assert out.exists()

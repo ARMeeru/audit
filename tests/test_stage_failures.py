@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import install_run_agent
+
 import audit.stages._common as common_mod
 import audit.stages.hunt as hunt_mod
 import audit.stages.trace as trace_mod
@@ -61,14 +63,14 @@ def test_failed_hunt_attempt_records_cost(
     db, ctx = stage_env
     _add_task(db)
 
-    def failing_agent(**kwargs):
+    async def failing_agent(**kwargs):
         on_attempt = kwargs.get("on_attempt")
         assert on_attempt is not None, "stage must pass on_attempt for spend ledgering"
         on_attempt({"total_cost_usd": 0.05, "usage": {"input_tokens": 10}})
         e = AgentRunError("[hunt/t_1] schema validation failed after retries")
         raise e
 
-    monkeypatch.setattr(hunt_mod, "run_agent", failing_agent)
+    install_run_agent(monkeypatch, hunt_mod, failing_agent)
     asyncio.run(hunt_mod.run_hunt(ctx, db))
     assert db.total_cost("poc") == pytest.approx(0.05)
 
@@ -82,14 +84,14 @@ def test_failed_trace_attempt_is_retryable_on_resume(
     db, ctx = stage_env
     _add_confirmed_canonical_finding(db)
 
-    def failing_agent(**kwargs):
+    async def failing_agent(**kwargs):
         on_attempt = kwargs.get("on_attempt")
         assert on_attempt is not None, "stage must pass on_attempt for spend ledgering"
         on_attempt({"total_cost_usd": 0.02, "usage": {"input_tokens": 10}})
         e = AgentRunError("[trace/f_1] schema validation failed after retries")
         raise e
 
-    monkeypatch.setattr(trace_mod, "run_agent", failing_agent)
+    install_run_agent(monkeypatch, trace_mod, failing_agent)
     asyncio.run(trace_mod.run_trace(ctx, db))
     # no verdict persisted -> --resume re-attempts the trace
     assert db.get_trace("poc", "f_1") is None
@@ -126,7 +128,7 @@ def test_dedupe_ignores_member_ids_from_other_runs(
         return R()
 
     import audit.stages.dedupe as dedupe_mod
-    monkeypatch.setattr(dedupe_mod, "run_agent", ok_agent)
+    install_run_agent(monkeypatch, dedupe_mod, ok_agent)
     asyncio.run(dedupe_mod.run_dedupe(ctx, db))
     foreign = [f for f in db.get_findings("run-other")][0]
     assert foreign.group_id is None and not foreign.is_canonical
@@ -163,7 +165,7 @@ def test_dedupe_canonical_falls_back_to_first_member(
         return R()
 
     import audit.stages.dedupe as dedupe_mod
-    monkeypatch.setattr(dedupe_mod, "run_agent", lying_agent)
+    install_run_agent(monkeypatch, dedupe_mod, lying_agent)
     asyncio.run(dedupe_mod.run_dedupe(ctx, db))
     canonicals = db.get_findings("poc", canonical_only=True)
     assert [f.finding_id for f in canonicals] == ["f_1"], (
@@ -215,7 +217,7 @@ def test_second_dedupe_pass_demotes_omitted_findings(
         return R()
 
     import audit.stages.dedupe as dedupe_mod
-    monkeypatch.setattr(dedupe_mod, "run_agent", scripted_agent)
+    install_run_agent(monkeypatch, dedupe_mod, scripted_agent)
     asyncio.run(dedupe_mod.run_dedupe(ctx, db))
     assert sorted(f.finding_id for f in db.get_findings("poc", canonical_only=True)) \
         == ["f_1", "f_2"]
@@ -258,7 +260,7 @@ def test_dedupe_skips_agent_when_confirmed_set_unchanged(
         return R()
 
     import audit.stages.dedupe as dedupe_mod
-    monkeypatch.setattr(dedupe_mod, "run_agent", counting_agent)
+    install_run_agent(monkeypatch, dedupe_mod, counting_agent)
     asyncio.run(dedupe_mod.run_dedupe(ctx, db))
     asyncio.run(dedupe_mod.run_dedupe(ctx, db))
     assert calls["n"] == 1, "unchanged confirmed set must skip the agent call"
@@ -279,14 +281,14 @@ def test_failed_validation_leaves_finding_unvalidated(
         "evidence_snippet": "e", "confidence": 0.9,
     })
 
-    def failing_agent(**kwargs):
+    async def failing_agent(**kwargs):
         on_attempt = kwargs.get("on_attempt")
         assert on_attempt is not None
         on_attempt({"total_cost_usd": 0.04, "usage": {"input_tokens": 10}})
         raise AgentRunError("[validate/f_1] schema validation failed after retries")
 
     import audit.stages.validate as validate_mod
-    monkeypatch.setattr(validate_mod, "run_agent", failing_agent)
+    install_run_agent(monkeypatch, validate_mod, failing_agent)
     asyncio.run(validate_mod.run_validate(ctx, db))
 
     unvalidated = db.get_unvalidated_findings("poc")
@@ -304,14 +306,14 @@ def test_failed_tracer_is_named_in_the_report(
     db, ctx = stage_env
     _add_confirmed_canonical_finding(db, "f_1")
 
-    def failing_agent(**kwargs):
+    async def failing_agent(**kwargs):
         on_attempt = kwargs.get("on_attempt")
         assert on_attempt is not None
         on_attempt({"total_cost_usd": 0.02, "usage": {"input_tokens": 10}})
         raise AgentRunError("[trace/f_1] schema validation failed after retries")
 
     import audit.stages.trace as trace_mod
-    monkeypatch.setattr(trace_mod, "run_agent", failing_agent)
+    install_run_agent(monkeypatch, trace_mod, failing_agent)
     asyncio.run(trace_mod.run_trace(ctx, db))
 
     import json
@@ -340,7 +342,7 @@ def test_failed_gapfill_attempt_consumes_its_loop_slot(
         raise AgentRunError("[gapfill/x] schema validation failed after retries")
 
     import audit.stages.gapfill as gapfill_mod
-    monkeypatch.setattr(gapfill_mod, "run_agent", failing_agent)
+    install_run_agent(monkeypatch, gapfill_mod, failing_agent)
     asyncio.run(gapfill_mod.run_gapfill(ctx, db))
     assert db.count_artifacts("poc", "gapfill") == 1, (
         "a failed attempt must consume its iteration slot"
@@ -400,7 +402,7 @@ def test_hunt_success_persists_findings_once_and_completes(
             cost_usd = 0.20
         return R()
 
-    monkeypatch.setattr(hunt_mod, "run_agent", ok_agent)
+    install_run_agent(monkeypatch, hunt_mod, ok_agent)
     asyncio.run(hunt_mod.run_hunt(ctx, db))
 
     rows = [f.finding_id for f in db.get_findings("poc")]
@@ -440,7 +442,7 @@ def test_finding_claimed_by_second_group_keeps_canonical_status(
         return R()
 
     import audit.stages.dedupe as dedupe_mod
-    monkeypatch.setattr(dedupe_mod, "run_agent", overlapping_agent)
+    install_run_agent(monkeypatch, dedupe_mod, overlapping_agent)
     asyncio.run(dedupe_mod.run_dedupe(ctx, db))
 
     f_1 = [f for f in db.get_findings("poc") if f.finding_id == "f_1"][0]
@@ -473,7 +475,7 @@ def test_group_listing_same_id_twice_dedupes(stage_env, monkeypatch: pytest.Monk
         return R()
 
     import audit.stages.dedupe as dedupe_mod
-    monkeypatch.setattr(dedupe_mod, "run_agent", dup_agent)
+    install_run_agent(monkeypatch, dedupe_mod, dup_agent)
     asyncio.run(dedupe_mod.run_dedupe(ctx, db))
     assert db.get_findings("poc", canonical_only=True)[0].finding_id == "f_1"
 

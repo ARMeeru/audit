@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import install_run_agent
+
 import audit.stages._common as common_mod
 import audit.stages.hunt as hunt_mod
 from audit import orchestrator, stages
@@ -110,7 +112,7 @@ def test_hunt_overrun_bounded_by_one_task_estimate(
     # history makes the per-task estimate an honest upper bound: $2/task
     db.record_cost("poc", "hunt", "hist", {"total_cost_usd": 2.0, "usage": {}})
 
-    def spending_agent(**kwargs):
+    async def spending_agent(**kwargs):
         on_attempt = kwargs.get("on_attempt")
         on_attempt({"total_cost_usd": 2.0, "usage": {"input_tokens": 10}})
         class R:
@@ -121,7 +123,7 @@ def test_hunt_overrun_bounded_by_one_task_estimate(
             cost_usd = 2.0
         return R()
 
-    monkeypatch.setattr(hunt_mod, "run_agent", spending_agent)
+    install_run_agent(monkeypatch, hunt_mod, spending_agent)
     cap = 5.0
     def budget_check(name, in_flight_usd=0.0):
         if db.total_cost("poc") + in_flight_usd >= cap:
@@ -155,7 +157,7 @@ def test_first_hunt_stage_with_no_history_stays_bounded(
     # self-correction demonstrably tightens the trip point.
     from audit.stages.hunt import DEFAULT_TASK_ESTIMATE_USD
 
-    def spending_agent(**kwargs):
+    async def spending_agent(**kwargs):
         on_attempt = kwargs.get("on_attempt")
         on_attempt({"total_cost_usd": 3.0, "usage": {"input_tokens": 10}})
         class R:
@@ -166,7 +168,7 @@ def test_first_hunt_stage_with_no_history_stays_bounded(
             cost_usd = 3.0
         return R()
 
-    monkeypatch.setattr(hunt_mod, "run_agent", spending_agent)
+    install_run_agent(monkeypatch, hunt_mod, spending_agent)
     cap = 10.0
     def budget_check(name, in_flight_usd=0.0):
         if db.total_cost("poc") + in_flight_usd >= cap:
