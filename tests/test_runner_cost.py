@@ -99,3 +99,135 @@ def test_weekly_limit_classifies_as_quota_not_transient():
         "You've hit your weekly limit · resets 1pm (Asia/Dhaka)")
     assert label == "quota_exhausted"
     assert exc_cls is QuotaExhaustedError
+
+
+class _FakeClient:
+    """Minimal ClaudeSDKClient stand-in: __aenter__/query/__aexit__ only.
+    The real _drain is patched out, so receive_response is never called."""
+
+    def __init__(self, options):
+        self.options = options
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def query(self, text):
+        self.last_query = text
+
+
+def _run_repair_scenario(monkeypatch, tmp_path: Path, drain_sequence, **run_kwargs):
+    """Drive the REAL _run_agent_once with a patched _drain that hands back
+    cumulative session totals (as the SDK does) across a repair turn."""
+    import audit.runner as runner_mod
+
+    prompt = tmp_path / "p.md"
+    prompt.write_text("prompt")
+    schema = tmp_path / "s.schema.json"
+    schema.write_text('{"type":"object","required":["ok"],'
+                      '"properties":{"ok":{"type":"boolean"}},'
+                      '"additionalProperties":false}')
+
+    calls = {"n": 0}
+
+    async def fake_drain(client, art):
+        idx = min(calls["n"], len(drain_sequence) - 1)
+        text, result_msg = drain_sequence[idx]
+        calls["n"] += 1
+        return text, result_msg
+
+    monkeypatch.setattr(runner_mod, "_drain", fake_drain)
+    monkeypatch.setattr(runner_mod, "ClaudeSDKClient", _FakeClient)
+
+    seen: list[float] = []
+
+    def on_attempt(msg):  # sync: stages pass plain lambdas
+        seen.append(msg.get("total_cost_usd"))
+
+    out = asyncio.run(runner_mod.run_agent(
+        stage="hunt", prompt_file=prompt,
+        user_input={}, schema_file=schema,
+        allowed_tools=[], model="m", cwd=tmp_path,
+        artifact_dir=tmp_path, artifact_name="a",
+        repair_attempts=3,
+        on_attempt=on_attempt, **run_kwargs))
+    return out, seen
+
+
+def test_repair_turns_record_one_session_row_not_three(tmp_path: Path, monkeypatch):
+    """F1/R1 regression: total_cost_usd is a cumulative session total, and
+    the old per-drain firing summed 1.0 + 1.8 + 2.4 for a session costing
+    2.40. One session = one ledger row carrying the final total."""
+    from audit.json_utils import extract_json  # noqa: F401  (exercises import path)
+
+    drain_sequence = [
+        ('{"nope": 1}', {"total_cost_usd": 1.0, "usage": {"input_tokens": 100}}),
+        ('{"nope": 1}', {"total_cost_usd": 1.8, "usage": {"input_tokens": 180}}),
+        ('{"ok": true}', {"total_cost_usd": 2.4, "usage": {"input_tokens": 240}}),
+    ]
+    out, seen = _run_repair_scenario(monkeypatch, tmp_path, drain_sequence)
+
+    assert out.payload == {"ok": True}
+    assert seen == [2.4], (
+        f"one session must record one row with the session's final total, "
+        f"got {seen}"
+    )
+
+
+def test_retries_still_sum_across_sessions(tmp_path: Path, monkeypatch):
+    """Cross-session retries are fresh SDK sessions: each contributes its
+    own final total, so the ledger sums the real spend."""
+    from audit.runner import TransientAgentError
+
+    sessions = [
+        # session 1: API error (drain completes, classify -> transient)
+        [('api error: 529 overloaded',
+          {"total_cost_usd": 1.0, "usage": {}, "is_error": True})],
+        # session 2: succeeds
+        [('{"ok": true}', {"total_cost_usd": 3.0, "usage": {}})],
+    ]
+
+    import audit.runner as runner_mod
+
+    prompt = tmp_path / "p.md"
+    prompt.write_text("prompt")
+    schema = tmp_path / "s.schema.json"
+    schema.write_text('{"type":"object","required":["ok"],'
+                      '"properties":{"ok":{"type":"boolean"}},'
+                      '"additionalProperties":false}')
+    calls = {"n": 0}
+
+    async def fake_drain(client, art):
+        idx = min(calls["n"], len(sessions) - 1)
+        result = sessions[idx]
+        calls["n"] += 1
+        return result[0]
+
+    # _drain must return different content per session: wrap with session index
+    async def fake_drain_by_session(client, art):
+        seq = sessions[min(calls["n"], len(sessions) - 1)]
+        # within a session there is exactly one drain in this scenario
+        text, msg = seq[0] if isinstance(seq[0], tuple) else seq[0]
+        calls["n"] += 1
+        return text, msg
+
+    monkeypatch.setattr(runner_mod, "_drain", fake_drain_by_session)
+    monkeypatch.setattr(runner_mod, "ClaudeSDKClient", _FakeClient)
+
+    seen: list[float] = []
+
+    def on_attempt(msg):  # sync: stages pass plain lambdas
+        seen.append(msg.get("total_cost_usd"))
+
+    out = asyncio.run(runner_mod.run_agent(
+        stage="hunt", prompt_file=prompt,
+        user_input={}, schema_file=schema,
+        allowed_tools=[], model="m", cwd=tmp_path,
+        artifact_dir=tmp_path, artifact_name="a",
+        transient_retries=3, transient_base_delay=0.0,
+        on_attempt=on_attempt))
+
+    assert out.payload == {"ok": True}
+    assert seen == [1.0, 3.0], "per-session rows must sum across retries"

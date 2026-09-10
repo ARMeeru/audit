@@ -246,8 +246,6 @@ async def _run_agent_once(
         try:
             await client.query(initial_prompt)
             last_text, last_result_msg = await _drain(client, art)
-            if on_attempt is not None and last_result_msg:
-                on_attempt(last_result_msg)
 
             # Before schema validation: was this a real model response, or
             # did the CLI surface an API error as the assistant text?
@@ -273,8 +271,6 @@ async def _run_agent_once(
                 _write_artifact(art, {"kind": "repair_request", "text": repair_prompt[:50000]})
                 await client.query(repair_prompt)
                 last_text, last_result_msg = await _drain(client, art)
-                if on_attempt is not None and last_result_msg:
-                    on_attempt(last_result_msg)
                 # An API error on the repair turn is also retry-worthy.
                 if last_result_msg.get("is_error"):
                     label, exc_cls = _classify_api_error(last_text)
@@ -301,6 +297,15 @@ async def _run_agent_once(
             payload = extract_json(last_text)
             _write_artifact(art, {"kind": "final_payload", "payload": payload})
         finally:
+            # One row per SDK session. total_cost_usd is a running session
+            # total, so recording per repair turn would sum 1.00 + 1.80 +
+            # 2.40 for a session that cost 2.40. Each retry is a new
+            # session, so run_agent's retry loop still accumulates
+            # correctly across attempts. An initialize failure never
+            # drains, so last_result_msg stays empty and nothing is
+            # recorded -- no spend happened.
+            if on_attempt is not None and last_result_msg:
+                on_attempt(last_result_msg)
             await sdk_ctx.__aexit__(None, None, None)
 
     usage = last_result_msg.get("usage") or {}
