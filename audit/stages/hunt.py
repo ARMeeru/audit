@@ -65,15 +65,20 @@ async def run_hunt(
             if aborted.is_set():
                 counters["skipped"] += 1
                 return
+            reserved = 0.0
             if budget_check is not None:
-                # check-and-increment with no await between: single-threaded
-                # event loop makes this atomic; a yield in the middle would
-                # let every concurrent task read in_flight = 0 and pass.
-                in_flight[0] += estimate[0]
+                # Reserve a SNAPSHOT, not the live box: self-correction
+                # raises estimate[0] when other tasks complete, and a
+                # release that reads the box returns more than this task
+                # ever put in -- in_flight goes negative and the cap
+                # understates spend. Check-and-increment stay sync: a yield
+                # in the middle would let every task read in_flight = 0.
+                reserved = estimate[0]
+                in_flight[0] += reserved
                 try:
                     budget_check(f"hunt/{task.task_id}", in_flight[0])
                 except Exception as e:
-                    in_flight[0] -= estimate[0]
+                    in_flight[0] -= reserved
                     log.warning("[%s] hunt aborting: %s", ctx.run_id, e)
                     aborted.set()
                     counters["skipped"] += 1
@@ -122,20 +127,20 @@ async def run_hunt(
                 )
                 db.release_task(ctx.run_id, task.task_id)
                 aborted.set()
+                in_flight[0] -= reserved
                 raise
             except (AgentRunError, TransientAgentError) as e:
                 log.warning("[%s] hunt task %s failed: %s", ctx.run_id, task.task_id, e)
                 db.update_task_status(ctx.run_id, task.task_id, "failed")
                 counters["tasks_failed"] += 1
-                # decrement only after the callback has recorded the final
-                # attempt (on_attempt fires inside run_agent before return)
-                in_flight[0] -= estimate[0]
+                # release the snapshot, not the live box (see reserve above)
+                in_flight[0] -= reserved
                 return
             except Exception as e:
                 log.error("[%s] hunt task %s unexpected error: %s", ctx.run_id, task.task_id, e)
                 db.update_task_status(ctx.run_id, task.task_id, "failed")
                 counters["tasks_failed"] += 1
-                in_flight[0] -= estimate[0]
+                in_flight[0] -= reserved
                 return
 
             payload = result.payload
@@ -150,9 +155,10 @@ async def run_hunt(
             db.add_artifact(ctx.run_id, "hunt", task.task_id, "scratch_dir",
                             str(scratch))
             counters["tasks_done"] += 1
-            # first completion corrects the guess for every queued task
+            # release exactly what was reserved, THEN learn: the box may
+            # have been raised by other tasks' completions in between
+            in_flight[0] -= reserved
             estimate[0] = max(estimate[0], result.cost_usd or 0.0)
-            in_flight[0] -= estimate[0]
             log.info(
                 "[%s] hunt %s: %d findings (cost=$%.4f)",
                 ctx.run_id, task.task_id, len(findings), result.cost_usd or 0.0,

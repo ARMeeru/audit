@@ -105,8 +105,8 @@ def test_hunt_overrun_bounded_by_one_task_estimate(
     agent count would not survive a reservation redesign; this one does.
     (stage_env fixture from test_stage_failures provides tmp isolation.)"""
     db, ctx = stage_env
-    for i in range(6):
-        db.add_task("poc", {"task_id": f"t_{i}", "attack_class": "sqli",
+    for i in range(60):
+        db.add_task("poc", {"task_id": f"t_{i:02d}", "attack_class": "sqli",
                             "scope_hint": "x", "target_files": ["a.py"],
                             "rationale": "r", "priority": 1, "source": "recon"})
     # history makes the per-task estimate an honest upper bound: $2/task
@@ -145,7 +145,7 @@ def test_first_hunt_stage_with_no_history_stays_bounded(
     chain and self-correction landed)."""
     db, ctx = stage_env
     for i in range(60):
-        db.add_task("poc", {"task_id": f"t_{i}", "attack_class": "sqli",
+        db.add_task("poc", {"task_id": f"t_{i:02d}", "attack_class": "sqli",
                             "scope_hint": "x", "target_files": ["a.py"],
                             "rationale": "r", "priority": 1, "source": "recon"})
     # deliberately NO history: estimate starts at DEFAULT_TASK_ESTIMATE_USD.
@@ -256,3 +256,42 @@ def test_finalize_cap_across_the_spend_band(
                 max_cost_usd=10.0, finalize=True, resume=True))
         assert ran["stages"], "validate runs before the cap trips at dedupe"
 
+
+def test_in_flight_never_goes_negative(stage_env, monkeypatch):
+    """F1/R2 invariant: budget_check must never see a negative in_flight.
+    Release sites read the live estimate box, and self-correction raises
+    it -- releasing more than the task reserved drives in_flight below
+    zero, which understates spend to the cap (worse than no reservation)."""
+    db, ctx = stage_env
+    for i in range(60):
+        db.add_task("poc", {"task_id": f"t_{i:02d}", "attack_class": "sqli",
+                            "scope_hint": "x", "target_files": ["a.py"],
+                            "rationale": "r", "priority": 1, "source": "recon"})
+
+    seen_in_flight: list[float] = []
+
+    async def spending_agent(**kwargs):
+        import asyncio as _aio
+        on_attempt = kwargs.get("on_attempt")
+        on_attempt({"total_cost_usd": 5.0, "usage": {"input_tokens": 10}})
+        # yield so the first wave stacks its reservations before any
+        # completion; the late reserves then observe post-release drift
+        await _aio.sleep(0)
+        class R:
+            payload = {"findings": []}
+            raw_result_message = {"total_cost_usd": 5.0, "usage": {}}
+            from pathlib import Path as _P
+            artifact_path = _P("/tmp/x.jsonl")
+            cost_usd = 5.0
+        return R()
+
+    monkeypatch.setattr(hunt_mod, "run_agent", spending_agent)
+
+    def budget_check(name, in_flight_usd=0.0):
+        seen_in_flight.append(in_flight_usd)
+
+    asyncio.run(hunt_mod.run_hunt(ctx, db, budget_check=budget_check))
+    assert min(seen_in_flight) >= 0.0, (
+        f"negative in_flight understates spend to the cap: "
+        f"min={min(seen_in_flight)}"
+    )
