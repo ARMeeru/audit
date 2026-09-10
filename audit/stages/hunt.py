@@ -43,8 +43,14 @@ async def run_hunt(
     # up to `concurrency` agents at once and committed only grows when a
     # task COMPLETES. Reserving the per-task estimate at dispatch keeps the
     # cap conservative: overrun is bounded by one task's estimate, not by
-    # concurrency x actual.
-    estimate = db.max_stage_cost(ctx.run_id, "hunt") or DEFAULT_TASK_ESTIMATE_USD
+    # concurrency x actual. Prior order: this run -> any prior run -> hard
+    # default (a first hunt stage has no rows for ITS run, which is the
+    # case the default was silently covering). The estimate self-corrects
+    # after each completion so later dispatches in the same stage see the
+    # observed spend.
+    estimate = [db.max_stage_cost(ctx.run_id, "hunt")
+                or db.max_stage_cost_any_run("hunt")
+                or DEFAULT_TASK_ESTIMATE_USD]
     in_flight = [0.0]
 
     log.info(
@@ -63,11 +69,11 @@ async def run_hunt(
                 # check-and-increment with no await between: single-threaded
                 # event loop makes this atomic; a yield in the middle would
                 # let every concurrent task read in_flight = 0 and pass.
-                in_flight[0] += estimate
+                in_flight[0] += estimate[0]
                 try:
                     budget_check(f"hunt/{task.task_id}", in_flight[0])
                 except Exception as e:
-                    in_flight[0] -= estimate
+                    in_flight[0] -= estimate[0]
                     log.warning("[%s] hunt aborting: %s", ctx.run_id, e)
                     aborted.set()
                     counters["skipped"] += 1
@@ -123,13 +129,13 @@ async def run_hunt(
                 counters["tasks_failed"] += 1
                 # decrement only after the callback has recorded the final
                 # attempt (on_attempt fires inside run_agent before return)
-                in_flight[0] -= estimate
+                in_flight[0] -= estimate[0]
                 return
             except Exception as e:
                 log.error("[%s] hunt task %s unexpected error: %s", ctx.run_id, task.task_id, e)
                 db.update_task_status(ctx.run_id, task.task_id, "failed")
                 counters["tasks_failed"] += 1
-                in_flight[0] -= estimate
+                in_flight[0] -= estimate[0]
                 return
 
             payload = result.payload
@@ -144,7 +150,9 @@ async def run_hunt(
             db.add_artifact(ctx.run_id, "hunt", task.task_id, "scratch_dir",
                             str(scratch))
             counters["tasks_done"] += 1
-            in_flight[0] -= estimate
+            # first completion corrects the guess for every queued task
+            estimate[0] = max(estimate[0], result.cost_usd or 0.0)
+            in_flight[0] -= estimate[0]
             log.info(
                 "[%s] hunt %s: %d findings (cost=$%.4f)",
                 ctx.run_id, task.task_id, len(findings), result.cost_usd or 0.0,

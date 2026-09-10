@@ -131,3 +131,44 @@ def test_hunt_overrun_bounded_by_one_task_estimate(
     assert db.total_cost("poc") <= cap + 2.0, (
         "overrun must be bounded by one task's estimate, not by concurrency"
     )
+
+def test_first_hunt_stage_with_no_history_stays_bounded(
+    stage_env, monkeypatch
+) -> None:
+    """F6/R2: the property must hold in the configuration the code runs in
+    most often — a run's FIRST hunt stage has no history rows, so the
+    estimate starts at the hard default. With per-task actuals far above
+    the default, self-correction plus reservation must still bound the
+    overrun (this configuration violated the property before the prior
+    chain and self-correction landed)."""
+    db, ctx = stage_env
+    for i in range(60):
+        db.add_task("poc", {"task_id": f"t_{i}", "attack_class": "sqli",
+                            "scope_hint": "x", "target_files": ["a.py"],
+                            "rationale": "r", "priority": 1, "source": "recon"})
+    # deliberately NO history: estimate starts at DEFAULT_TASK_ESTIMATE_USD
+    from audit.stages.hunt import DEFAULT_TASK_ESTIMATE_USD
+
+    def spending_agent(**kwargs):
+        on_attempt = kwargs.get("on_attempt")
+        on_attempt({"total_cost_usd": 3.0, "usage": {"input_tokens": 10}})
+        class R:
+            payload = {"findings": []}
+            raw_result_message = {"total_cost_usd": 3.0, "usage": {}}
+            from pathlib import Path as _P
+            artifact_path = _P("/tmp/x.jsonl")
+            cost_usd = 3.0
+        return R()
+
+    monkeypatch.setattr(hunt_mod, "run_agent", spending_agent)
+    cap = 10.0
+    def budget_check(name, in_flight_usd=0.0):
+        if db.total_cost("poc") + in_flight_usd >= cap:
+            raise CostExceeded(name)
+    asyncio.run(hunt_mod.run_hunt(ctx, db, budget_check=budget_check))
+
+    estimate_ceiling = max(DEFAULT_TASK_ESTIMATE_USD, 3.0)
+    assert db.total_cost("poc") <= cap + estimate_ceiling, (
+        f"overrun must stay bounded by one (self-corrected) estimate: "
+        f"spent {db.total_cost('poc')}"
+    )

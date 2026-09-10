@@ -447,6 +447,16 @@ class StateDB:
         ).fetchone()
         return float(row["m"]) if row and row["m"] is not None else None
 
+    def max_stage_cost_any_run(self, stage: str) -> float | None:
+        """Same as max_stage_cost, across every run sharing this database:
+        a first hunt stage has no rows for ITS run, which is the case a
+        hard default was silently covering."""
+        row = self._conn.execute(
+            "SELECT MAX(usd) AS m FROM costs WHERE stage = ?",
+            (stage,),
+        ).fetchone()
+        return float(row["m"]) if row and row["m"] is not None else None
+
     def count_abandoned_tasks(self, run_id: str) -> int:
         """Failed tasks past the requeue ceiling — work silently given up
         on. surfaced so an operator can see the abandonment, not just the
