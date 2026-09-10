@@ -295,3 +295,46 @@ def test_in_flight_never_goes_negative(stage_env, monkeypatch):
         f"negative in_flight understates spend to the cap: "
         f"min={min(seen_in_flight)}"
     )
+
+def test_cold_first_wave_bounded_by_one_actual(stage_env, monkeypatch):
+    """F5/R3: a cold first wave (no history anywhere) with actuals far
+    above the default used to launch concurrency/2+ tasks at the stale
+    default and blow the bound by (launched-1) x (actual-default). The
+    ramp dispatches one task, learns, then opens the throttle: cold-start
+    exposure is one task's actual spend, not concurrency x actual. Red as
+    shipped ($45 vs $15 in the review's measurement), green after."""
+    db, ctx = stage_env
+    for i in range(60):
+        db.add_task("poc", {"task_id": f"t_{i:02d}", "attack_class": "sqli",
+                            "scope_hint": "x", "target_files": ["a.py"],
+                            "rationale": "r", "priority": 1, "source": "recon"})
+    # deliberately NO history anywhere: cold start
+
+    async def spending_agent(**kwargs):
+        import asyncio as _aio
+        on_attempt = kwargs.get("on_attempt")
+        on_attempt({"total_cost_usd": 5.0, "usage": {"input_tokens": 10}})
+        await _aio.sleep(0)
+        class R:
+            payload = {"findings": []}
+            raw_result_message = {"total_cost_usd": 5.0, "usage": {}}
+            from pathlib import Path as _P
+            artifact_path = _P("/tmp/x.jsonl")
+            cost_usd = 5.0
+        return R()
+
+    monkeypatch.setattr(hunt_mod, "run_agent", spending_agent)
+
+    def budget_check(name, in_flight_usd=0.0):
+        # the cap under test: ramp bounds the cold wave, this bounds the
+        # rest. Note run_hunt SWALLOWS budget_check exceptions (log +
+        # aborted + return) -- the orchestrator's stage-level _check is
+        # what aborts the pipeline; here we assert the bound on the ledger.
+        if db.total_cost("poc") + in_flight_usd >= 10.0:
+            raise CostExceeded(name)
+
+    asyncio.run(hunt_mod.run_hunt(ctx, db, budget_check=budget_check))
+    assert db.total_cost("poc") <= 10.0 + 5.0, (
+        f"cold-start exposure must be one task's actual spend: "
+        f"{db.total_cost('poc')} (cap 10)"
+    )

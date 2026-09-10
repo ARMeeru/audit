@@ -37,7 +37,15 @@ async def run_hunt(
 
     sc = ctx.stage("hunt")
     recon_summary = db.get_recon_output(ctx.run_id) or {}
-    sem = asyncio.Semaphore(sc.concurrency)
+    # A cold stage has no honest estimate: a full first wave reserves the
+    # hard default for every task while the actuals are unknown, so the
+    # F12 bound degrades to concurrency x actual. Dispatch ONE task, learn
+    # from its completion, then open the throttle. Costs one task's
+    # latency, once per database -- max_stage_cost_any_run has a row
+    # forever after the first completion, so every later run starts warm.
+    cold = (db.max_stage_cost(ctx.run_id, "hunt") is None
+            and db.max_stage_cost_any_run("hunt") is None)
+    sem = asyncio.Semaphore(1 if cold else sc.concurrency)
     aborted = asyncio.Event()
     # In-flight reservation: the cap reads committed spend, but hunt runs
     # up to `concurrency` agents at once and committed only grows when a
@@ -61,6 +69,7 @@ async def run_hunt(
     counters = {"findings": 0, "tasks_done": 0, "tasks_failed": 0, "skipped": 0}
 
     async def _one(task: Task) -> None:
+        nonlocal cold
         async with sem:
             if aborted.is_set():
                 counters["skipped"] += 1
@@ -159,6 +168,12 @@ async def run_hunt(
             # have been raised by other tasks' completions in between
             in_flight[0] -= reserved
             estimate[0] = max(estimate[0], result.cost_usd or 0.0)
+            if cold:
+                # first completion observed: the estimate is honest now --
+                # open the throttle for the rest of the stage
+                cold = False
+                for _ in range(sc.concurrency - 1):
+                    sem.release()
             log.info(
                 "[%s] hunt %s: %d findings (cost=$%.4f)",
                 ctx.run_id, task.task_id, len(findings), result.cost_usd or 0.0,
