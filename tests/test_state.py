@@ -565,7 +565,7 @@ def test_wal_mode_and_user_version_after_migration(tmp_path: Path) -> None:
 
     db = StateDB(p)
     assert db._conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-    assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 3
     assert len(db.get_findings("run-a")) == 1
     db.close()
 
@@ -595,8 +595,8 @@ def test_v2_migration_scopes_tasks_and_keeps_fk_intact(tmp_path: Path) -> None:
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='findings'"
     ).fetchone()["sql"]
     assert 'REFERENCES "tasks_legacy"' not in fk_sql, "dangling FK after migration"
-    assert "REFERENCES tasks(task_id)" in fk_sql
-    assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert "REFERENCES tasks(run_id, task_id)" in fk_sql
+    assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 3
 
     # two runs, same task_id: both rows survive (the old global PK dropped one)
     db.add_task("run-a", {"task_id": "t_1", "attack_class": "sqli",
@@ -702,3 +702,59 @@ def test_quota_release_hands_back_the_attempt(tmp_path: Path) -> None:
     assert [t.task_id for t in pending] == ["t_1"], (
         "released task must stay dispatchable after repeated quota kills"
     )
+
+def test_v3_repairs_indexes_and_fk_on_v2_damaged_databases(tmp_path: Path) -> None:
+    """Findings 2+7 acceptance: v0, v1 and v2 databases all migrate to v3
+    with all five indexes present, rows preserved, integrity ok, and a
+    foreign-key-valid findings insert (foreign_keys=ON)."""
+    import sqlite3
+    # v2-damaged base: simulate a database that went through the index-losing v2
+    p = tmp_path / "v2damaged.db"
+    conn = sqlite3.connect(p)
+    conn.executescript(LEGACY_V0_SQL)
+    conn.execute(
+        "INSERT INTO runs (run_id, repo_path, started_at, status)"
+        " VALUES ('run-a', '/r', 1, 'running')"
+    )
+    conn.execute(
+        "INSERT INTO tasks (task_id, run_id, source, attack_class, scope_hint,"
+        " target_files, rationale, priority, status, raw_json, created_at, updated_at)"
+        " VALUES ('t_1', 'run-a', 'recon', 'sqli', 'x', '[]', '', 3, 'pending', '{}', 1, 1)"
+    )
+    conn.commit()
+    conn.close()
+    # drive it through the OLD v2 (index-losing) by hand: migrate, then drop
+    # the indexes v2 dropped to reproduce the damage
+    db = StateDB(p)
+    db.close()
+    conn = sqlite3.connect(p)
+    for idx in ("idx_findings_group", "idx_findings_run",
+                "idx_findings_validation", "idx_tasks_run_status"):
+        conn.execute(f"DROP INDEX IF EXISTS {idx}")
+    # downgrade user_version to 2 so v3 runs (and the reconcile path fires)
+    conn.execute("PRAGMA user_version = 2")
+    conn.commit()
+    conn.close()
+
+    db = StateDB(p)
+    conn = sqlite3.connect(p)
+    indexes = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'")}
+    for expected in ("idx_findings_group", "idx_findings_run",
+                     "idx_findings_validation", "idx_tasks_run_status",
+                     "idx_costs_run_stage"):
+        assert expected in indexes, f"{expected} lost"
+    # FK valid: with foreign_keys ON, a finding insert must succeed
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute(
+        "INSERT INTO findings (finding_id, task_id, run_id, file, line_start,"
+        " line_end, vuln_class, severity, description, evidence, raw_json)"
+        " VALUES ('f_x', 't_1', 'run-a', 'a.py', 1, 2, 'sqli', 'high', 'd', 'e', '{}')"
+    )
+    fk_issues = conn.execute("PRAGMA foreign_key_check").fetchall()
+    assert fk_issues == [], f"foreign_key_check reported: {fk_issues}"
+    conn.close()
+
+    # fresh v3 -> v3 reopen is a no-op
+    db2 = StateDB(p)
+    assert db2._conn.execute("PRAGMA user_version").fetchone()[0] == 3

@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS findings (
     group_id TEXT,
     is_canonical INTEGER DEFAULT 0,
     PRIMARY KEY (run_id, finding_id),
-    FOREIGN KEY (task_id) REFERENCES tasks(task_id)
+    FOREIGN KEY (run_id, task_id) REFERENCES tasks(run_id, task_id)
 );
 
 CREATE TABLE IF NOT EXISTS traces (
@@ -159,7 +159,7 @@ class Finding:
 
 
 class StateDB:
-    MIGRATION_VERSION = 2
+    MIGRATION_VERSION = 3
 
     def __init__(self, db_path: Path):
         self.path = db_path
@@ -190,6 +190,11 @@ class StateDB:
         try:
             self._migrate_v1()
             self._migrate_v2()
+            self._migrate_v3()
+            # Reconcile indexes: v2 shipped without the pre-rename drop and
+            # destroyed four of five on every database it touched. CREATE
+            # INDEX IF NOT EXISTS is a no-op for those still present.
+            self._create_schema()
             self._conn.execute(f"PRAGMA user_version = {self.MIGRATION_VERSION}")
             self._conn.commit()
         except Exception:
@@ -248,6 +253,44 @@ class StateDB:
         if "attempts" not in task_cols:
             self._conn.execute("ALTER TABLE tasks ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
 
+    def _rebuild(self, tables: tuple[str, ...]) -> None:
+        """Rename -> recreate from SCHEMA -> copy by name -> drop, inside
+        the caller's transaction.
+
+        Indexes are dropped FIRST and by lookup, not from a hardcoded list:
+        an index follows its table on rename and keeps its name, so
+        CREATE INDEX IF NOT EXISTS silently no-ops and DROP TABLE takes the
+        index with it. v2 lost four of five indexes exactly this way."""
+        for table in tables:
+            for row in self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' "
+                "AND tbl_name = ? AND name NOT LIKE 'sqlite_%'", (table,)
+            ).fetchall():
+                self._conn.execute(f"DROP INDEX IF EXISTS {row['name']}")
+        for table in tables:
+            self._conn.execute(f"ALTER TABLE {table} RENAME TO {table}_legacy")
+        self._create_schema()
+        for table in tables:
+            new_cols = [r["name"] for r in self._conn.execute(
+                f"PRAGMA table_info({table})").fetchall()]
+            legacy_cols = [r["name"] for r in self._conn.execute(
+                f"PRAGMA table_info({table}_legacy)").fetchall()]
+            # map by name; new-only columns (e.g. tasks.attempts) take
+            # their SCHEMA defaults
+            shared = [c for c in new_cols if c in legacy_cols]
+            before = self._conn.execute(
+                f"SELECT COUNT(*) FROM {table}_legacy").fetchone()[0]
+            self._conn.execute(
+                f"INSERT INTO {table} ({', '.join(shared)}) "
+                f"SELECT {', '.join(shared)} FROM {table}_legacy"
+            )
+            after = self._conn.execute(
+                f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            if after != before:
+                log.warning("migration: %s carried %d of %d rows",
+                            table, after, before)
+            self._conn.execute(f"DROP TABLE {table}_legacy")
+
     def _migrate_v2(self) -> None:
         """v1 -> v2: tasks joined the run-scoped key family.
 
@@ -269,19 +312,24 @@ class StateDB:
         ).fetchone()
         if row is None or "PRIMARY KEY (run_id, task_id)" in row["sql"]:
             return
-        for table in ("tasks", "findings", "traces"):
-            self._conn.execute(f"ALTER TABLE {table} RENAME TO {table}_legacy")
-        self._create_schema()
-        for table in ("tasks", "findings", "traces"):
-            new_cols = [r["name"] for r in self._conn.execute(f"PRAGMA table_info({table})").fetchall()]
-            legacy_cols = [r["name"] for r in self._conn.execute(f"PRAGMA table_info({table}_legacy)").fetchall()]
-            # map by name; tasks.attempts is new (SCHEMA default covers it)
-            shared = [c for c in new_cols if c in legacy_cols]
-            self._conn.execute(
-                f"INSERT INTO {table} ({', '.join(shared)}) "
-                f"SELECT {', '.join(shared)} FROM {table}_legacy"
-            )
-            self._conn.execute(f"DROP TABLE {table}_legacy")
+        self._rebuild(("tasks", "findings", "traces"))
+
+    def _migrate_v3(self) -> None:
+        """v2 -> v3: findings' FK matches tasks' composite primary key.
+
+        v2 gave tasks PRIMARY KEY (run_id, task_id) but left findings
+        declaring FOREIGN KEY (task_id) REFERENCES tasks(task_id). A
+        single-column FK needs a unique parent index, so SQLite rejects it
+        as a foreign key mismatch: PRAGMA foreign_key_check errors and,
+        with foreign_keys=ON, every finding insert fails. Rebuilding
+        findings alone is safe -- the FK is its own, so no other table's
+        SQL is rewritten."""
+        row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'findings'"
+        ).fetchone()
+        if row is None or "REFERENCES tasks(run_id, task_id)" in row["sql"]:
+            return
+        self._rebuild(("findings",))
 
     # ---------- runs ----------
 
