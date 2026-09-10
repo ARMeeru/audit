@@ -178,3 +178,79 @@ def test_first_hunt_stage_with_no_history_stays_bounded(
         f"overrun must stay bounded by one (self-corrected) estimate: "
         f"spent {db.total_cost('poc')}"
     )
+
+@pytest.mark.parametrize("pre_spent,stage_cost,expect_completed", [
+    (0.0, 0.0, True),    # fresh run: finalize runs, cap bounds the invocation
+    (4.0, 0.0, True),    # below half: runs
+    (6.0, 0.0, True),    # the old remainder bug tripped here (half-band)
+    (9.0, 0.0, True),    # just under: runs when the invocation spends nothing
+    (10.0, 0.0, True),   # at cap: escape hatch, closes uncapped
+    (12.0, 0.0, True),   # over cap: escape hatch
+    (9.0, 2.0, False),   # invocation spend pushes cumulative past the cap
+])
+def test_finalize_cap_across_the_spend_band(
+    stage_env, monkeypatch, pre_spent, stage_cost, expect_completed
+):
+    """F3/R5: the remainder-with-zero-baseline pairing aborted whenever
+    cumulative spend sat in [cap/2, cap) -- the band where closing out a
+    run is most plausible. Finalize must run for every pre-spend below
+    the cap, close uncapped at or above it, and abort only when the
+    invocation itself pushes cumulative spend past the cap."""
+    from audit import orchestrator
+    from audit.state import StateDB
+    from audit.config import load_config
+    from pathlib import Path
+
+    tmp = stage_env[2] if len(stage_env) > 2 else None
+    # stage_env yields (db, ctx); build our own isolated pieces
+    db, ctx = stage_env
+    import audit.stages._common as common_mod
+    tmp_path = Path(str(ctx.repo_path)).parent
+
+    cfg = load_config()
+    ran = {"stages": False}
+
+    def cheap_stub(name, cost=0.0):
+        async def _fn(c, d, **kwargs):
+            ran["stages"] = True
+            if cost:
+                d.record_cost(c.run_id, name, None,
+                              {"total_cost_usd": cost, "usage": {}})
+            return 0
+        return _fn
+
+    async def report_fn(c, d, **kwargs):
+        ran["stages"] = True
+        out = c.results_dir("report") / "report.json"
+        out.write_text('{"run_id": "%s", "target": {}, "summary": '
+                       '{"total": 0, "by_severity": {}}, "findings": []}' % c.run_id)
+        return out
+
+    for name in ("run_recon", "run_validate", "run_dedupe", "run_trace",
+                 "run_feedback", "run_gapfill", "run_hunt"):
+        monkeypatch.setattr(orchestrator.stages, name,
+                            cheap_stub(name, stage_cost if name == "run_validate" else 0.0))
+    monkeypatch.setattr(orchestrator.stages, "run_report", report_fn)
+
+    db.create_run("/r", "band")
+    if pre_spent:
+        db.record_cost("band", "hunt", "x",
+                       {"total_cost_usd": pre_spent, "usage": {}})
+
+    from audit.orchestrator import run_pipeline, CostExceeded
+    from audit.orchestrator import run_pipeline, CostExceeded
+    if expect_completed:
+        asyncio.run(run_pipeline(
+            repo_path=tmp_path, run_id="band", db=db, config=cfg,
+            max_cost_usd=10.0, finalize=True, resume=True))
+        assert ran["stages"]
+        status = db._conn.execute(
+            "SELECT status FROM runs WHERE run_id='band'").fetchone()["status"]
+        assert status == "completed"
+    else:
+        with pytest.raises(CostExceeded):
+            asyncio.run(run_pipeline(
+                repo_path=tmp_path, run_id="band", db=db, config=cfg,
+                max_cost_usd=10.0, finalize=True, resume=True))
+        assert ran["stages"], "validate runs before the cap trips at dedupe"
+

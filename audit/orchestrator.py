@@ -112,8 +112,12 @@ async def run_pipeline(
         if finalize_cost_usd is not None:
             checks.append(("finalize", finalize_cost_usd, finalize_start_cost))
         elif max_cost_usd is not None and finalize_start_cost < max_cost_usd:
-            checks.append(
-                ("finalize", max_cost_usd - finalize_start_cost, 0.0))
+            # Absolute cap with an absolute baseline. Pairing the REMAINDER
+            # with baseline 0.0 compares cumulative spend against what is
+            # left, so the check tripped at half the budget -- refusing
+            # exactly in the band where an operator most plausibly closes
+            # out a run with budget left.
+            checks.append(("finalize", max_cost_usd, 0.0))
 
     def _check(stage_name: str, in_flight_usd: float = 0.0) -> None:
         spent_total = db.total_cost(run_id)
