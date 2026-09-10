@@ -790,3 +790,28 @@ def test_duplicate_id_within_one_payload_keeps_both(tmp_path: Path) -> None:
     assert db._conn.execute(
         "SELECT COUNT(*) AS c FROM findings WHERE run_id = ?",
         (rid,)).fetchone()["c"] == 2
+
+def test_migration_from_an_indexed_database_keeps_every_index(tmp_path: Path) -> None:
+    """Findings 2+3/R4: the index-loss regression only reproduces from a
+    database that HAS indexes going into a rename -- v2's two mechanisms
+    (pre-rename drop in _rebuild, trailing reconcile in _migrate) each
+    mask the other, so every single-point mutation survives. This sensor
+    starts indexed and asserts the exact index set survives v0->v3."""
+    import sqlite3
+    p = tmp_path / "indexed.db"
+    conn = sqlite3.connect(p)
+    conn.executescript(LEGACY_V0_SQL)   # origin/main's real SCHEMA: 5 indexes
+    conn.commit()
+    before = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'")}
+    assert len(before) == 5, f"fixture must be indexed: {before}"
+    conn.close()
+
+    db = StateDB(p)   # v0 -> v3
+    db.close()
+
+    conn = sqlite3.connect(p)
+    after = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'")}
+    conn.close()
+    assert after == before, f"index set changed across migration: lost {before - after}"
