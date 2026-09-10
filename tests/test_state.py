@@ -815,3 +815,31 @@ def test_migration_from_an_indexed_database_keeps_every_index(tmp_path: Path) ->
         "SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'")}
     conn.close()
     assert after == before, f"index set changed across migration: lost {before - after}"
+
+def test_migration_completes_despite_a_concurrent_reader(tmp_path: Path) -> None:
+    """F4/R5: switching a rollback-journal file to WAL needs an exclusive
+    lock, and a held read (what `audit status` in a second terminal is)
+    used to abort the open -- skipping the v3 repair behind an opaque
+    'database is locked'. The migration must complete anyway."""
+    import sqlite3
+    p = tmp_path / "legacy.db"
+    conn = sqlite3.connect(p)
+    conn.executescript(LEGACY_V0_SQL)
+    conn.execute(
+        "INSERT INTO runs (run_id, repo_path, started_at, status)"
+        " VALUES ('run-a', '/r', 1, 'running')"
+    )
+    conn.commit()
+    # hold a read transaction, like a second process mid-`audit status`
+    conn.execute("BEGIN")
+    conn.execute("SELECT COUNT(*) FROM runs").fetchone()
+
+    db = StateDB(p)   # must not raise, even though commit cannot land
+    db.close()
+
+    # reader goes away: the next open completes the upgrade
+    conn.execute("COMMIT")
+    conn.close()
+    db = StateDB(p)
+    assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    db.close()

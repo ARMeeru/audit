@@ -5,6 +5,7 @@ orchestration, resume, and reporting."""
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 import uuid
@@ -157,6 +158,8 @@ class Finding:
     group_id: str | None
     is_canonical: bool
 
+log = logging.getLogger(__name__)
+
 
 class StateDB:
     MIGRATION_VERSION = 3
@@ -169,10 +172,39 @@ class StateDB:
         # WAL: readers (`audit status` during a run) no longer trip the
         # writer's lock, and a crash between checkpoint and commit is
         # recovered from the WAL instead of corrupting the write.
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._create_schema()
-        self._migrate()
-        self._conn.commit()
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError:
+            # Switching an existing rollback-journal file to WAL needs an
+            # exclusive lock, and another `audit` process holding a read
+            # blocks it. Failing HERE would skip _migrate entirely -- a v2
+            # database would stay unrepaired (missing indexes, invalid FK)
+            # behind an error naming nothing actionable. Degrade: the
+            # migration below is transactional under the rollback journal
+            # too; the WAL switch retires on a quieter re-open.
+            log.warning(
+                "could not switch %s to WAL (another audit process may "
+                "hold it); close other audit processes and re-open to "
+                "finish upgrading", self.path,
+            )
+        try:
+            self._create_schema()
+            self._migrate()
+            self._conn.commit()
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e):
+                raise
+            # A reader holding a transaction (an `audit status` sitting
+            # open) blocks the migration's final EXCLUSIVE lock on a
+            # rollback-journal database. Leave the upgrade pending rather
+            # than crashing the open: the database is usable unmigrated,
+            # and the NEXT open without readers completes the upgrade.
+            self._conn.rollback()
+            log.warning(
+                "could not upgrade %s yet (another audit process holds it);"
+                " the upgrade completes on the next open",
+                self.path,
+            )
 
     def _create_schema(self) -> None:
         # executescript() would COMMIT any open transaction, so the schema
