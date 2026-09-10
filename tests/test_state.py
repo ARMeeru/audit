@@ -758,3 +758,35 @@ def test_v3_repairs_indexes_and_fk_on_v2_damaged_databases(tmp_path: Path) -> No
     # fresh v3 -> v3 reopen is a no-op
     db2 = StateDB(p)
     assert db2._conn.execute("PRAGMA user_version").fetchone()[0] == 3
+
+def test_duplicate_id_within_one_payload_keeps_both(tmp_path: Path) -> None:
+    """F4/R6: two different findings sharing an id in the SAME payload are
+    a model-emitted collision, not a replay -- the second used to be
+    silently dropped because the first's row existed by resolution time
+    (a regression against the pre-fix suffix loop)."""
+    db = StateDB(tmp_path / "state.db")
+    rid = db.create_run("/r", "test_run")
+    db.add_task(rid, {"task_id": "t_1", "attack_class": "sqli",
+                      "scope_hint": "x", "target_files": ["a.py"],
+                      "rationale": "r", "priority": 1, "source": "recon"})
+    f_a = {"finding_id": "f_1", "file": "a.py", "line_start": 10,
+           "line_end": 11, "vuln_class": "sqli", "severity": "high",
+           "description": "SQLi in the login handler", "evidence_snippet": "e1",
+           "confidence": 0.9}
+    f_b = dict(f_a, description="SQLi in the signup handler",
+               evidence_snippet="e2", line_start=20)
+
+    inserted = db.complete_task(rid, "t_1", [f_a, f_b])
+    assert inserted == 2, "both same-payload findings must be stored"
+    rows = db._conn.execute(
+        "SELECT finding_id, line_start FROM findings WHERE run_id = ? "
+        "ORDER BY line_start", (rid,)).fetchall()
+    assert [(r["finding_id"], r["line_start"]) for r in rows] == \
+        [("f_1", 10), ("f_1_2", 20)]
+
+    # a genuine replay of the SAME payload afterwards still no-ops
+    inserted2 = db.complete_task(rid, "t_1", [f_a, f_b])
+    assert inserted2 == 0
+    assert db._conn.execute(
+        "SELECT COUNT(*) AS c FROM findings WHERE run_id = ?",
+        (rid,)).fetchone()["c"] == 2

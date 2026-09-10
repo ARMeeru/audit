@@ -448,10 +448,24 @@ class StateDB:
         Returns the number of NEW findings inserted."""
         self._conn.execute("BEGIN IMMEDIATE")
         try:
-            inserted = 0
+            # Resolve the WHOLE payload's ids before inserting anything, so
+            # a repeat within the payload suffixes off the planned fid and
+            # a replay of the same payload resolves to the same (already
+            # stored) rows and no-ops.
+            seen: set[str] = set()
+            taken: set[str] = set()
+            planned: list[tuple[str, dict, bool]] = []
             for finding in findings:
-                fid, insert = self._resolve_finding_id(run_id, task_id,
-                                                       finding["finding_id"])
+                base = finding["finding_id"]
+                fid, insert = self._resolve_finding_id(
+                    run_id, task_id, base, replay_ok=base not in seen,
+                    taken=taken)
+                seen.add(base)
+                taken.add(fid)
+                planned.append((fid, finding, insert))
+
+            inserted = 0
+            for fid, finding, insert in planned:
                 if not insert:
                     continue
                 if fid != finding["finding_id"]:
@@ -574,34 +588,44 @@ class StateDB:
     # ---------- findings ----------
 
     def _resolve_finding_id(
-        self, run_id: str, task_id: str, base: str
+        self, run_id: str, task_id: str, base: str, replay_ok: bool = True,
+        taken: set[str] | None = None,
     ) -> tuple[str, bool]:
         """Resolve a model-emitted finding id for (run_id, task_id).
 
         Returns (finding_id, insert_needed). A row already held by the SAME
         task means this is a replay of an interrupted dispatch (crash
-        between the finding writes and the done flip): no insert. The same
-        id from a DIFFERENT task is a genuine model-emitted collision and
-        gets a suffix — model ids are only unique per task by prompt
-        convention."""
+        between the finding writes and the done flip): no insert -- unless
+        replay_ok is False, which complete_task passes for a base id it has
+        already handled within THIS payload (two different findings sharing
+        an id in one payload are a collision, not a replay; treating them
+        as a replay silently dropped the second finding). The same id from
+        a DIFFERENT task is a genuine model-emitted collision and gets a
+        suffix — model ids are only unique per task by prompt convention."""
+        taken = taken or set()
         existing = self._conn.execute(
             "SELECT task_id FROM findings WHERE run_id = ? AND finding_id = ?",
             (run_id, base),
         ).fetchone()
-        if existing is not None and existing["task_id"] == task_id:
+        if replay_ok and existing is not None and existing["task_id"] == task_id:
             return base, False
         fid = base
         n = 1
-        while self._conn.execute(
-            "SELECT 1 FROM findings WHERE run_id = ? AND finding_id = ?",
-            (run_id, fid),
-        ).fetchone():
-            # Two tasks may emit the same id; keep both by suffixing and
-            # keep raw_json consistent so downstream stages reference the
-            # rewritten id.
+        while True:
+            row = self._conn.execute(
+                "SELECT task_id FROM findings WHERE run_id = ? AND finding_id = ?",
+                (run_id, fid),
+            ).fetchone()
+            if row is None and fid not in taken:
+                return fid, True
+            if row is not None and row["task_id"] == task_id and fid not in taken:
+                # our own row: a replay of this very payload item
+                return fid, False
+            # taken fids are planned earlier in this same payload; rows
+            # owned by other tasks are genuine collisions -- both force
+            # the next suffix
             n += 1
             fid = f"{base}_{n}"
-        return fid, True
 
     def add_finding(self, run_id: str, task_id: str, finding: dict) -> str:
         """Insert one finding. Returns the (possibly suffixed) finding_id."""
