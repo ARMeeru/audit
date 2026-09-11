@@ -162,6 +162,12 @@ class Finding:
 log = logging.getLogger(__name__)
 
 
+class UpgradePendingError(RuntimeError):
+    """The database could not be migrated yet (another process held it).
+    `audit status` works; a run does not, because the run paths need the
+    upgraded schema."""
+
+
 class StateDB:
     MIGRATION_VERSION = 3
 
@@ -170,6 +176,11 @@ class StateDB:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.path))
         self._conn.row_factory = sqlite3.Row
+        # Set when the migration could not run because another process held
+        # the database. The object is usable for reads; run paths check this
+        # and refuse with a named error instead of failing later with
+        # "no such column: attempts" after a paid recon.
+        self.upgrade_pending = False
         # WAL: readers (`audit status` during a run) no longer trip the
         # writer's lock, and a crash between checkpoint and commit is
         # recovered from the WAL instead of corrupting the write.
@@ -201,10 +212,11 @@ class StateDB:
             # than crashing the open: the database is usable unmigrated,
             # and the NEXT open without readers completes the upgrade.
             self._conn.rollback()
+            self.upgrade_pending = True
             log.warning(
-                "could not upgrade %s yet (another audit process holds it);"
-                " the upgrade completes on the next open",
-                self.path,
+                "could not upgrade %s yet (another audit process holds it); "
+                "`audit status` works, but a run needs the upgrade -- close "
+                "other audit processes and re-open", self.path,
             )
 
     def _create_schema(self) -> None:
@@ -227,7 +239,7 @@ class StateDB:
         schema_index_names = set(re.findall(
             r"CREATE INDEX IF NOT EXISTS (\w+)", SCHEMA))
         preserved = [
-            row["sql"] for row in self._conn.execute(
+            (row["name"], row["sql"]) for row in self._conn.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'index' "
                 "AND name NOT LIKE 'sqlite_%'"
             ).fetchall()
@@ -243,9 +255,20 @@ class StateDB:
             # destroyed four of five on every database it touched. CREATE
             # INDEX IF NOT EXISTS is a no-op for those still present.
             self._create_schema()
-            for sql in preserved:
-                self._conn.execute(
-                    sql.replace("CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1))
+            # Replay by ABSENCE, never by rewriting the DDL. Two ways the
+            # rewrite bricked the upgrade: "CREATE INDEX" is not a substring
+            # of CREATE UNIQUE INDEX so the rewrite silently missed, and an
+            # index on a table no migration rebuilds (costs, runs, artifacts,
+            # recon_outputs) is captured but never dropped -- so its name was
+            # still live at replay time and the verbatim statement collided.
+            # The rollback left user_version at 0 with the cause stable, so
+            # every subsequent open failed identically: the database could
+            # never be upgraded.
+            live = {r["name"] for r in self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'").fetchall()}
+            for name, sql in preserved:
+                if name not in live:
+                    self._conn.execute(sql)
             self._conn.execute(f"PRAGMA user_version = {self.MIGRATION_VERSION}")
             self._conn.commit()
         except Exception:
@@ -457,6 +480,7 @@ class StateDB:
         self._conn.commit()
 
     def get_pending_tasks(self, run_id: str, max_attempts: int = 3) -> list[Task]:
+        self._require_upgraded()
         rows = self._conn.execute(
             "SELECT * FROM tasks WHERE run_id = ? AND status = 'pending' "
             "AND attempts < ? ORDER BY priority, created_at",
@@ -487,6 +511,7 @@ class StateDB:
         path writes 'pending' directly — neither increments a requeue-side
         counter, so a deterministically hanging task re-burned full spend
         on every resume."""
+        self._require_upgraded()
         self._conn.execute(
             "UPDATE tasks SET status = 'running', attempts = attempts + 1, "
             "updated_at = ? WHERE run_id = ? AND task_id = ?",
@@ -501,6 +526,7 @@ class StateDB:
         the resume re-dispatch then re-inserted every finding (the findings
         and the done flip are now indivisible). Same-task replays no-op.
         Returns the number of NEW findings inserted."""
+        self._require_upgraded()
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             # Resolve the WHOLE payload's ids before inserting anything, so
@@ -553,27 +579,6 @@ class StateDB:
             self._conn.rollback()
             raise
 
-    def max_stage_cost(self, run_id: str, stage: str) -> float | None:
-        """Most expensive single completed task in this stage of this run.
-        Used as the per-task in-flight estimate for budget checks: an upper
-        bound, not a mean — a mean under-shoots exactly when a stage runs
-        long, which is when the cap matters."""
-        row = self._conn.execute(
-            "SELECT MAX(usd) AS m FROM costs WHERE run_id = ? AND stage = ?",
-            (run_id, stage),
-        ).fetchone()
-        return float(row["m"]) if row and row["m"] is not None else None
-
-    def max_stage_cost_any_run(self, stage: str) -> float | None:
-        """Same as max_stage_cost, across every run sharing this database:
-        a first hunt stage has no rows for ITS run, which is the case a
-        hard default was silently covering."""
-        row = self._conn.execute(
-            "SELECT MAX(usd) AS m FROM costs WHERE stage = ?",
-            (stage,),
-        ).fetchone()
-        return float(row["m"]) if row and row["m"] is not None else None
-
     def release_task(self, run_id: str, task_id: str) -> None:
         """Return a task to 'pending' WITHOUT keeping the attempt charge: a
         quota abort is the pipeline stopping, not the task failing. Three
@@ -586,6 +591,14 @@ class StateDB:
             (time.time(), run_id, task_id),
         )
         self._conn.commit()
+
+    def _require_upgraded(self) -> None:
+        if self.upgrade_pending:
+            raise UpgradePendingError(
+                f"{self.path} still needs its schema upgrade; another audit "
+                "process held it at open. Close other audit processes and "
+                "re-open. (`audit status` works meanwhile.)"
+            )
 
     def count_abandoned_tasks(self, run_id: str) -> int:
         """Failed tasks past the requeue ceiling — work silently given up
@@ -606,6 +619,7 @@ class StateDB:
         re-queued max_requeues times stays failed, so a deterministically
         failing task stops re-burning spend on every resume. Returns the
         number of tasks reset."""
+        self._require_upgraded()
         now = time.time()
         cur_run = self._conn.execute(
             "UPDATE tasks SET status = 'pending', updated_at = ? "

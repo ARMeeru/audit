@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from audit.state import StateDB
 
 
@@ -835,6 +837,15 @@ def test_migration_completes_despite_a_concurrent_reader(tmp_path: Path) -> None
     conn.execute("SELECT COUNT(*) FROM runs").fetchone()
 
     db = StateDB(p)   # must not raise, even though commit cannot land
+    assert db.upgrade_pending is True
+    # `audit status` paths still work on the unmigrated database
+    assert db.total_cost("run-a") == 0.0
+    # ...but a RUN must refuse with a named error, not fail later inside a
+    # dispatch with "no such column: attempts" after a paid recon
+    import pytest as _pytest
+    from audit.state import UpgradePendingError
+    with _pytest.raises(UpgradePendingError):
+        db.get_pending_tasks("run-a")
     db.close()
 
     # reader goes away: the next open completes the upgrade
@@ -842,6 +853,8 @@ def test_migration_completes_despite_a_concurrent_reader(tmp_path: Path) -> None
     conn.close()
     db = StateDB(p)
     assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert db.upgrade_pending is False
+    assert db.get_pending_tasks("run-a") == []
     db.close()
 
 def test_rebuild_preserves_hand_added_indexes(tmp_path: Path) -> None:
@@ -864,3 +877,55 @@ def test_rebuild_preserves_hand_added_indexes(tmp_path: Path) -> None:
         "SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'")}
     assert "idx_user_custom" in names, "hand-added index must survive the rebuild"
     conn.close()
+
+
+@pytest.mark.parametrize("ddl,name", [
+    ("CREATE INDEX idx_custom ON findings(severity)", "idx_custom"),
+    # NOT rebuilt by any migration, so the name stays live at replay -- the
+    # shape that used to brick the upgrade on every open.
+    ("CREATE UNIQUE INDEX idx_u_costs ON costs(cost_id)", "idx_u_costs"),
+    ("CREATE INDEX idx_part ON findings(file) WHERE severity='high'", "idx_part"),
+    ("create index idx_lower on findings(severity)", "idx_lower"),
+])
+@pytest.mark.parametrize("start", ["v0", "v1", "v2_damaged"])
+def test_hand_added_indexes_survive_every_upgrade_path(tmp_path: Path, ddl, name, start) -> None:
+    """F1/R1: a hand-added index must survive every upgrade path, and the
+    open must never raise. Parametrized over index shapes because the old
+    sensor used a plain index on a REBUILT table -- the one shape that
+    cannot collide with the replay."""
+    import sqlite3
+    p = tmp_path / f"{start}.db"
+    conn = sqlite3.connect(p)
+    conn.executescript(LEGACY_V0_SQL)
+    conn.execute(
+        "INSERT INTO runs (run_id, repo_path, started_at, status)"
+        " VALUES ('run-a', '/r', 1, 'running')")
+    conn.execute(ddl)
+    conn.commit()
+    conn.close()
+
+    if start == "v1":
+        # migrate, then stop at v1 by rolling the version back
+        db = StateDB(p)
+        db.close()
+        conn = sqlite3.connect(p)
+        conn.execute("PRAGMA user_version = 1")
+        conn.commit()
+        conn.close()
+    elif start == "v2_damaged":
+        db = StateDB(p)
+        db.close()
+        conn = sqlite3.connect(p)
+        for idx in ("idx_findings_group", "idx_findings_run",
+                    "idx_findings_validation", "idx_tasks_run_status"):
+            conn.execute(f"DROP INDEX IF EXISTS {idx}")
+        conn.execute("PRAGMA user_version = 2")
+        conn.commit()
+        conn.close()
+
+    db = StateDB(p)   # must not raise
+    assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    names = {r[0] for r in db._conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'")}
+    db.close()
+    assert name in names, f"{name} lost across {start} upgrade: {sorted(names)}"
