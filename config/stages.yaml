@@ -6,6 +6,13 @@ defaults:
   max_turns: 25
   permission_mode: acceptEdits   # never bypassPermissions
   repair_attempts: 1             # one re-emit chance on schema-validation failure
+  # Per-task cost reserved against --max-cost-usd while agents are in flight.
+  # Upper bound by intent: 1.5 sits above the highest single task cost ever
+  # recorded on the live runs (hunt max $0.676, validate max $1.26,
+  # trace max $0.95 across 400+ cost rows). Raise it if a stage moves to a
+  # costlier model or max_turns grows; a value below actual per-task cost
+  # makes the cap more permissive than committed spend alone.
+  est_cost_usd: 1.5
 
 stages:
   recon:

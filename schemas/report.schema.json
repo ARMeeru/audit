@@ -1,36 +1,70 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Report",
-  "description": "Final structured report — only reachable, deduped findings.",
+  "description": "Final structured report \u2014 only reachable, deduped findings.",
   "type": "object",
-  "required": ["run_id", "target", "summary", "findings"],
+  "required": [
+    "run_id",
+    "target",
+    "summary",
+    "findings"
+  ],
   "additionalProperties": false,
   "properties": {
-    "run_id": { "type": "string" },
+    "run_id": {
+      "type": "string"
+    },
     "target": {
       "type": "object",
-      "required": ["repo_path"],
+      "required": [
+        "repo_path"
+      ],
       "additionalProperties": false,
       "properties": {
-        "repo_path": { "type": "string" },
-        "commit": { "type": "string" }
+        "repo_path": {
+          "type": "string"
+        },
+        "commit": {
+          "type": "string"
+        }
       }
     },
     "summary": {
       "type": "object",
-      "required": ["total", "by_severity"],
+      "required": [
+        "total",
+        "by_severity"
+      ],
       "additionalProperties": false,
       "properties": {
-        "total": { "type": "integer", "minimum": 0 },
+        "total": {
+          "type": "integer",
+          "minimum": 0
+        },
         "by_severity": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "critical":      { "type": "integer", "minimum": 0 },
-            "high":          { "type": "integer", "minimum": 0 },
-            "medium":        { "type": "integer", "minimum": 0 },
-            "low":           { "type": "integer", "minimum": 0 },
-            "informational": { "type": "integer", "minimum": 0 }
+            "critical": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "high": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "medium": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "low": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "informational": {
+              "type": "integer",
+              "minimum": 0
+            }
           }
         }
       }
@@ -39,34 +73,90 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["finding_id", "title", "severity", "vuln_class", "file", "line_start", "line_end", "description", "evidence", "trace", "recommendation"],
+        "required": [
+          "finding_id",
+          "title",
+          "severity",
+          "vuln_class",
+          "file",
+          "line_start",
+          "line_end",
+          "description",
+          "evidence",
+          "trace",
+          "recommendation"
+        ],
         "additionalProperties": false,
         "properties": {
-          "finding_id": { "type": "string" },
-          "title": { "type": "string", "minLength": 5 },
-          "severity": { "type": "string", "enum": ["critical", "high", "medium", "low", "informational"] },
-          "vuln_class": { "type": "string" },
-          "cwe": { "type": "string", "pattern": "^CWE-[0-9]+$" },
-          "file": { "type": "string" },
-          "line_start": { "type": "integer", "minimum": 1 },
-          "line_end": { "type": "integer", "minimum": 1 },
-          "description": { "type": "string", "minLength": 30 },
-          "evidence": { "type": "string" },
+          "finding_id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string",
+            "minLength": 5
+          },
+          "severity": {
+            "type": "string",
+            "enum": [
+              "critical",
+              "high",
+              "medium",
+              "low",
+              "informational"
+            ]
+          },
+          "vuln_class": {
+            "type": "string"
+          },
+          "cwe": {
+            "type": "string",
+            "pattern": "^CWE-[0-9]+$"
+          },
+          "file": {
+            "type": "string"
+          },
+          "line_start": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "line_end": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "description": {
+            "type": "string",
+            "minLength": 30
+          },
+          "evidence": {
+            "type": "string"
+          },
           "trace": {
             "type": "object",
-            "required": ["entry_points", "call_chain"],
+            "required": [
+              "entry_points",
+              "call_chain"
+            ],
             "additionalProperties": false,
             "properties": {
               "entry_points": {
                 "type": "array",
                 "items": {
                   "type": "object",
-                  "required": ["kind", "location"],
+                  "required": [
+                    "kind",
+                    "location"
+                  ],
                   "additionalProperties": false,
                   "properties": {
-                    "kind": { "type": "string" },
-                    "location": { "type": "string" },
-                    "controllable_by": { "type": "string" }
+                    "kind": {
+                      "type": "string"
+                    },
+                    "location": {
+                      "type": "string"
+                    },
+                    "controllable_by": {
+                      "type": "string"
+                    }
                   }
                 }
               },
@@ -74,12 +164,23 @@
                 "type": "array",
                 "items": {
                   "type": "object",
-                  "required": ["file", "function", "line"],
+                  "required": [
+                    "file",
+                    "function",
+                    "line"
+                  ],
                   "additionalProperties": false,
                   "properties": {
-                    "file": { "type": "string" },
-                    "function": { "type": "string" },
-                    "line": { "type": "integer", "minimum": 1 }
+                    "file": {
+                      "type": "string"
+                    },
+                    "function": {
+                      "type": "string"
+                    },
+                    "line": {
+                      "type": "integer",
+                      "minimum": 1
+                    }
                   }
                 }
               }
@@ -89,19 +190,44 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "language": { "type": "string" },
-              "code": { "type": "string" },
-              "succeeded": { "type": "boolean" }
+              "language": {
+                "type": "string"
+              },
+              "code": {
+                "type": "string"
+              },
+              "succeeded": {
+                "type": "boolean"
+              }
             }
           },
           "variants": {
             "type": "array",
-            "items": { "type": "string" },
+            "items": {
+              "type": "string"
+            },
             "description": "Other finding_ids in the same dedupe group."
           },
-          "recommendation": { "type": "string", "minLength": 20 }
+          "recommendation": {
+            "type": "string",
+            "minLength": 20
+          }
         }
       }
+    },
+    "degraded": {
+      "type": "boolean",
+      "description": "True when the report was produced by the deterministic fallback (agent failed) or the run closed with unassessed canonicals."
+    },
+    "degraded_reason": {
+      "type": "string"
+    },
+    "untraced_findings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Confirmed canonical findings with no trace row: never assessed."
     }
   }
 }

@@ -21,26 +21,31 @@ async def run_recon(ctx: StageContext, db: StateDB, max_tasks: int = DEFAULT_MAX
     sc = ctx.stage("recon")
     log.info("[%s] recon: model=%s max_tasks=%d", ctx.run_id, sc.model, max_tasks)
 
-    result = await run_agent(
-        stage="recon",
-        prompt_file=ctx.prompt("01-recon"),
-        user_input={"repo_path": str(ctx.repo_path), "max_tasks": max_tasks,
-                    **ctx.extras()},
-        schema_file=ctx.schema("recon_output"),
-        allowed_tools=sc.tools,
-        model=sc.model,
-        cwd=ctx.repo_path,
-        add_dirs=[ctx.repo_path],
-        max_turns=sc.max_turns,
-        permission_mode=sc.permission_mode,
-        artifact_dir=ctx.results_dir("recon"),
-        artifact_name="recon",
-        repair_attempts=sc.repair_attempts,
-    )
+    try:
+        result = await run_agent(
+            stage="recon",
+            prompt_file=ctx.prompt("01-recon"),
+            user_input={"repo_path": str(ctx.repo_path), "max_tasks": max_tasks,
+                        **ctx.extras()},
+            schema_file=ctx.schema("recon_output"),
+            allowed_tools=sc.tools,
+            model=sc.model,
+            cwd=ctx.repo_path,
+            add_dirs=[ctx.repo_path],
+            max_turns=sc.max_turns,
+            permission_mode=sc.permission_mode,
+            artifact_dir=ctx.results_dir("recon"),
+            artifact_name="recon",
+            repair_attempts=sc.repair_attempts,
+            on_attempt=lambda msg: db.record_cost(ctx.run_id, "recon", None, msg),
+        )
+    except Exception:
+        # Recon failure aborts the run; per-attempt spend is already on the
+        # ledger via the runner's on_attempt callback.
+        raise
 
     payload = result.payload
     db.save_recon_output(ctx.run_id, payload)
-    db.record_cost(ctx.run_id, "recon", None, result.raw_result_message)
     db.add_artifact(ctx.run_id, "recon", None, "jsonl", str(result.artifact_path))
 
     for task in payload.get("initial_tasks", []):

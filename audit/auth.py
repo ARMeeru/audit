@@ -51,6 +51,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -75,13 +76,29 @@ CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 
 
 def _is_gateway_base(url: str) -> bool:
-    """A non-empty BASE_URL that doesn't point at canonical Anthropic
-    counts as 'gateway mode'."""
-    u = url.strip().lower()
+    """A non-empty BASE_URL whose hostname is not canonical Anthropic
+    counts as 'gateway mode'.
+
+    The comparison is on the parsed hostname, not a substring: a lookalike
+    like `https://api.anthropic.com.evil.net` must classify as a gateway,
+    otherwise configure_auth scrubs ANTHROPIC_AUTH_TOKEN but keeps the
+    hostile base URL active for the SDK's CLI."""
+    u = (url or "").strip().lower()
     if not u:
         return False
-    # Treat anything except api.anthropic.com / console.anthropic.com as gateway.
-    return "anthropic.com" not in u
+    if "://" not in u:
+        u = f"https://{u}"
+    try:
+        host = urlparse(u).hostname or ""
+    except ValueError:
+        # Unparseable URL (e.g. malformed IPv6 literal): treat as a
+        # foreign host and fail closed rather than raising past the
+        # AuthError-handling call sites.
+        return True
+    # Deliberate single-host allowlist: only the canonical API host counts
+    # as Anthropic. Console/docs hosts are not API endpoints, so pointing
+    # BASE_URL at them is a misconfiguration and fails closed.
+    return host != "api.anthropic.com"
 
 
 def configure_auth(
@@ -118,6 +135,19 @@ def configure_auth(
     base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
     auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN", "").strip()
     gateway = _is_gateway_base(base_url) and bool(auth_token)
+
+    # Credential-independent rule, checked above the mode fork: a
+    # non-Anthropic BASE_URL without a gateway token must never proceed.
+    # The subscription branch used to check this, but the --allow-api-key
+    # branch skipped it, so a real API key would be sent to the hostile
+    # host with a green preflight. Validate once, for every mode.
+    if _is_gateway_base(base_url) and not auth_token:
+        raise AuthError(
+            f"ANTHROPIC_BASE_URL points at a non-Anthropic host ({base_url})\n"
+            "but ANTHROPIC_AUTH_TOKEN is not set. Credentials are never sent\n"
+            "to a custom host without an explicit gateway token: either set\n"
+            "ANTHROPIC_AUTH_TOKEN for the gateway, or unset ANTHROPIC_BASE_URL."
+        )
 
     api_key_scrubbed = False
     auth_token_was_scrubbed = False
@@ -201,6 +231,6 @@ def configure_auth(
         claude_cli_path=cli_path,
         claude_cli_version=cli_version,
         credentials_file=creds_file,
-        gateway_base_url=base_url if mode == "gateway" else None,
+        gateway_base_url=base_url or None,
         gateway_model=os.environ.get("ANTHROPIC_MODEL") if mode == "gateway" else None,
     )

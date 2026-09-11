@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 
-from audit.runner import AgentRunError, TransientAgentError, run_agent
+from audit.runner import AgentRunError, QuotaExhaustedError, TransientAgentError, run_agent
 from audit.state import StateDB
 from audit.stages._common import StageContext, truncated_recon_summary
 
@@ -54,6 +54,17 @@ async def run_gapfill(ctx: StageContext, db: StateDB,
         "max_new_tasks": max_new_tasks,
         **ctx.extras(),
     }
+    # The artifact row is written BEFORE the agent call: a failed attempt
+    # must consume its loop-budget slot, or the next resume re-grants the
+    # iteration (the exact re-expansion the derived bounds exist to stop).
+    # The trade is deliberate: a quota-killed gapfill consumes its slot
+    # permanently, on the theory that an aborted iteration's remaining
+    # exploration is worth less than an unbounded loop.
+    # It also makes the iter tag collision-free — the tag is derived from
+    # the count at reservation time, and retries reuse the same path.
+    iter_tag = _iter_tag(ctx.run_id, db)
+    artifact_path = ctx.results_dir("gapfill") / f"gapfill_{iter_tag}.jsonl"
+    db.add_artifact(ctx.run_id, "gapfill", None, "jsonl", str(artifact_path))
     try:
         result = await run_agent(
             stage="gapfill",
@@ -67,9 +78,12 @@ async def run_gapfill(ctx: StageContext, db: StateDB,
             max_turns=sc.max_turns,
             permission_mode=sc.permission_mode,
             artifact_dir=ctx.results_dir("gapfill"),
-            artifact_name=f"gapfill_{_iter_tag(ctx.run_id, db)}",
+            artifact_name=f"gapfill_{iter_tag}",
             repair_attempts=sc.repair_attempts,
+            on_attempt=lambda msg: db.record_cost(ctx.run_id, "gapfill", None, msg),
         )
+    except QuotaExhaustedError:
+        raise
     except (AgentRunError, TransientAgentError) as e:
         log.warning("[%s] gapfill failed: %s — skipping iteration", ctx.run_id, e)
         return 0
@@ -83,8 +97,6 @@ async def run_gapfill(ctx: StageContext, db: StateDB,
             continue  # skip duplicate id
         db.add_task(ctx.run_id, t)
         added += 1
-    db.record_cost(ctx.run_id, "gapfill", None, result.raw_result_message)
-    db.add_artifact(ctx.run_id, "gapfill", None, "jsonl", str(result.artifact_path))
     log.info("[%s] gapfill: added %d new tasks", ctx.run_id, added)
     return added
 
@@ -101,14 +113,5 @@ def _infer_subsystem(target_files: list[str], recon: dict) -> str:
 
 
 def _iter_tag(run_id: str, db: StateDB) -> str:
-    # Simple monotonic tag based on existing gapfill artifacts.
-    return f"iter_{int(_artifact_count(db, run_id, 'gapfill')) + 1}"
-
-
-def _artifact_count(db: StateDB, run_id: str, stage: str) -> int:
-    cur = db._conn.execute(  # type: ignore[attr-defined]
-        "SELECT COUNT(*) AS c FROM artifacts WHERE run_id = ? AND stage = ?",
-        (run_id, stage),
-    )
-    row = cur.fetchone()
-    return int(row["c"]) if row else 0
+    # Simple monotonic tag based on reserved gapfill artifact rows.
+    return f"iter_{db.count_artifacts(run_id, 'gapfill') + 1}"

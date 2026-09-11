@@ -18,9 +18,11 @@ import asyncio
 import dataclasses
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 from claude_agent_sdk import (
@@ -78,8 +80,17 @@ _QUOTA_MARKERS = (
     # often hours out, so backoff-retrying is futile — treat it as terminal
     # and let the caller abort into a resumable state.
     "session limit",
+    "weekly limit",
     "your plan has no remaining",
 )
+
+# Subscription limit wording changes ("usage limit reached" vs "your usage
+# limit ·" vs "5-hour limit"); an exact-phrase allowlist needed a new entry
+# for every rewording and one miss cost 136 attempts of backoff on a live
+# run. Match the limit-plus-reset SHAPE instead: "hit your ... limit".
+# "Approaching your usage limit; upgrade for more" is a warning, not a
+# block, and does not match -- keep that case in the sensor.
+_LIMIT_SHAPE_RE = re.compile(r"hit your\b[^.]{0,32}\blimit")
 
 _TRANSIENT_MARKERS = (
     "api error: 529",
@@ -94,10 +105,18 @@ _TRANSIENT_MARKERS = (
 )
 
 
-def _classify_api_error(text: str) -> tuple[str, type[RuntimeError]]:
-    """Return (label, exception_class) for an is_error response."""
+def _classify_api_error(
+    text: str, status: int | None = None
+) -> tuple[str, type[RuntimeError]]:
+    """Return (label, exception_class) for an is_error response.
+
+    Status first: a 429 is a usage limit whatever the prose says (the SDK
+    has exposed api_error_status since CLI v2.1.110). The text fallback
+    matches exact markers and the limit-plus-reset shape."""
+    if status == 429:
+        return "quota_exhausted", QuotaExhaustedError
     t = (text or "").lower()
-    if any(m in t for m in _QUOTA_MARKERS):
+    if any(m in t for m in _QUOTA_MARKERS) or _LIMIT_SHAPE_RE.search(t):
         return "quota_exhausted", QuotaExhaustedError
     if any(m in t for m in _TRANSIENT_MARKERS):
         return "transient", TransientAgentError
@@ -122,6 +141,7 @@ async def run_agent(
     repair_attempts: int = 1,
     transient_retries: int = 3,
     transient_base_delay: float = 30.0,
+    on_attempt: "Callable[[dict], None] | None" = None,
 ) -> AgentResult:
     """Run one agent, retrying transient API errors with exponential backoff.
 
@@ -130,6 +150,15 @@ async def run_agent(
     backoff retries are exhausted. Raises `AgentRunError` if the model
     produced parseable output that doesn't match the schema even after
     repair turns.
+
+    `on_attempt` is invoked ONCE per SDK session with that session's
+    final result-message dict, whether the session succeeded or raised.
+    Each transient retry opens a new session, so the retry loop's calls
+    sum correctly across attempts.
+
+    Do NOT call it per repair turn: ResultMessage.total_cost_usd is a
+    RUNNING SESSION TOTAL, so summing per-turn values recorded
+    1.00 + 1.80 + 2.40 for a session that cost 2.40.
     """
     last_exc: RuntimeError | None = None
     for attempt in range(transient_retries + 1):
@@ -148,6 +177,7 @@ async def run_agent(
                 artifact_dir=artifact_dir,
                 artifact_name=artifact_name,
                 repair_attempts=repair_attempts,
+                on_attempt=on_attempt,
             )
         except QuotaExhaustedError:
             raise
@@ -181,6 +211,7 @@ async def _run_agent_once(
     artifact_dir: Path,
     artifact_name: str,
     repair_attempts: int,
+    on_attempt: Callable[[dict], None] | None = None,
 ) -> AgentResult:
     """Single attempt. Raises TransientAgentError / QuotaExhaustedError
     before schema validation if the API returned is_error=True."""
@@ -239,13 +270,18 @@ async def _run_agent_once(
             # Before schema validation: was this a real model response, or
             # did the CLI surface an API error as the assistant text?
             if last_result_msg.get("is_error"):
-                label, exc_cls = _classify_api_error(last_text)
+                label, exc_cls = _classify_api_error(
+                    last_text, last_result_msg.get("api_error_status"))
                 _write_artifact(art, {"kind": "api_error", "classification": label,
                                       "text": last_text[:1000]})
-                raise exc_cls(
+                e = exc_cls(
                     f"[{stage}/{artifact_name}] {label}: "
                     f"{(last_text or '').strip()[:300]}"
                 )
+                # The attempt still spent API usage; carry the result
+                # message so stages can record it against the run's costs.
+                e.result_msg = last_result_msg
+                raise e
 
             attempts = 0
             errors = _validate(last_text, schema_file)
@@ -258,26 +294,40 @@ async def _run_agent_once(
                 last_text, last_result_msg = await _drain(client, art)
                 # An API error on the repair turn is also retry-worthy.
                 if last_result_msg.get("is_error"):
-                    label, exc_cls = _classify_api_error(last_text)
+                    label, exc_cls = _classify_api_error(
+                        last_text, last_result_msg.get("api_error_status"))
                     _write_artifact(art, {"kind": "api_error_on_repair",
                                           "classification": label,
                                           "text": last_text[:1000]})
-                    raise exc_cls(
+                    e = exc_cls(
                         f"[{stage}/{artifact_name}] {label} on repair turn: "
                         f"{(last_text or '').strip()[:300]}"
                     )
+                    e.result_msg = last_result_msg
+                    raise e
                 errors = _validate(last_text, schema_file)
 
             if errors:
                 _write_artifact(art, {"kind": "schema_errors", "errors": errors})
-                raise AgentRunError(
+                e = AgentRunError(
                     f"[{stage}/{artifact_name}] schema validation failed after "
                     f"{repair_attempts} repair attempts: {errors[:5]}"
                 )
+                e.result_msg = last_result_msg
+                raise e
 
             payload = extract_json(last_text)
             _write_artifact(art, {"kind": "final_payload", "payload": payload})
         finally:
+            # One row per SDK session. total_cost_usd is a running session
+            # total, so recording per repair turn would sum 1.00 + 1.80 +
+            # 2.40 for a session that cost 2.40. Each retry is a new
+            # session, so run_agent's retry loop still accumulates
+            # correctly across attempts. An initialize failure never
+            # drains, so last_result_msg stays empty and nothing is
+            # recorded -- no spend happened.
+            if on_attempt is not None and last_result_msg:
+                on_attempt(last_result_msg)
             await sdk_ctx.__aexit__(None, None, None)
 
     usage = last_result_msg.get("usage") or {}
@@ -392,6 +442,7 @@ def _result_to_dict(msg: ResultMessage) -> dict[str, Any]:
     return {
         "subtype": msg.subtype,
         "is_error": msg.is_error,
+        "api_error_status": getattr(msg, "api_error_status", None),
         "duration_ms": msg.duration_ms,
         "duration_api_ms": msg.duration_api_ms,
         "num_turns": msg.num_turns,

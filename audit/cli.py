@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import logging
 import os
 import sys
@@ -18,12 +19,18 @@ from rich.table import Table
 from audit.auth import AuthError, configure_auth
 
 
+_FALSY_ENV = {"", "0", "false", "no", "off"}
+
+
 def _allow_api_key_from_env_or_flag(flag: bool) -> bool:
     """A user may opt into api_key mode via --allow-api-key OR via
-    AUDIT_ALLOW_API_KEY=1 in the env. Either is sufficient."""
+    AUDIT_ALLOW_API_KEY in the env. Either is sufficient. Env parsing is
+    case-insensitive and treats the usual negatives (no/off/0/false) as
+    opt-out, so `AUDIT_ALLOW_API_KEY=no` never silently enables metered
+    billing."""
     if flag:
         return True
-    return os.environ.get("AUDIT_ALLOW_API_KEY", "").strip() not in ("", "0", "false", "False")
+    return os.environ.get("AUDIT_ALLOW_API_KEY", "").strip().lower() not in _FALSY_ENV
 from audit.config import load_config
 from audit.orchestrator import CostExceeded, run_pipeline
 from audit.state import StateDB
@@ -70,6 +77,11 @@ def auth_check(allow_api_key: bool) -> None:
     if status.auth_mode == "oauth_token":
         console.print("[green]OK[/green] using CLAUDE_CODE_OAUTH_TOKEN")
     elif status.auth_mode == "api_key":
+        if status.gateway_base_url:
+            console.print(
+                f"[green]OK[/green] using ANTHROPIC_API_KEY against "
+                f"{status.gateway_base_url} (metered API billing)"
+            )
         console.print(
             "[green]OK[/green] using ANTHROPIC_API_KEY (metered Anthropic API billing)"
         )
@@ -122,6 +134,14 @@ def auth_check(allow_api_key: bool) -> None:
                    "rules / exclusions; passed verbatim to every stage.")
 @click.option("--config", "config_path", default=None, type=click.Path(),
               help="Override config/stages.yaml.")
+@click.option("--finalize", "finalize", is_flag=True, default=False,
+              help="Skip exploration (no hunt/gapfill/feedback): validate any "
+                   "remaining findings, dedupe, trace, and write the report "
+                   "from current state. Combine with --resume.")
+@click.option("--finalize-cost-usd", "finalize_cost_usd", default=None, type=float,
+              help="Optional flat cap on spend within ONE finalize invocation "
+                   "(per-invocation, not cumulative - a tripped cap leaves the "
+                   "run resumable).")
 @click.option("--allow-api-key", is_flag=True, default=False,
               help="Honor ANTHROPIC_API_KEY for metered Anthropic billing "
                    "(also via AUDIT_ALLOW_API_KEY=1).")
@@ -130,6 +150,8 @@ def run(repo: str, run_id: str | None, resume: bool, max_cost_usd: float | None,
         target_url: str | None, target_creds: tuple[str, ...],
         scope_notes_path: str | None,
         config_path: str | None,
+        finalize: bool,
+        finalize_cost_usd: float | None,
         allow_api_key: bool) -> None:
     """Run the full 8-stage pipeline against a target repo."""
     allow = _allow_api_key_from_env_or_flag(allow_api_key)
@@ -176,11 +198,21 @@ def run(repo: str, run_id: str | None, resume: bool, max_cost_usd: float | None,
             db=db,
             config=config,
             max_cost_usd=max_cost_usd,
+            finalize=finalize,
+            finalize_cost_usd=finalize_cost_usd,
             resume=resume,
             max_recon_tasks=max_recon_tasks,
             live_target=live_target,
             scope_notes=scope_notes,
         ))
+        run_row = db.get_run(run_id)
+        if run_row is not None and run_row["status"] == "partial":
+            console.print(
+                f"[yellow]partial[/yellow] run_id={run_id} report={report} — "
+                "closed with gaps (untraced canonicals or fallback report); "
+                "--resume re-attempts the missing pieces"
+            )
+            sys.exit(4)
         console.print(f"[green]done[/green] run_id={run_id} report={report}")
     except CostExceeded as e:
         console.print(f"[yellow]aborted[/yellow] {e}")
@@ -263,6 +295,60 @@ def _show_run_detail(db: StateDB, run_id: str) -> None:
     t.add_row("total cost ($)", f"{db.total_cost(run_id):.4f}")
     console.print(t)
 
+    per_stage = Table(title="tasks by stage", show_lines=False)
+    per_stage.add_column("stage")
+    for col in ("pending", "running", "done", "failed"):
+        per_stage.add_column(col)
+    by_stage: dict[str, dict[str, int]] = {}
+    for x in tasks:
+        row = by_stage.setdefault(x.source, {"pending": 0, "running": 0, "done": 0, "failed": 0})
+        if x.status in row:
+            row[x.status] += 1
+    for stage in sorted(by_stage):
+        row = by_stage[stage]
+        per_stage.add_row(stage, *(str(row[c]) for c in ("pending", "running", "done", "failed")))
+    console.print(per_stage)
+
+    costs = Table(title="cost by stage ($)", show_lines=False)
+    costs.add_column("stage"); costs.add_column("usd")
+    for row in db.stage_costs(run_id):
+        costs.add_row(row["stage"], f"{row['usd'] or 0:.4f}")
+    console.print(costs)
+
+    unvalidated = len(db.get_unvalidated_findings(run_id))
+    untraced = len(canonical) - len(reachable)
+    remaining = Table(title="finalize remaining", show_lines=False)
+    remaining.add_column("work"); remaining.add_column("count")
+    remaining.add_row("findings to validate", str(max(0, len(findings) - len(
+        [f for f in findings if f.validation_status is not None]))))
+    remaining.add_row("canonicals to trace", str(max(0, len(canonical) - len(reachable))))
+    console.print(remaining)
+    if unvalidated:
+        console.print(f"[yellow]{unvalidated} finding(s) never validated — "
+                      "run the pipeline (or --resume --finalize) to grade them[/yellow]")
+
+
+def _md_inline(s: str) -> str:
+    r"""Escape markdown control characters for interpolation into a line.
+
+    Taint is per-report, not per-field: finding fields come from a model
+    reading attacker-influenced target code, so a field added later must be
+    safe by default. Code fences still use _code_fence."""
+    return re.sub(r"([\\`*_{}\[\]()#+\-.!|<>])", r"\\\1", str(s))
+
+
+def _code_fence(content: str) -> str:
+    """A backtick fence long enough to survive any run of backticks inside
+    `content`: target-influenced evidence that contains ``` must not be
+    able to close the code block early and inject markdown into the
+    rendered report."""
+    longest = 0
+    run = 0
+    for ch in content:
+        run = run + 1 if ch == "`" else 0
+        longest = max(longest, run)
+    return "`" * max(3, longest + 1)
+
 
 def _render_markdown_report(report: dict) -> str:
     lines: list[str] = []
@@ -275,34 +361,38 @@ def _render_markdown_report(report: dict) -> str:
                  else f"**Total findings: {s['total']}**")
     lines.append("")
     for f in report["findings"]:
-        lines.append(f"## {f['title']}")
-        lines.append(f"- **Severity**: {f['severity']}  ")
-        lines.append(f"- **Class**: {f['vuln_class']}"
+        lines.append(f"## {_md_inline(f['title'])}")
+        lines.append(f"- **Severity**: {_md_inline(f['severity'])}  ")
+        lines.append(f"- **Class**: {_md_inline(f['vuln_class'])}"
                      + (f" ({f['cwe']})" if f.get("cwe") else ""))
-        lines.append(f"- **Location**: `{f['file']}:{f['line_start']}-{f['line_end']}`  ")
+        lines.append(f"- **Location**: `{_md_inline(f['file'])}:{f['line_start']}-{f['line_end']}`  ")
         lines.append("")
-        lines.append(f["description"])
+        # description is prose from the target-influenced model output:
+        # escaped like every other inline field, so headings, images and
+        # links cannot inject structure into the rendered document
+        lines.append(_md_inline(f["description"]))
         lines.append("")
-        lines.append("```")
+        fence = _code_fence(f["evidence"])
+        lines.append(fence)
         lines.append(f["evidence"])
-        lines.append("```")
+        lines.append(fence)
         lines.append("")
         ep = f["trace"].get("entry_points", [])
         if ep:
             lines.append("**Entry points**:")
             for e in ep:
-                lines.append(f"- `{e['kind']}` at `{e['location']}`")
+                lines.append(f"- `{_md_inline(e['kind'])}` at `{_md_inline(e['location'])}`")
             lines.append("")
         cc = f["trace"].get("call_chain", [])
         if cc:
             lines.append("**Call chain**:")
             for frame in cc:
-                lines.append(f"1. `{frame['file']}:{frame['line']}` — `{frame['function']}()`")
+                lines.append(f"1. `{_md_inline(frame['file'])}:{frame['line']}` — `{_md_inline(frame['function'])}()`")
             lines.append("")
-        lines.append(f"**Recommendation**: {f['recommendation']}")
+        lines.append(f"**Recommendation**: {_md_inline(f['recommendation'])}")
         lines.append("")
         if f.get("variants"):
-            lines.append(f"_Variants_: {', '.join(f['variants'])}")
+            lines.append(f"_Variants_: {', '.join(_md_inline(v) for v in f['variants'])}")
             lines.append("")
         lines.append("---")
         lines.append("")

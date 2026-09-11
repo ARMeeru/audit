@@ -5,11 +5,13 @@ orchestration, resume, and reporting."""
 from __future__ import annotations
 
 import json
+import logging
+import re
 import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -30,7 +32,7 @@ CREATE TABLE IF NOT EXISTS recon_outputs (
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
-    task_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
     run_id TEXT NOT NULL,
     source TEXT NOT NULL,
     attack_class TEXT NOT NULL,
@@ -38,15 +40,17 @@ CREATE TABLE IF NOT EXISTS tasks (
     target_files TEXT NOT NULL,
     rationale TEXT,
     priority INTEGER NOT NULL DEFAULT 3,
+    attempts INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'pending',
     raw_json TEXT NOT NULL,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
-    FOREIGN KEY (run_id) REFERENCES runs(run_id)
+    FOREIGN KEY (run_id) REFERENCES runs(run_id),
+    PRIMARY KEY (run_id, task_id)
 );
 
 CREATE TABLE IF NOT EXISTS findings (
-    finding_id TEXT PRIMARY KEY,
+    finding_id TEXT NOT NULL,
     task_id TEXT NOT NULL,
     run_id TEXT NOT NULL,
     file TEXT NOT NULL,
@@ -63,24 +67,27 @@ CREATE TABLE IF NOT EXISTS findings (
     validation_json TEXT,
     group_id TEXT,
     is_canonical INTEGER DEFAULT 0,
-    FOREIGN KEY (task_id) REFERENCES tasks(task_id)
+    PRIMARY KEY (run_id, finding_id),
+    FOREIGN KEY (run_id, task_id) REFERENCES tasks(run_id, task_id)
 );
 
 CREATE TABLE IF NOT EXISTS traces (
-    finding_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    finding_id TEXT NOT NULL,
     reachable INTEGER NOT NULL,
     confidence REAL,
     rationale TEXT,
     raw_json TEXT NOT NULL,
-    FOREIGN KEY (finding_id) REFERENCES findings(finding_id)
+    PRIMARY KEY (run_id, finding_id)
 );
 
 CREATE TABLE IF NOT EXISTS dedupe_groups (
-    group_id TEXT PRIMARY KEY,
+    group_id TEXT NOT NULL,
     run_id TEXT NOT NULL,
     root_cause TEXT NOT NULL,
     canonical_finding_id TEXT NOT NULL,
     raw_json TEXT NOT NULL,
+    PRIMARY KEY (run_id, group_id),
     FOREIGN KEY (run_id) REFERENCES runs(run_id)
 );
 
@@ -129,6 +136,7 @@ class Task:
     priority: int
     status: str
     raw_json: dict
+    attempts: int = 0
 
 
 @dataclass
@@ -151,15 +159,255 @@ class Finding:
     group_id: str | None
     is_canonical: bool
 
+log = logging.getLogger(__name__)
+
+
+class UpgradePendingError(RuntimeError):
+    """The database could not be migrated yet (another process held it).
+    `audit status` works; a run does not, because the run paths need the
+    upgraded schema."""
+
 
 class StateDB:
+    MIGRATION_VERSION = 3
+
     def __init__(self, db_path: Path):
         self.path = db_path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.path))
         self._conn.row_factory = sqlite3.Row
-        self._conn.executescript(SCHEMA)
-        self._conn.commit()
+        # Set when the migration could not run because another process held
+        # the database. The object is usable for reads; run paths check this
+        # and refuse with a named error instead of failing later with
+        # "no such column: attempts" after a paid recon.
+        self.upgrade_pending = False
+        # WAL: readers (`audit status` during a run) no longer trip the
+        # writer's lock, and a crash between checkpoint and commit is
+        # recovered from the WAL instead of corrupting the write.
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError:
+            # Switching an existing rollback-journal file to WAL needs an
+            # exclusive lock, and another `audit` process holding a read
+            # blocks it. Failing HERE would skip _migrate entirely -- a v2
+            # database would stay unrepaired (missing indexes, invalid FK)
+            # behind an error naming nothing actionable. Degrade: the
+            # migration below is transactional under the rollback journal
+            # too; the WAL switch retires on a quieter re-open.
+            log.warning(
+                "could not switch %s to WAL (another audit process may "
+                "hold it); close other audit processes and re-open to "
+                "finish upgrading", self.path,
+            )
+        try:
+            self._create_schema()
+            self._migrate()
+            self._conn.commit()
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e):
+                raise
+            # A reader holding a transaction (an `audit status` sitting
+            # open) blocks the migration's final EXCLUSIVE lock on a
+            # rollback-journal database. Leave the upgrade pending rather
+            # than crashing the open: the database is usable unmigrated,
+            # and the NEXT open without readers completes the upgrade.
+            self._conn.rollback()
+            self.upgrade_pending = True
+            log.warning(
+                "could not upgrade %s yet (another audit process holds it); "
+                "`audit status` works, but a run needs the upgrade -- close "
+                "other audit processes and re-open", self.path,
+            )
+
+    def _create_schema(self) -> None:
+        # executescript() would COMMIT any open transaction, so the schema
+        # runs statement-by-statement and migrations stay atomic.
+        for stmt in SCHEMA.split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                self._conn.execute(stmt)
+
+    def _migrate(self) -> None:
+        version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+        if version >= self.MIGRATION_VERSION:
+            return
+        # Any index NOT declared in SCHEMA (a hand-added performance index
+        # on a real operator's database) is destroyed by the rename+rebuild
+        # migrations -- v1's hardcoded drop list, v2's index loss, and
+        # _rebuild's lookup drop all remove it. Capture up front; replay
+        # whatever the migrations did not recreate.
+        schema_index_names = set(re.findall(
+            r"CREATE INDEX IF NOT EXISTS (\w+)", SCHEMA))
+        preserved = [
+            (row["name"], row["sql"]) for row in self._conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'index' "
+                "AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+            if row["name"] not in schema_index_names and row["sql"]
+        ]
+
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._migrate_v1()
+            self._migrate_v2()
+            self._migrate_v3()
+            # Reconcile indexes: v2 shipped without the pre-rename drop and
+            # destroyed four of five on every database it touched. CREATE
+            # INDEX IF NOT EXISTS is a no-op for those still present.
+            self._create_schema()
+            # Replay by ABSENCE, never by rewriting the DDL. Two ways the
+            # rewrite bricked the upgrade: "CREATE INDEX" is not a substring
+            # of CREATE UNIQUE INDEX so the rewrite silently missed, and an
+            # index on a table no migration rebuilds (costs, runs, artifacts,
+            # recon_outputs) is captured but never dropped -- so its name was
+            # still live at replay time and the verbatim statement collided.
+            # The rollback left user_version at 0 with the cause stable, so
+            # every subsequent open failed identically: the database could
+            # never be upgraded.
+            live = {r["name"] for r in self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'").fetchall()}
+            for name, sql in preserved:
+                if name not in live:
+                    self._conn.execute(sql)
+            self._conn.execute(f"PRAGMA user_version = {self.MIGRATION_VERSION}")
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def _migrate_v1(self) -> None:
+        """v0 -> v1: run-scoped identity keys, tasks.attempts column.
+
+        finding_id and group_id were globally unique keys while their values
+        are model-emitted and only unique per run, so two runs sharing this
+        db silently dropped each other's rows. Columns are mapped by name;
+        legacy traces had no run_id column, so theirs is derived by joining
+        findings (migrated first, whose legacy rows carry it)."""
+        legacy = (
+            ("findings", "PRIMARY KEY (run_id, finding_id)", None),
+            ("traces", "PRIMARY KEY (run_id, finding_id)",
+             # legacy traces lack run_id: derive it from findings, whose
+             # legacy rows are migrated first and hold globally-unique ids
+             "SELECT f.run_id AS run_id, t.finding_id AS finding_id, "
+             "t.reachable AS reachable, t.confidence AS confidence, "
+             "t.rationale AS rationale, t.raw_json AS raw_json "
+             "FROM {table}_legacy t JOIN findings f ON f.finding_id = t.finding_id"),
+            ("dedupe_groups", "PRIMARY KEY (run_id, group_id)", None),
+        )
+        indexes = {
+            "findings": ("idx_findings_run", "idx_findings_validation", "idx_findings_group"),
+        }
+        for table, marker, custom_select in legacy:
+            row = self._conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            ).fetchone()
+            if row is None or marker in row["sql"]:
+                continue
+            for idx in indexes.get(table, ()):
+                self._conn.execute(f"DROP INDEX IF EXISTS {idx}")
+            self._conn.execute(f"ALTER TABLE {table} RENAME TO {table}_legacy")
+            self._create_schema()
+            new_cols = [r["name"] for r in self._conn.execute(f"PRAGMA table_info({table})").fetchall()]
+            if custom_select:
+                self._conn.execute(
+                    f"INSERT INTO {table} ({', '.join(new_cols)}) "
+                    f"{custom_select.format(table=table)}"
+                )
+            else:
+                legacy_cols = [
+                    r["name"] for r in self._conn.execute(f"PRAGMA table_info({table}_legacy)").fetchall()
+                ]
+                self._conn.execute(
+                    f"INSERT OR IGNORE INTO {table} ({', '.join(new_cols)}) "
+                    f"SELECT {', '.join(legacy_cols)} FROM {table}_legacy"
+                )
+            self._conn.execute(f"DROP TABLE {table}_legacy")
+        task_cols = [r["name"] for r in self._conn.execute("PRAGMA table_info(tasks)").fetchall()]
+        if "attempts" not in task_cols:
+            self._conn.execute("ALTER TABLE tasks ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+
+    def _rebuild(self, tables: tuple[str, ...]) -> None:
+        """Rename -> recreate from SCHEMA -> copy by name -> drop, inside
+        the caller's transaction.
+
+        Indexes are dropped FIRST and by lookup, not from a hardcoded list:
+        an index follows its table on rename and keeps its name, so
+        CREATE INDEX IF NOT EXISTS silently no-ops and DROP TABLE takes the
+        index with it. v2 lost four of five indexes exactly this way."""
+        for table in tables:
+            for row in self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' "
+                "AND tbl_name = ? AND name NOT LIKE 'sqlite_%'", (table,)
+            ).fetchall():
+                # An index follows its table on rename, so CREATE INDEX IF
+                # NOT EXISTS would no-op against the old name -- drop by
+                # lookup so SCHEMA's indexes can be recreated. Non-SCHEMA
+                # indexes are preserved and replayed at the _migrate level.
+                self._conn.execute(f"DROP INDEX IF EXISTS {row['name']}")
+        for table in tables:
+            self._conn.execute(f"ALTER TABLE {table} RENAME TO {table}_legacy")
+        self._create_schema()
+        for table in tables:
+            new_cols = [r["name"] for r in self._conn.execute(
+                f"PRAGMA table_info({table})").fetchall()]
+            legacy_cols = [r["name"] for r in self._conn.execute(
+                f"PRAGMA table_info({table}_legacy)").fetchall()]
+            # map by name; new-only columns (e.g. tasks.attempts) take
+            # their SCHEMA defaults
+            shared = [c for c in new_cols if c in legacy_cols]
+            before = self._conn.execute(
+                f"SELECT COUNT(*) FROM {table}_legacy").fetchone()[0]
+            self._conn.execute(
+                f"INSERT INTO {table} ({', '.join(shared)}) "
+                f"SELECT {', '.join(shared)} FROM {table}_legacy"
+            )
+            after = self._conn.execute(
+                f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            if after != before:
+                log.warning("migration: %s carried %d of %d rows",
+                            table, after, before)
+            self._conn.execute(f"DROP TABLE {table}_legacy")
+
+    def _migrate_v2(self) -> None:
+        """v1 -> v2: tasks joined the run-scoped key family.
+
+        task_id stayed a global PRIMARY KEY in v1 while its values are
+        model-emitted and only unique per run — exactly the argument v1's
+        docstring makes for findings — so two runs sharing this database
+        dropped each other's tasks (INSERT OR IGNORE), and update_task_status
+        hit whichever run's row came first.
+
+        FK hazard (verified against a real database): renaming tasks to
+        tasks_legacy rewrites findings' FOREIGN KEY to reference
+        tasks_legacy, and DROP leaves it dangling there permanently. v1 got
+        away with the same pattern only because traces — the FK holder it
+        renamed — was itself rebuilt in the same transaction. v2 renames and
+        rebuilds all three tables in one transaction, so no dangling
+        reference ever survives. Runs after v1, so traces carry run_id."""
+        row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'"
+        ).fetchone()
+        if row is None or "PRIMARY KEY (run_id, task_id)" in row["sql"]:
+            return
+        self._rebuild(("tasks", "findings", "traces"))
+
+    def _migrate_v3(self) -> None:
+        """v2 -> v3: findings' FK matches tasks' composite primary key.
+
+        v2 gave tasks PRIMARY KEY (run_id, task_id) but left findings
+        declaring FOREIGN KEY (task_id) REFERENCES tasks(task_id). A
+        single-column FK needs a unique parent index, so SQLite rejects it
+        as a foreign key mismatch: PRAGMA foreign_key_check errors and,
+        with foreign_keys=ON, every finding insert fails. Rebuilding
+        findings alone is safe -- the FK is its own, so no other table's
+        SQL is rewritten."""
+        row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'findings'"
+        ).fetchone()
+        if row is None or "REFERENCES tasks(run_id, task_id)" in row["sql"]:
+            return
+        self._rebuild(("findings",))
 
     # ---------- runs ----------
 
@@ -231,10 +479,12 @@ class StateDB:
         )
         self._conn.commit()
 
-    def get_pending_tasks(self, run_id: str) -> list[Task]:
+    def get_pending_tasks(self, run_id: str, max_attempts: int = 3) -> list[Task]:
+        self._require_upgraded()
         rows = self._conn.execute(
-            "SELECT * FROM tasks WHERE run_id = ? AND status = 'pending' ORDER BY priority, created_at",
-            (run_id,),
+            "SELECT * FROM tasks WHERE run_id = ? AND status = 'pending' "
+            "AND attempts < ? ORDER BY priority, created_at",
+            (run_id, max_attempts),
         ).fetchall()
         return [self._row_to_task(r) for r in rows]
 
@@ -245,25 +495,148 @@ class StateDB:
         ).fetchall()
         return [self._row_to_task(r) for r in rows]
 
-    def update_task_status(self, task_id: str, status: str) -> None:
+    def update_task_status(self, run_id: str, task_id: str, status: str) -> None:
         self._conn.execute(
-            "UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?",
-            (status, time.time(), task_id),
+            "UPDATE tasks SET status = ?, updated_at = ? WHERE run_id = ? AND task_id = ?",
+            (status, time.time(), run_id, task_id),
         )
         self._conn.commit()
 
-    def reset_incomplete_tasks(self, run_id: str) -> int:
-        """Flip 'running' and 'failed' tasks back to 'pending' so a resumed
-        run re-attempts work that was interrupted (quota/crash, left
-        'running') or that failed on a transient/quota error (marked
-        'failed'). Returns the number of tasks reset."""
-        cur = self._conn.execute(
-            "UPDATE tasks SET status = 'pending', updated_at = ? "
-            "WHERE run_id = ? AND status IN ('running', 'failed')",
-            (time.time(), run_id),
+    def begin_task(self, run_id: str, task_id: str) -> None:
+        """Flip a task to 'running' and spend one attempt, atomically.
+
+        The attempts counter belongs at the point the attempt is spent
+        (dispatch), not where the task is re-queued: a crash leaves status
+        'running' without passing through any handler, and hunt's quota
+        path writes 'pending' directly — neither increments a requeue-side
+        counter, so a deterministically hanging task re-burned full spend
+        on every resume."""
+        self._require_upgraded()
+        self._conn.execute(
+            "UPDATE tasks SET status = 'running', attempts = attempts + 1, "
+            "updated_at = ? WHERE run_id = ? AND task_id = ?",
+            (time.time(), run_id, task_id),
         )
         self._conn.commit()
-        return cur.rowcount
+
+    def complete_task(self, run_id: str, task_id: str, findings: list[dict]) -> int:
+        """Persist a hunt task's findings and flip it to done in one
+        transaction, resetting the attempt strike. A crash between the
+        finding writes and the status flip used to leave the task 'running';
+        the resume re-dispatch then re-inserted every finding (the findings
+        and the done flip are now indivisible). Same-task replays no-op.
+        Returns the number of NEW findings inserted."""
+        self._require_upgraded()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Resolve the WHOLE payload's ids before inserting anything, so
+            # a repeat within the payload suffixes off the planned fid and
+            # a replay of the same payload resolves to the same (already
+            # stored) rows and no-ops.
+            seen: set[str] = set()
+            taken: set[str] = set()
+            planned: list[tuple[str, dict, bool]] = []
+            for finding in findings:
+                base = finding["finding_id"]
+                fid, insert = self._resolve_finding_id(
+                    run_id, task_id, base, replay_ok=base not in seen,
+                    taken=taken)
+                seen.add(base)
+                taken.add(fid)
+                planned.append((fid, finding, insert))
+
+            inserted = 0
+            for fid, finding, insert in planned:
+                if not insert:
+                    continue
+                if fid != finding["finding_id"]:
+                    finding = dict(finding, finding_id=fid)
+                self._conn.execute(
+                    """INSERT INTO findings
+                    (finding_id, task_id, run_id, file, line_start, line_end,
+                     vuln_class, severity, description, evidence, poc_succeeded,
+                     confidence, raw_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        fid, task_id, run_id,
+                        finding["file"], finding["line_start"], finding["line_end"],
+                        finding["vuln_class"], finding["severity"],
+                        finding["description"], finding["evidence_snippet"],
+                        1 if (finding.get("poc") or {}).get("succeeded") else 0,
+                        finding.get("confidence"),
+                        json.dumps(finding),
+                    ),
+                )
+                inserted += 1
+            self._conn.execute(
+                "UPDATE tasks SET status = 'done', attempts = 0, updated_at = ? "
+                "WHERE run_id = ? AND task_id = ?",
+                (time.time(), run_id, task_id),
+            )
+            self._conn.commit()
+            return inserted
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def release_task(self, run_id: str, task_id: str) -> None:
+        """Return a task to 'pending' WITHOUT keeping the attempt charge: a
+        quota abort is the pipeline stopping, not the task failing. Three
+        quota-killed resumes must not abandon a task that never genuinely
+        failed."""
+        self._conn.execute(
+            "UPDATE tasks SET status = 'pending', "
+            "attempts = MAX(0, attempts - 1), updated_at = ? "
+            "WHERE run_id = ? AND task_id = ?",
+            (time.time(), run_id, task_id),
+        )
+        self._conn.commit()
+
+    def _require_upgraded(self) -> None:
+        if self.upgrade_pending:
+            raise UpgradePendingError(
+                f"{self.path} still needs its schema upgrade; another audit "
+                "process held it at open. Close other audit processes and "
+                "re-open. (`audit status` works meanwhile.)"
+            )
+
+    def count_abandoned_tasks(self, run_id: str) -> int:
+        """Failed tasks past the requeue ceiling — work silently given up
+        on. surfaced so an operator can see the abandonment, not just the
+        green completion."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM tasks WHERE run_id = ? AND status = 'failed' "
+            "AND attempts >= 3",
+            (run_id,),
+        ).fetchone()
+        return int(row["c"]) if row else 0
+
+    def reset_incomplete_tasks(self, run_id: str, max_requeues: int = 3) -> int:
+        """Re-queue interrupted and failed tasks so a resumed run re-attempts
+        them. 'running' tasks (quota/crash interrupts — not the task's fault)
+        are always re-queued. 'failed' tasks are re-queued only under a retry
+        ceiling: each re-queue increments attempts, and a task that has been
+        re-queued max_requeues times stays failed, so a deterministically
+        failing task stops re-burning spend on every resume. Returns the
+        number of tasks reset."""
+        self._require_upgraded()
+        now = time.time()
+        cur_run = self._conn.execute(
+            "UPDATE tasks SET status = 'pending', updated_at = ? "
+            "WHERE run_id = ? AND status = 'running'",
+            (now, run_id),
+        )
+        cur_fail = self._conn.execute(
+            # No increment here: begin_task spends the attempt at dispatch,
+            # and get_pending_tasks filters on the ceiling. Incrementing in
+            # both places charged two attempts per failure cycle, so a task
+            # got 2 dispatches under a ceiling of 3.
+            "UPDATE tasks SET status = 'pending', updated_at = ? "
+            "WHERE run_id = ? AND status = 'failed' AND attempts < ?",
+            (now, run_id, max_requeues),
+        )
+        self._conn.commit()
+        return cur_run.rowcount + cur_fail.rowcount
 
     @staticmethod
     def _row_to_task(r: sqlite3.Row) -> Task:
@@ -278,20 +651,68 @@ class StateDB:
             priority=r["priority"],
             status=r["status"],
             raw_json=json.loads(r["raw_json"]),
+            attempts=r["attempts"] if "attempts" in r.keys() else 0,
         )
 
     # ---------- findings ----------
 
-    def add_finding(self, run_id: str, task_id: str, finding: dict) -> None:
+    def _resolve_finding_id(
+        self, run_id: str, task_id: str, base: str, replay_ok: bool = True,
+        taken: set[str] | None = None,
+    ) -> tuple[str, bool]:
+        """Resolve a model-emitted finding id for (run_id, task_id).
+
+        Returns (finding_id, insert_needed). A row already held by the SAME
+        task means this is a replay of an interrupted dispatch (crash
+        between the finding writes and the done flip): no insert -- unless
+        replay_ok is False, which complete_task passes for a base id it has
+        already handled within THIS payload (two different findings sharing
+        an id in one payload are a collision, not a replay; treating them
+        as a replay silently dropped the second finding). The same id from
+        a DIFFERENT task is a genuine model-emitted collision and gets a
+        suffix — model ids are only unique per task by prompt convention."""
+        taken = taken or set()
+        existing = self._conn.execute(
+            "SELECT task_id FROM findings WHERE run_id = ? AND finding_id = ?",
+            (run_id, base),
+        ).fetchone()
+        if replay_ok and existing is not None and existing["task_id"] == task_id:
+            return base, False
+        fid = base
+        n = 1
+        while True:
+            row = self._conn.execute(
+                "SELECT task_id FROM findings WHERE run_id = ? AND finding_id = ?",
+                (run_id, fid),
+            ).fetchone()
+            if row is None and fid not in taken:
+                return fid, True
+            if row is not None and row["task_id"] == task_id and fid not in taken:
+                # our own row: a replay of this very payload item
+                return fid, False
+            # taken fids are planned earlier in this same payload; rows
+            # owned by other tasks are genuine collisions -- both force
+            # the next suffix
+            n += 1
+            fid = f"{base}_{n}"
+
+    def add_finding(self, run_id: str, task_id: str, finding: dict) -> str:
+        """Insert one finding. Returns the (possibly suffixed) finding_id."""
         poc = finding.get("poc") or {}
+        fid, insert = self._resolve_finding_id(run_id, task_id,
+                                               finding["finding_id"])
+        if not insert:
+            return fid
+        if fid != finding["finding_id"]:
+            finding = dict(finding, finding_id=fid)
         self._conn.execute(
-            """INSERT OR IGNORE INTO findings
+            """INSERT INTO findings
             (finding_id, task_id, run_id, file, line_start, line_end,
              vuln_class, severity, description, evidence, poc_succeeded,
              confidence, raw_json)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                finding["finding_id"],
+                fid,
                 task_id,
                 run_id,
                 finding["file"],
@@ -327,19 +748,21 @@ class StateDB:
         ).fetchall()
         return [self._row_to_finding(r) for r in rows]
 
-    def set_finding_validation(self, finding_id: str, status: str, payload: dict) -> None:
+    def set_finding_validation(self, run_id: str, finding_id: str, status: str, payload: dict) -> None:
         self._conn.execute(
-            "UPDATE findings SET validation_status = ?, validation_json = ? WHERE finding_id = ?",
-            (status, json.dumps(payload), finding_id),
+            "UPDATE findings SET validation_status = ?, validation_json = ? "
+            "WHERE run_id = ? AND finding_id = ?",
+            (status, json.dumps(payload), run_id, finding_id),
         )
         self._conn.commit()
 
     def assign_finding_group(
-        self, finding_id: str, group_id: str, is_canonical: bool
+        self, run_id: str, finding_id: str, group_id: str, is_canonical: bool
     ) -> None:
         self._conn.execute(
-            "UPDATE findings SET group_id = ?, is_canonical = ? WHERE finding_id = ?",
-            (group_id, 1 if is_canonical else 0, finding_id),
+            "UPDATE findings SET group_id = ?, is_canonical = ? "
+            "WHERE run_id = ? AND finding_id = ?",
+            (group_id, 1 if is_canonical else 0, run_id, finding_id),
         )
         self._conn.commit()
 
@@ -367,12 +790,13 @@ class StateDB:
 
     # ---------- traces ----------
 
-    def add_trace(self, finding_id: str, payload: dict) -> None:
+    def add_trace(self, run_id: str, finding_id: str, payload: dict) -> None:
         self._conn.execute(
             """INSERT OR REPLACE INTO traces
-            (finding_id, reachable, confidence, rationale, raw_json)
-            VALUES (?, ?, ?, ?, ?)""",
+            (run_id, finding_id, reachable, confidence, rationale, raw_json)
+            VALUES (?, ?, ?, ?, ?, ?)""",
             (
+                run_id,
                 finding_id,
                 1 if payload.get("reachable") else 0,
                 payload.get("confidence"),
@@ -382,21 +806,105 @@ class StateDB:
         )
         self._conn.commit()
 
-    def get_trace(self, finding_id: str) -> dict | None:
+    def get_trace(self, run_id: str, finding_id: str) -> dict | None:
         row = self._conn.execute(
-            "SELECT raw_json FROM traces WHERE finding_id = ?", (finding_id,)
+            "SELECT raw_json FROM traces WHERE run_id = ? AND finding_id = ?",
+            (run_id, finding_id),
         ).fetchone()
         return json.loads(row["raw_json"]) if row else None
 
     def get_reachable_canonical_findings(self, run_id: str) -> list[tuple[Finding, dict]]:
         out: list[tuple[Finding, dict]] = []
         for f in self.get_findings(run_id, validation_status="confirmed", canonical_only=True):
-            tr = self.get_trace(f.finding_id)
+            tr = self.get_trace(run_id, f.finding_id)
             if tr and tr.get("reachable"):
                 out.append((f, tr))
         return out
 
     # ---------- dedupe ----------
+
+    def clear_finding_groups(self, run_id: str) -> None:
+        """Drop all group assignments for a run before re-applying a fresh
+        dedupe pass. Without this, a finding demoted between passes keeps
+        is_canonical=1 and inflates the reported set."""
+        self._conn.execute(
+            "UPDATE findings SET group_id = NULL, is_canonical = 0 WHERE run_id = ?",
+            (run_id,),
+        )
+        self._conn.execute("DELETE FROM dedupe_groups WHERE run_id = ?", (run_id,))
+        self._conn.commit()
+
+    def latest_artifact_path(self, run_id: str, stage: str, kind: str) -> str | None:
+        """Path of the most recent artifact row matching (stage, kind), or
+        None. Used for content markers like the dedupe confirmed-set hash."""
+        row = self._conn.execute(
+            "SELECT path FROM artifacts WHERE run_id = ? AND stage = ? AND kind = ? "
+            "ORDER BY artifact_id DESC LIMIT 1",
+            (run_id, stage, kind),
+        ).fetchone()
+        return row["path"] if row else None
+
+    def untraced_canonical_ids(self, run_id: str) -> list[str]:
+        """Confirmed canonical findings with no trace row. Trace failures
+        are retryable (no verdict persisted), so "every canonical has a
+        trace" is no longer an invariant — the report must say which
+        canonicals it could not assess instead of silently omitting them."""
+        rows = self._conn.execute(
+            """SELECT f.finding_id FROM findings f
+            WHERE f.run_id = ? AND f.validation_status = 'confirmed'
+              AND f.is_canonical = 1
+              AND NOT EXISTS (SELECT 1 FROM traces t
+                              WHERE t.run_id = f.run_id AND t.finding_id = f.finding_id)""",
+            (run_id,),
+        ).fetchall()
+        return [r["finding_id"] for r in rows]
+
+    def count_dedupe_groups(self, run_id: str) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM dedupe_groups WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        return int(row["c"]) if row else 0
+
+    def apply_dedupe_groups(
+        self, run_id: str, prepared: list[tuple[dict, list[str], str]]
+    ) -> int:
+        """Atomically replace the run's grouping: clear stale assignments,
+        insert the new groups, assign members. One transaction, so a crash
+        mid-apply cannot leave a run with no canonicals, and a finding the
+        second pass omits cannot keep is_canonical=1 (the stale-canonical
+        defect). Each tuple is (group_dict, validated_member_ids, canonical_id).
+        Returns the number of groups applied."""
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                "UPDATE findings SET group_id = NULL, is_canonical = 0 WHERE run_id = ?",
+                (run_id,),
+            )
+            self._conn.execute("DELETE FROM dedupe_groups WHERE run_id = ?", (run_id,))
+            for group, member_ids, canonical in prepared:
+                self._conn.execute(
+                    """INSERT OR REPLACE INTO dedupe_groups
+                    (group_id, run_id, root_cause, canonical_finding_id, raw_json)
+                    VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        group["group_id"],
+                        run_id,
+                        group["root_cause"],
+                        canonical,
+                        json.dumps(group),
+                    ),
+                )
+                for fid in member_ids:
+                    self._conn.execute(
+                        "UPDATE findings SET group_id = ?, is_canonical = ? "
+                        "WHERE run_id = ? AND finding_id = ?",
+                        (group["group_id"], 1 if fid == canonical else 0, run_id, fid),
+                    )
+            self._conn.commit()
+            return len(prepared)
+        except Exception:
+            self._conn.rollback()
+            raise
 
     def add_dedupe_group(self, run_id: str, group: dict) -> None:
         self._conn.execute(
@@ -452,6 +960,30 @@ class StateDB:
         return float(row["total"]) if row else 0.0
 
     # ---------- artifacts ----------
+
+    def count_artifacts(self, run_id: str, stage: str) -> int:
+        """Agent invocations already consumed for a stage. The artifacts table
+        is the source of truth for expansion-loop bounds: derived counts cannot
+        desync from the work the way persisted counters can."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM artifacts WHERE run_id = ? AND stage = ?",
+            (run_id, stage),
+        ).fetchone()
+        return int(row["c"]) if row else 0
+
+    def stage_summary(self, run_id: str) -> list[sqlite3.Row]:
+        return list(self._conn.execute(
+            "SELECT stage, status, COUNT(*) AS c FROM tasks WHERE run_id = ? "
+            "GROUP BY stage, status ORDER BY stage",
+            (run_id,),
+        ).fetchall())
+
+    def stage_costs(self, run_id: str) -> list[sqlite3.Row]:
+        return list(self._conn.execute(
+            "SELECT stage, SUM(usd) AS usd FROM costs WHERE run_id = ? "
+            "GROUP BY stage ORDER BY stage",
+            (run_id,),
+        ).fetchall())
 
     def add_artifact(
         self, run_id: str, stage: str, ref_id: str | None, kind: str, path: str

@@ -59,6 +59,7 @@ class StageContext:
         return d
 
 
+
 def truncated_recon_summary(full: dict, subsystem_filter: str | None = None) -> dict:
     """Pass only the architecture facts downstream agents need."""
     out: dict = {
