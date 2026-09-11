@@ -33,7 +33,15 @@ def install_run_agent(monkeypatch: pytest.MonkeyPatch, mod, stub):
     silently exercises only the error path while staying green (both cost
     sensors shipped that way). Sync stubs are therefore wrapped in an
     async shim so they work as intended; a warning marks them so the
-    author can convert to `async def`."""
+    author can convert to `async def`.
+
+    Ordering note for stubs that call `on_attempt`: record the cost AFTER
+    awaiting something, the way a real agent does (its cost lands when the
+    API round-trip returns). Recording it before the first yield grows
+    committed spend during dispatch, which trips a cap with or without the
+    reservation being tested -- the sensor then passes against the very
+    defect it polices. The same applies to any event ordering a stub
+    inverts."""
     import warnings
 
     if inspect.iscoroutinefunction(stub):

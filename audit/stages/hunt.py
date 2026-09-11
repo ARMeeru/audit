@@ -14,9 +14,6 @@ from audit.runner import (
 )
 from audit.state import StateDB, Task
 
-# Per-task estimate when this run has no hunt history yet. Upper-bound by
-# intent; a historical max replaces it as soon as one task completes.
-DEFAULT_TASK_ESTIMATE_USD = 1.0
 from audit.stages._common import StageContext, truncated_recon_summary
 
 log = logging.getLogger(__name__)
@@ -37,28 +34,22 @@ async def run_hunt(
 
     sc = ctx.stage("hunt")
     recon_summary = db.get_recon_output(ctx.run_id) or {}
-    # A cold stage has no honest estimate: a full first wave reserves the
-    # hard default for every task while the actuals are unknown, so the
-    # F12 bound degrades to concurrency x actual. Dispatch ONE task, learn
-    # from its completion, then open the throttle. Costs one task's
-    # latency, once per database -- max_stage_cost_any_run has a row
-    # forever after the first completion, so every later run starts warm.
-    cold = (db.max_stage_cost(ctx.run_id, "hunt") is None
-            and db.max_stage_cost_any_run("hunt") is None)
-    sem = asyncio.Semaphore(1 if cold else sc.concurrency)
+    sem = asyncio.Semaphore(sc.concurrency)
     aborted = asyncio.Event()
-    # In-flight reservation: the cap reads committed spend, but hunt runs
-    # up to `concurrency` agents at once and committed only grows when a
-    # task COMPLETES. Reserving the per-task estimate at dispatch keeps the
-    # cap conservative: overrun is bounded by one task's estimate, not by
-    # concurrency x actual. Prior order: this run -> any prior run -> hard
-    # default (a first hunt stage has no rows for ITS run, which is the
-    # case the default was silently covering). The estimate self-corrects
-    # after each completion so later dispatches in the same stage see the
-    # observed spend.
-    estimate = [db.max_stage_cost(ctx.run_id, "hunt")
-                or db.max_stage_cost_any_run("hunt")
-                or DEFAULT_TASK_ESTIMATE_USD]
+    # In-flight reservation: the cap reads committed spend, but hunt runs up
+    # to `concurrency` agents at once and committed only grows when a task
+    # COMPLETES. Reserving a configured per-task estimate at dispatch makes
+    # the trip conservative.
+    #
+    # The estimate is a configured CONSTANT (config: est_cost_usd), not a
+    # derivation from observed spend. That is a deliberate scope choice: the
+    # requirement here is a bound, not an estimate, and the estimator this
+    # replaced (prior chain plus self-correction plus a cold-start ramp) cost
+    # more in defects than the precision bought. It was only ever correct
+    # because the constant already exceeded every observed task cost (hunt
+    # max $0.676 against a $1.50 default); the derivation could not have
+    # improved on that. Raise est_cost_usd if a stage's cost profile changes.
+    estimate = sc.est_cost_usd
     in_flight = [0.0]
 
     log.info(
@@ -69,20 +60,21 @@ async def run_hunt(
     counters = {"findings": 0, "tasks_done": 0, "tasks_failed": 0, "skipped": 0}
 
     async def _one(task: Task) -> None:
-        nonlocal cold
         async with sem:
             if aborted.is_set():
                 counters["skipped"] += 1
                 return
             reserved = 0.0
             if budget_check is not None:
-                # Reserve a SNAPSHOT, not the live box: self-correction
-                # raises estimate[0] when other tasks complete, and a
-                # release that reads the box returns more than this task
-                # ever put in -- in_flight goes negative and the cap
-                # understates spend. Check-and-increment stay sync: a yield
-                # in the middle would let every task read in_flight = 0.
-                reserved = estimate[0]
+                # Reserve a SNAPSHOT rather than reading `estimate` at
+                # release time. The estimate is a constant today, so the two
+                # are equal; the snapshot keeps release correct if it ever
+                # becomes dynamic again (a release that reads a raised
+                # estimate returns more than the task reserved, driving
+                # in_flight negative and making the cap permissive).
+                # Check-and-increment stay sync: a yield in the middle would
+                # let every task read in_flight = 0.
+                reserved = estimate
                 in_flight[0] += reserved
                 try:
                     budget_check(f"hunt/{task.task_id}", in_flight[0])
@@ -164,16 +156,7 @@ async def run_hunt(
             db.add_artifact(ctx.run_id, "hunt", task.task_id, "scratch_dir",
                             str(scratch))
             counters["tasks_done"] += 1
-            # release exactly what was reserved, THEN learn: the box may
-            # have been raised by other tasks' completions in between
             in_flight[0] -= reserved
-            estimate[0] = max(estimate[0], result.cost_usd or 0.0)
-            if cold:
-                # first completion observed: the estimate is honest now --
-                # open the throttle for the rest of the stage
-                cold = False
-                for _ in range(sc.concurrency - 1):
-                    sem.release()
             log.info(
                 "[%s] hunt %s: %d findings (cost=$%.4f)",
                 ctx.run_id, task.task_id, len(findings), result.cost_usd or 0.0,

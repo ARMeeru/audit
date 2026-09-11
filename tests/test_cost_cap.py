@@ -97,89 +97,66 @@ def test_finalize_still_closes_a_blown_budget(tmp_path: Path, monkeypatch):
         "SELECT status FROM runs WHERE run_id='t'").fetchone()["status"] == "completed"
 
 
-def test_hunt_overrun_bounded_by_one_task_estimate(
+# Highest single-task cost ever recorded on the live runs (state.db, 410
+# cost rows): hunt $0.676 over 145 tasks, validate $1.26 over 222, trace
+# $0.95 over 43. These are the numbers the reservation has to clear.
+OBSERVED_STAGE_MAX_USD = {"hunt": 0.676, "validate": 1.26, "trace": 0.95}
+
+
+def test_configured_estimate_exceeds_observed_task_costs() -> None:
+    """The in-flight reservation is only conservative while est_cost_usd
+    sits ABOVE real per-task cost: below it, `committed + in_flight`
+    under-states spend and the cap becomes more permissive than committed
+    spend alone. This is the property that made the deleted estimator
+    unnecessary -- it was never more accurate than the constant, because
+    the constant already cleared every observed task. Red if the config
+    drops below reality (a stage moves to opus, max_turns rises)."""
+    cfg = load_config()
+    for stage, observed_max in OBSERVED_STAGE_MAX_USD.items():
+        assert cfg.get(stage).est_cost_usd > observed_max, (
+            f"{stage}'s est_cost_usd must exceed the highest observed task "
+            f"cost (${observed_max}); below it the reservation under-states "
+            f"spend and --max-cost-usd becomes permissive"
+        )
+
+
+def test_hunt_trip_is_conservative_when_estimate_clears_actual(
     stage_env, monkeypatch
 ) -> None:
-    """F12 property: with N tasks whose actual spend exceeds the cap, total
-    spend stays under cap + one task estimate. A test asserting an exact
-    agent count would not survive a reservation redesign; this one does.
-    (stage_env fixture from test_stage_failures provides tmp isolation.)"""
+    """With the estimate above per-task actual, the trip fires early rather
+    than late: total spend stays within cap + one wave of actual, and the
+    reservation is never the reason spend exceeded the cap."""
     db, ctx = stage_env
-    for i in range(60):
+    for i in range(12):
         db.add_task("poc", {"task_id": f"t_{i:02d}", "attack_class": "sqli",
                             "scope_hint": "x", "target_files": ["a.py"],
                             "rationale": "r", "priority": 1, "source": "recon"})
-    # history makes the per-task estimate an honest upper bound: $2/task
-    db.record_cost("poc", "hunt", "hist", {"total_cost_usd": 2.0, "usage": {}})
+
+    actual = 0.5   # well under the configured $1.50 estimate
 
     async def spending_agent(**kwargs):
-        on_attempt = kwargs.get("on_attempt")
-        on_attempt({"total_cost_usd": 2.0, "usage": {"input_tokens": 10}})
+        kwargs["on_attempt"]({"total_cost_usd": actual, "usage": {}})
         class R:
             payload = {"findings": []}
-            raw_result_message = {"total_cost_usd": 2.0, "usage": {}}
+            raw_result_message = {"total_cost_usd": actual, "usage": {}}
             from pathlib import Path as _P
             artifact_path = _P("/tmp/x.jsonl")
-            cost_usd = 2.0
+            cost_usd = actual
         return R()
 
     install_run_agent(monkeypatch, hunt_mod, spending_agent)
-    cap = 5.0
+    cap = 4.0
+
     def budget_check(name, in_flight_usd=0.0):
         if db.total_cost("poc") + in_flight_usd >= cap:
             raise CostExceeded(name)
-    asyncio.run(hunt_mod.run_hunt(ctx, db, budget_check=budget_check))
 
-    assert db.total_cost("poc") <= cap + 2.0, (
-        "overrun must be bounded by one task's estimate, not by concurrency"
+    asyncio.run(hunt_mod.run_hunt(ctx, db, budget_check=budget_check))
+    spent = db.total_cost("poc")
+    assert spent <= cap + actual, (
+        f"conservative trip must not overspend beyond cap + one task: {spent}"
     )
 
-def test_first_hunt_stage_with_no_history_stays_bounded(
-    stage_env, monkeypatch
-) -> None:
-    """F6/R2: the property must hold in the configuration the code runs in
-    most often — a run's FIRST hunt stage has no history rows, so the
-    estimate starts at the hard default. With per-task actuals far above
-    the default, self-correction plus reservation must still bound the
-    overrun (this configuration violated the property before the prior
-    chain and self-correction landed)."""
-    db, ctx = stage_env
-    for i in range(60):
-        db.add_task("poc", {"task_id": f"t_{i:02d}", "attack_class": "sqli",
-                            "scope_hint": "x", "target_files": ["a.py"],
-                            "rationale": "r", "priority": 1, "source": "recon"})
-    # deliberately NO history: estimate starts at DEFAULT_TASK_ESTIMATE_USD.
-    # Unproven configuration, stated per the sensor-arrangement rule: with a
-    # fully concurrent first wave and actuals far above the default, the
-    # one-estimate bound cannot hold even post-fix (all wave reservations
-    # use the default before any completion corrects it). This sensor
-    # exercises the synchronous-completion configuration, where the
-    # self-correction demonstrably tightens the trip point.
-    from audit.stages.hunt import DEFAULT_TASK_ESTIMATE_USD
-
-    async def spending_agent(**kwargs):
-        on_attempt = kwargs.get("on_attempt")
-        on_attempt({"total_cost_usd": 3.0, "usage": {"input_tokens": 10}})
-        class R:
-            payload = {"findings": []}
-            raw_result_message = {"total_cost_usd": 3.0, "usage": {}}
-            from pathlib import Path as _P
-            artifact_path = _P("/tmp/x.jsonl")
-            cost_usd = 3.0
-        return R()
-
-    install_run_agent(monkeypatch, hunt_mod, spending_agent)
-    cap = 10.0
-    def budget_check(name, in_flight_usd=0.0):
-        if db.total_cost("poc") + in_flight_usd >= cap:
-            raise CostExceeded(name)
-    asyncio.run(hunt_mod.run_hunt(ctx, db, budget_check=budget_check))
-
-    estimate_ceiling = max(DEFAULT_TASK_ESTIMATE_USD, 3.0)
-    assert db.total_cost("poc") <= cap + estimate_ceiling, (
-        f"overrun must stay bounded by one (self-corrected) estimate: "
-        f"spent {db.total_cost('poc')}"
-    )
 
 @pytest.mark.parametrize("pre_spent,stage_cost,expect_completed", [
     (0.0, 0.0, True),    # fresh run: finalize runs, cap bounds the invocation
@@ -258,10 +235,17 @@ def test_finalize_cap_across_the_spend_band(
 
 
 def test_in_flight_never_goes_negative(stage_env, monkeypatch):
-    """F1/R2 invariant: budget_check must never see a negative in_flight.
-    Release sites read the live estimate box, and self-correction raises
-    it -- releasing more than the task reserved drives in_flight below
-    zero, which understates spend to the cap (worse than no reservation)."""
+    """Invariant: budget_check must never see a negative in_flight --
+    releasing more than the task reserved understates spend to the cap.
+
+    Currently VACUOUS, stated here rather than left to look like coverage:
+    the estimate is a configured constant, so releasing it equals releasing
+    the reserved snapshot and no drift is possible. Mutation-confirmed --
+    swapping the release back to a live read leaves this test green, because
+    there is nothing to read differently. It becomes load-bearing the moment
+    the estimate turns dynamic again (which the reservation comment warns
+    against); the live sensor for this design is
+    test_configured_estimate_exceeds_observed_task_costs."""
     db, ctx = stage_env
     for i in range(60):
         db.add_task("poc", {"task_id": f"t_{i:02d}", "attack_class": "sqli",
@@ -285,7 +269,7 @@ def test_in_flight_never_goes_negative(stage_env, monkeypatch):
             cost_usd = 5.0
         return R()
 
-    monkeypatch.setattr(hunt_mod, "run_agent", spending_agent)
+    install_run_agent(monkeypatch, hunt_mod, spending_agent)
 
     def budget_check(name, in_flight_usd=0.0):
         seen_in_flight.append(in_flight_usd)
@@ -294,47 +278,4 @@ def test_in_flight_never_goes_negative(stage_env, monkeypatch):
     assert min(seen_in_flight) >= 0.0, (
         f"negative in_flight understates spend to the cap: "
         f"min={min(seen_in_flight)}"
-    )
-
-def test_cold_first_wave_bounded_by_one_actual(stage_env, monkeypatch):
-    """F5/R3: a cold first wave (no history anywhere) with actuals far
-    above the default used to launch concurrency/2+ tasks at the stale
-    default and blow the bound by (launched-1) x (actual-default). The
-    ramp dispatches one task, learns, then opens the throttle: cold-start
-    exposure is one task's actual spend, not concurrency x actual. Red as
-    shipped ($45 vs $15 in the review's measurement), green after."""
-    db, ctx = stage_env
-    for i in range(60):
-        db.add_task("poc", {"task_id": f"t_{i:02d}", "attack_class": "sqli",
-                            "scope_hint": "x", "target_files": ["a.py"],
-                            "rationale": "r", "priority": 1, "source": "recon"})
-    # deliberately NO history anywhere: cold start
-
-    async def spending_agent(**kwargs):
-        import asyncio as _aio
-        on_attempt = kwargs.get("on_attempt")
-        on_attempt({"total_cost_usd": 5.0, "usage": {"input_tokens": 10}})
-        await _aio.sleep(0)
-        class R:
-            payload = {"findings": []}
-            raw_result_message = {"total_cost_usd": 5.0, "usage": {}}
-            from pathlib import Path as _P
-            artifact_path = _P("/tmp/x.jsonl")
-            cost_usd = 5.0
-        return R()
-
-    monkeypatch.setattr(hunt_mod, "run_agent", spending_agent)
-
-    def budget_check(name, in_flight_usd=0.0):
-        # the cap under test: ramp bounds the cold wave, this bounds the
-        # rest. Note run_hunt SWALLOWS budget_check exceptions (log +
-        # aborted + return) -- the orchestrator's stage-level _check is
-        # what aborts the pipeline; here we assert the bound on the ledger.
-        if db.total_cost("poc") + in_flight_usd >= 10.0:
-            raise CostExceeded(name)
-
-    asyncio.run(hunt_mod.run_hunt(ctx, db, budget_check=budget_check))
-    assert db.total_cost("poc") <= 10.0 + 5.0, (
-        f"cold-start exposure must be one task's actual spend: "
-        f"{db.total_cost('poc')} (cap 10)"
     )

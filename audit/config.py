@@ -17,6 +17,10 @@ class StageConfig:
     max_turns: int
     permission_mode: str
     repair_attempts: int
+    # Per-task cost estimate used to reserve in-flight spend against the cap.
+    # Must be an UPPER BOUND on observed per-task cost: reserving less than
+    # actual makes the cap permissive rather than conservative.
+    est_cost_usd: float = 1.5
 
 
 @dataclass
@@ -60,6 +64,9 @@ def load_config(path: Path | None = None) -> HarnessConfig:
             ),
             repair_attempts=int(
                 spec.get("repair_attempts", defaults.get("repair_attempts", 1))
+            ),
+            est_cost_usd=float(
+                spec.get("est_cost_usd", defaults.get("est_cost_usd", 1.5))
             ),
         )
     loops = raw.get("loops", {}) or {}
