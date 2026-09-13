@@ -332,6 +332,13 @@ stays green.
   config, and Bash is refused by name, but a Bash command that builds the path at
   runtime is not caught. Prompts and schemas are re-read per dispatch, so a
   rewrite lands in a later stage's system prompt within the same run.
+- **MCP servers are suppressed, not filtered.** Sessions run with no MCP
+  servers and `strict_mcp_config`, because the CLI otherwise loads the
+  operator's own user, project and plugin servers. Those clients run inside the
+  harness process, which is outside the sandbox, so an MCP server with write
+  access is an exfiltration route the sandbox cannot see. If you want a stage to
+  have one, pass it explicitly through `mcp_servers` rather than relying on your
+  global configuration.
 - **Reads are not restricted at all in a normal run.** An agent can read any file
   the user can, including anything under `--add-dir`. The filter covers the
   harness's own secrets and state, not the rest of the filesystem.

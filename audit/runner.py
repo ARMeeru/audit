@@ -281,12 +281,24 @@ def _build_options(
             sandbox_settings["network"] = {"allowedDomains": list(network_allow)}
     return ClaudeAgentOptions(
         system_prompt=system_prompt,
-        # `tools` is the set that EXISTS; `allowed_tools` only pre-approves.
-        # Setting both to the configured list means a stage configured with no
-        # Bash does not have Bash at all, rather than merely failing to
-        # pre-approve it and falling through to whatever permission_mode allows.
+        # `tools` is the set that EXISTS among the CLI's built-in tools;
+        # `allowed_tools` only pre-approves. Setting both to the configured list
+        # means a stage configured with no Bash does not have Bash at all, rather
+        # than merely failing to pre-approve it and falling through to whatever
+        # permission_mode allows. Probed rather than assumed: a session declaring
+        # tools=["Read"] reports BASH=absent.
+        #
+        # It does NOT cover MCP tools. A session with a two-name built-in list
+        # still carried the operator's own `mcp__claude_ai_Google_Drive__*`
+        # servers, because setting_sources=[] disables settings files but not the
+        # MCP configuration the CLI loads separately. Those clients run inside
+        # this process, so they sit outside the sandbox, and an MCP server with
+        # write access is an exfiltration route the sandbox cannot see. No
+        # servers plus strict_mcp_config closes it.
         tools=list(allowed_tools),
         allowed_tools=list(allowed_tools),
+        mcp_servers={},
+        strict_mcp_config=True,
         model=model,
         max_turns=max_turns,
         cwd=str(cwd),

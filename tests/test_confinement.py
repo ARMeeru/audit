@@ -715,3 +715,18 @@ def test_firmlink_spelling_of_the_checkout_also_warns(
     assert any("self-audit" in r.message.lower() for r in caplog.records), (
         "the firmlinked spelling of the checkout was not recognised"
     )
+
+
+def test_options_ignore_operator_configured_mcp_servers() -> None:
+    """A session declaring tools=["Read","Bash"] still carried the operator's
+    own `mcp__claude_ai_Google_Drive__*` servers, because setting_sources=[]
+    disables settings files but not the MCP configuration the CLI loads
+    separately. Those clients run inside the harness process, so they are outside
+    the sandbox: an MCP server with write access is an exfiltration route the
+    sandbox cannot see, and it is reachable from a prompt-injected hunter."""
+    opts = _options()
+    assert list(opts.mcp_servers) == [] or not opts.mcp_servers
+    assert opts.strict_mcp_config is True, (
+        "without strict_mcp_config the CLI still loads user, project and "
+        "plugin-provided MCP servers"
+    )
