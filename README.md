@@ -274,10 +274,30 @@ state.db        SQLite (gitignored)
 
 ## Safety
 
-Hunt agents have Bash and run inside per-task scratch dirs. They are **not**
-sandboxed at the OS level. Run the audit inside a disposable VM or container
-when you don't trust the target source — a target with malicious build
-scripts could otherwise execute on your host during PoC compilation.
+Hunt agents have Bash and run inside per-task scratch dirs. They also run under
+the SDK's OS sandbox (macOS and Linux), enabled by default and configurable per
+stage via `sandbox` in `config/stages.yaml`:
+
+- writes outside the agent's working directory are refused by the sandbox, so an
+  agent cannot rewrite `state.db` or the `results/` tree even when the code it
+  is reading talks it into trying;
+- a PreToolUse filter additionally refuses tool calls naming `state.db`, the
+  results tree, the harness `.env` or the Claude credentials file, and says why.
+  It is a filter over a command string, **not** a boundary: a path built at
+  runtime, base64-encoded, or held in a variable walks straight past it.
+
+Two cases where the sandbox is not the boundary, both worth knowing before you
+rely on it:
+
+- **A self-audit** (`--repo` pointing at this checkout) hands the harness tree to
+  the agent as its own working directory, so no path-based restriction can
+  separate the two. Only the filter applies. Such a run logs a warning.
+- **A platform where the sandbox cannot start** (Linux without a working
+  sandbox) falls back to the filter alone.
+
+For an untrusted target, run the audit inside a disposable VM or container
+anyway: a target with malicious build scripts could otherwise execute on your
+host during PoC compilation, which is outside anything the harness can enforce.
 
 The agent reads everything you `--add-dir`, including any `.env` or
 `secrets/` directories in the target. Outputs land in `results/<run-id>/`
