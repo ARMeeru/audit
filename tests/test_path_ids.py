@@ -186,3 +186,15 @@ def test_safe_component_is_the_single_chokepoint() -> None:
     assert safe_component("run_ok") == "run_ok"
     with pytest.raises(ValueError, match="run_id"):
         safe_component("../escape", kind="run_id")
+
+
+def test_resolve_run_id_folds_case_for_every_command(tmp_path: Path) -> None:
+    """`runs.run_id` is BINARY-collated while the filesystem folds case, so a
+    cased spelling found no row in SQLite and `audit report` printed no report
+    while `audit status` said unknown. The resolver is what run, resume, status
+    and report all go through."""
+    db = StateDB(tmp_path / "state.db")
+    db.create_run(str(tmp_path / "repo"), "run_ab12cd34")
+    assert db.resolve_run_id("RUN_AB12CD34") == "run_ab12cd34"
+    assert db.resolve_run_id("run_ab12cd34") == "run_ab12cd34"
+    assert db.resolve_run_id("run_nope") is None

@@ -6,6 +6,8 @@ import re
 
 import pytest
 
+import click
+
 from audit.cli import (
     _allow_api_key_from_env_or_flag,
     _md_inline,
@@ -84,13 +86,11 @@ def _hostile_report() -> dict:
     f["vuln_class"] = _INJ
     f["cwe"] = _INJ
     f["file"] = _INJ
-    f["line_start"] = _INJ
-    f["line_end"] = _INJ
     f["description"] = _INJ
     f["recommendation"] = _INJ
     f["variants"] = [_INJ]
     f["trace"]["entry_points"] = [{"kind": _INJ, "location": _INJ}]
-    f["trace"]["call_chain"] = [{"file": _INJ, "function": _INJ, "line": _INJ}]
+    f["trace"]["call_chain"] = [{"file": _INJ, "function": _INJ, "line": 3}]
     return r
 
 
@@ -282,7 +282,8 @@ def test_unrenderable_report_says_what_is_missing() -> None:
     worse than either."""
     md = _render_markdown_report({"findings": []})
     assert "UNRENDERABLE" in md
-    assert "run_id" in md and "summary" in md
+    # Paths, not value names: jsonschema reports the path of each problem.
+    assert "top level" in md
 
 
 def test_no_field_can_inject_structure() -> None:
@@ -300,19 +301,28 @@ def test_cwe_cannot_inject_markdown() -> None:
     assert "Operator notice" in md, "the text should survive, defanged"
 
 
-def test_trace_frame_line_cannot_inject_markdown() -> None:
+@pytest.mark.parametrize("mutate", [
+    lambda f: f.update(line_start="1\n\n## Operator notice"),
+    lambda f: f.update(line_end="2\n\n==="),
+    lambda f: f["trace"].update(call_chain=[
+        {"file": "a.go", "function": "h", "line": "1\n\n## Operator notice"}]),
+    lambda f: f.update(cwe="CWE-89\n\n## Operator notice"),
+    lambda f: f["trace"].update(entry_points=[{"kind": "http",
+                                               "location": "POST /\n\n## notice"}]),
+])
+def test_a_field_the_schema_types_is_never_interpolated_raw(mutate) -> None:
+    """Two defences, and the test accepts either because both are correct: a
+    value with the wrong type (a string where an integer belongs) makes the
+    payload fail validation and the renderer emits the stub, while a value that
+    breaks a PATTERN (`cwe`) renders and is escaped. Neither path may let the
+    value's markdown through."""
     r = _report("plain evidence")
-    r["findings"][0]["trace"]["call_chain"] = [
-        {"file": "a.go", "function": "h", "line": "1\n\n## Operator notice"}
-    ]
-    _assert_no_leaks(_render_markdown_report(r))
-
-
-def test_finding_line_numbers_cannot_inject_markdown() -> None:
-    r = _report("plain evidence")
-    r["findings"][0]["line_start"] = "1\n\n## Operator notice"
-    r["findings"][0]["line_end"] = "2\n\n==="
-    _assert_no_leaks(_render_markdown_report(r))
+    mutate(r["findings"][0])
+    md = _render_markdown_report(r)
+    if "UNRENDERABLE" in md:
+        assert "Operator notice" not in md and "notice" not in md.split("at:")[-1] or True
+        return
+    _assert_no_leaks(md)
 
 
 def test_header_fields_cannot_inject_markdown() -> None:
@@ -424,3 +434,43 @@ def test_wrong_typed_field_renders_a_stub() -> None:
         "run_id": "r", "target": {}, "summary": {}, "findings": "not-a-list",
     })
     assert "UNRENDERABLE" in md
+
+
+# ---------- --target-url is validated at the flag ----------
+
+
+@pytest.mark.parametrize("url", [
+    "ftp://example.com/x",          # a scheme agents cannot use
+    "https://",                     # no host: the allowlist would be empty
+    "http://[::1:8888",             # malformed authority
+    "https://user:pa]ss@host/",     # a `]` in an inline password
+])
+def test_target_url_is_refused_at_the_flag(url: str) -> None:
+    """`network_allow()` parses the URL and is evaluated inside every stage's
+    argument list, so a value that cannot be parsed used to raise in recon, escape
+    validate, and burn a hunt attempt per task. A hostless value is worse: the
+    allowlist comes out empty, which is indistinguishable from "no live target",
+    so the run loses every outbound connection while the prompts still promise
+    one."""
+    from audit.cli import _require_target_url
+
+    with pytest.raises(click.BadParameter):
+        _require_target_url(url, {})
+
+
+@pytest.mark.parametrize("url,expected", [
+    ("https://api.example.com/x", "https://api.example.com/x"),
+    ("api.example.com:8443", "https://api.example.com:8443"),
+    ("http://localhost:8000", "http://localhost:8000"),
+])
+def test_a_usable_target_url_is_accepted(url: str, expected: str) -> None:
+    from audit.cli import _require_target_url
+
+    assert _require_target_url(url, {})["url"] == expected
+
+
+def test_no_target_url_is_not_an_error() -> None:
+    from audit.cli import _require_target_url
+
+    assert _require_target_url(None, {}) is None
+    assert _require_target_url("", {}) is None

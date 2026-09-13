@@ -45,7 +45,15 @@ class StageContext:
         allowed, not the whole URL, and a target that redirects to a CDN needs
         the stage's sandbox switched off.
         """
-        host = urlparse(str((self.live_target or {}).get("url", ""))).hostname
+        url = str((self.live_target or {}).get("url", ""))
+        try:
+            host = urlparse(url).hostname
+        except ValueError:
+            # Malformed authority (e.g. `http://[::1:8888`). cli.run validates
+            # the flag, so this is belt-and-braces: this method is evaluated
+            # inside every stage's argument list, and raising here used to abort
+            # a whole stage after its upstream spend was already sunk.
+            return []
         return [host] if host else []
 
     def prompt(self, name: str) -> Path:

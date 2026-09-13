@@ -293,10 +293,13 @@ stage via `sandbox` in `config/stages.yaml`:
   or the `results/` tree even when the code it is reading talks it into trying.
   The audited source itself IS inside that scope (it is added as a directory),
   so a hunter can write to the target it is reading;
-- a PreToolUse filter additionally refuses tool calls naming `state.db`, the
-  results tree, the harness `.env` or the Claude credentials file, and says why.
-  It is a filter over a command string, **not** a boundary: a path built at
-  runtime, base64-encoded, or held in a variable walks straight past it.
+- a PreToolUse hook additionally refuses tool calls whose own path lands in the
+  harness's files. For the structured tools it resolves that path and compares by
+  filesystem identity, so case-folded spellings, hardlinks, symlinks, `..` and
+  `~` need no pattern matching. For Bash it is a **speed bump**, not a boundary:
+  it expands the shell's home spellings and refuses the guarded names, and it
+  does not model globbing, quoting, `cd`, `--flag=<path>` or a path built at
+  runtime.
 
 Two cases are worth knowing before you rely on either layer, and both are in the
 register below rather than repeated here.
@@ -316,59 +319,43 @@ not have. `scripts/mutation-check.py` is the executable form of the claims above
 it breaks one protection at a time and fails if the sensor that should notice
 stays green.
 
-- **Bash commands are filtered by string, not by structure.** The filter
-  normalises the spellings it can see (`~`, `$HOME`, quoting, `//`, `/./`, `..`,
-  a leading `cd`), but a path built at runtime (`p=$(printf %s <base64> | base64
-  -d); sqlite3 "$p" ...`), a variable or any other indirection walks past it. It
-  matches the harness database by basename, so a target shipping its own
-  `state.db` cannot be reached by a shell command; use Read, which compares by
-  identity and does allow it.
-- **Structured tools are checked by identity, not by string.** A path is resolved
-  and compared with `st_dev`/`st_ino` where it exists, with a case-folded prefix
-  comparison otherwise, so case-folded spellings, hardlinks, symlinks and
-  not-yet-existing paths are all handled. That is a filesystem comparison, not a
-  guarantee about what the tool does with the path afterwards.
-- **A self-audit is unconfined by construction.** `--repo` pointing at this
-  checkout, or at a directory containing it, hands the agent the tree the
-  harness keeps `state.db` and `results/` in. The run logs a warning. Keeping
-  those paths outside the audited tree is the structural fix and is not done yet.
-- **A platform where the sandbox cannot start** leaves the filter alone, and a
-  target that redirects to a third-party host needs that stage's sandbox off.
-  Both are honest reasons to set `sandbox: false`; neither is a reason to leave
-  it off for a whole run.
-- **Prompt files can still be rewritten by a shell command in self-audit
-  geometry.** Write and Edit are refused for the prompts, schemas and stage
-  config, and Bash is refused by name, but a Bash command that builds the path at
-  runtime is not caught. Prompts and schemas are re-read per dispatch, so a
-  rewrite lands in a later stage's system prompt within the same run.
-- **MCP servers are suppressed, not filtered.** Sessions run with no MCP
-  servers and `strict_mcp_config`, because the CLI otherwise loads the
-  operator's own user, project and plugin servers. Those clients run inside the
-  harness process, which is outside the sandbox, so an MCP server with write
-  access is an exfiltration route the sandbox cannot see. If you want a stage to
-  have one, pass it explicitly through `mcp_servers` rather than relying on your
-  global configuration.
+- **The Bash filter is a speed bump with a written scope.** It does not model
+  globbing (`cat .cla*/.creden*`), quoting (`cat .cla""ude/x`), `--flag=<path>`,
+  `cd`, or a path built at runtime. It also does not stop `cp -R .` or a similar
+  directory-level copy, which puts a copy of the checkout (including `.env`) in
+  the scratch dir where Read can reach it. It matches the harness database by
+  basename, so a target shipping its own `state.db` cannot be reached by a shell
+  command; the structured tools compare by identity and do allow it. Three review
+  rounds tried to make this filter sound by adding rules and produced eight
+  bypasses, two regressions and a hook that could block every concurrent agent
+  for 41 seconds, so the rules came out and the scope went in here.
+- **A self-audit is still unconfined by construction.** `--repo` pointing at this
+  checkout, or at a directory containing it, hands the agent the tree the harness
+  keeps `state.db`, `results/` and `.env` in. The run logs a warning. Moving
+  those three paths outside the audited tree is the fix, and it is the reason the
+  paragraph above can stay this short: with them outside, the sandbox separates
+  harness from target in every geometry and most of the filter has no reason to
+  exist.
+- **Reading is not sandboxed at all.** The sandbox scopes writes and network. A
+  Grep rooted above a guarded file is refused by the hook, because ripgrep passes
+  `--hidden` with only VCS directories excluded, but an agent can still read
+  anything else the user can, including anything under `--add-dir`.
+- **MCP servers are suppressed, not filtered.** Sessions pass
+  `--strict-mcp-config` with no server config, because the CLI otherwise loads
+  the operator's own user, project and plugin servers, and those clients run
+  inside the harness process, outside the sandbox. The CLI treats that flag as a
+  startup error when an enterprise MCP config is present, which is why
+  `strict_mcp_config: false` exists per stage; it re-opens the route.
 - **Loopback is not available under the sandbox, whatever the allowlist says.**
   Measured: with `allowedDomains` set to `127.0.0.1`, `localhost` or
   `127.0.0.1:<port>`, a connection to a local server is still refused with
-  `deny network-outbound`. The allowlist is by host and does not cover the
-  loopback interface, so a stage whose PoC needs a local server must run with
-  `sandbox: false`. Note that the port is not part of the allowlist either: a
-  target is allowlisted by host.
-- **MCP suppression can refuse to start on a managed machine.** Sessions pass
-  `--strict-mcp-config`, and the CLI treats that as a startup error when an
-  enterprise MCP config is present. `strict_mcp_config: false` in
-  `config/stages.yaml` is the way out, and it re-opens the route above, so prefer
-  fixing the enterprise config.
-- **Reads are not restricted at all in a normal run.** An agent can read any file
-  the user can, including anything under `--add-dir`. The filter covers the
-  harness's own secrets and state, not the rest of the filesystem.
+  `deny network-outbound`. A stage whose PoC needs a local server must run with
+  `sandbox: false`. A static run has no egress at all, and `--target-url` adds
+  exactly that host.
 - **`--run-id` must match `[A-Za-z0-9._-]{1,128}`** and is rejected at the CLI
   otherwise. It becomes a directory name, so a run id with a colon or a space
-  will not resolve.
-- **Case-only differences collide.** macOS and Windows fold case, so `Foo` and
-  `foo` share one directory while SQLite keeps two rows; `create_run` refuses the
-  second one.
+  will not resolve. Case-only differences collide on a case-folding filesystem
+  and are refused.
 
 ## License
 

@@ -80,20 +80,21 @@ def _validate_stage(name: str, spec: dict, defaults: dict) -> None:
     # `tools:` with no value is None in YAML, and dict.get returns the stored
     # None rather than the default, so this used to raise TypeError instead of
     # the intended message.
-    if "tools" in spec and not isinstance(spec["tools"], list):
+    # `defaults.tools` falls back like every other key, and a stage that ends up
+    # with no tools at all is refused: an empty list disables every built-in tool,
+    # so the stage would silently produce nothing while the run completed clean.
+    tools = spec.get("tools", defaults.get("tools"))
+    if not isinstance(tools, list):
         # A bare `tools:` key is None in YAML, and dict.get returns the stored
         # None rather than the default, which used to raise a TypeError.
         raise ValueError(
-            f"stage {name!r}: tools must be a list of tool names, got "
-            f"{spec['tools']!r}"
+            f"stage {name!r}: tools must be a list of tool names, got {tools!r}"
         )
-    tools = spec.get("tools") or []
-    if "tools" in spec and not tools:
-        # An empty list disables every built-in tool, which is never what a stage
-        # means; failing here beats a stage that silently cannot act.
+    if not tools:
         raise ValueError(
-            f"stage {name!r}: tools is empty (an unset key such as `tools:` "
-            "means the same thing). Name the tools, or remove the key."
+            f"stage {name!r}: tools is empty. An empty list disables every "
+            "built-in tool, so name the tools or give the stage a `tools:` "
+            "value under `defaults:`."
         )
     for tool in tools:
         if tool not in KNOWN_TOOLS:
@@ -162,7 +163,7 @@ def load_config(path: Path | None = None) -> HarnessConfig:
             name=name,
             model=spec["model"],
             concurrency=int(spec["concurrency"]),
-            tools=list(spec.get("tools") or []),
+            tools=list(spec.get("tools", defaults.get("tools")) or []),
             max_turns=int(spec.get("max_turns", defaults.get("max_turns", 25))),
             permission_mode=spec.get(
                 "permission_mode", defaults.get("permission_mode", "acceptEdits")

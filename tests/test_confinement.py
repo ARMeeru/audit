@@ -1,25 +1,21 @@
-"""Confinement sensors: an agent's Bash tool must not be able to reach the
-harness's own mutable state (state.db, results/) or its credentials.
+"""Confinement sensors: an agent must not be able to reach the harness's own
+mutable state (state.db, results/, .env), its credentials, or the files the
+pipeline judges itself by.
 
-Most tests here assert the CORRECT behaviour and are red against the unfixed
-tree, because no confinement existed: `allowed_tools` merely pre-approves a tool
-(the SDK's removal knob is `tools`), no sandbox settings were passed, and no
-PreToolUse hook was installed.
+Two mechanisms and one deliberate non-mechanism:
 
-Not every test in the file is that kind, and an earlier docstring claiming so was
-false: the config-validation tests (the "auto" permission mode, for one) are
-green at origin/main too, because main validated no permission mode at all and
-accepted everything. Tests that pin behaviour rather than detect a defect say so
-where they appear.
-
-Two layers are under test and they are NOT equivalent:
-
-  * the sandbox (SDK `sandbox` settings) is the boundary: commands run under the
-    OS sandbox, so a write outside the agent's own working directory fails.
-  * the tool guard (a PreToolUse hook) is a FILTER over the command string. It
-    stops the direct and the obvious, and it is what stands in the way when the
-    sandbox cannot start (or when the audited repo IS the harness). Obfuscation
-    defeats it. It must never be described, here or in the docs, as the boundary.
+  * the OS sandbox (SDK `sandbox` settings) is the boundary. Measured: writes
+    outside the working directory plus `--add-dir` fail, and with no network
+    config every outbound connection is refused.
+  * `structured_path_hit` is exact by construction: it resolves the path a tool
+    is about to use and compares by filesystem identity, so case-folded
+    spellings, hardlinks, `..`, relative spellings and `~` need no string table.
+  * `bash_guard_hit` is a speed bump with a written scope. Its non-scope is
+    documented in its own docstring rather than tested, because three review
+    rounds of expanding it produced eight known bypasses and a hook that could
+    block every concurrent agent for 41 seconds. What is tested here is what it
+    claims: home spellings, the guarded names, and a path boundary so ordinary
+    names in a target are not refused.
 """
 
 from __future__ import annotations
@@ -38,11 +34,10 @@ HARNESS_ROOT = Path(runner_mod.__file__).resolve().parent.parent
 STATE_DB = HARNESS_ROOT / "state.db"
 RESULTS = HARNESS_ROOT / "results"
 
-
 # A workspace that is not the harness: what a stage gets when it audits some
-# other repository. Building the guard without one defaults to the harness root
-# and refuses everything, so a test that wants an allow needs this shape.
+# other repository.
 FOREIGN = Path("/tmp/some-unrelated-target")
+HOME = Path.home()
 
 
 def _guard(cwd=None, workspace=None):
@@ -72,33 +67,8 @@ def _reason(out: dict) -> str:
     return out.get("hookSpecificOutput", {}).get("permissionDecisionReason", "")
 
 
-# ---------- the guard denies the harness's own state ----------
+# ---------- structured tools: exact containment ----------
 
-
-@pytest.mark.parametrize(
-    "command",
-    [
-        f"sqlite3 {STATE_DB} \"update findings set severity='info'\"",
-        f"rm -f {STATE_DB}-wal {STATE_DB}-shm",
-        f"cp /tmp/forged.json {STATE_DB}",
-        f"python3 -c \"import sqlite3; sqlite3.connect('{STATE_DB}')\"",
-        f"ls -la {RESULTS}/run_ab12/report",
-        f"echo '{{}}' > {RESULTS}/run_ab12/report/report.json",
-        f"sed -i s/confirmed/rejected/ {RESULTS}/run_ab12/validate/f_1.jsonl",
-        "cat ~/.claude/.credentials.json",
-        "cp ~/.claude/.credentials.json /tmp/creds.json",
-        f"cat {HARNESS_ROOT}/.env",
-        f"cd {HARNESS_ROOT} && sqlite3 state.db 'delete from findings'",
-    ],
-)
-def test_guard_denies_harness_state_references(command: str) -> None:
-    out = _decide(_guard(), "Bash", {"command": command})
-    assert _denied(out), f"guard allowed a harness-state command: {command}"
-
-
-# Real input shapes, not one shared key: a Grep call has no file_path, so
-# parametrizing over it tested nothing about Grep. The keys are the ones the
-# tools actually emit.
 _TARGET_CASES = {
     "Read": "file_path",
     "Write": "file_path",
@@ -113,126 +83,219 @@ _TARGET_CASES = {
 def test_guard_denies_structured_paths_into_harness_state(
     tool_name: str, key: str
 ) -> None:
-    """A path in tool_input is matched by containment after resolving, so
-    relative spellings, `..` and `~` do not need a string table. Read matters
-    most: it is granted to every stage and reads file CONTENTS, so it is the
-    route that can pull the subscription credential into a finding's evidence."""
+    """Read matters most: it is granted to every stage and reads file CONTENTS,
+    so it is the route that can pull a credential into a finding's evidence."""
     guard = _guard()
-    for target in (
+    targets = [
         RESULTS / "r" / "report" / "report.json",
         STATE_DB,
+        STATE_DB.with_name("state.db-wal"),
+        STATE_DB.with_name("state.db-shm"),
         HARNESS_ROOT / ".env",
-        Path.home() / ".claude" / ".credentials.json",
-    ):
+        HOME / ".claude" / ".credentials.json",
+        HOME / ".claude" / "settings.json",
+        HOME / ".claude.json",
+        HOME / ".claude.json.backup",
+    ]
+    if tool_name in ("Write", "Edit", "NotebookEdit"):
+        # Only the write tools are refused the files a self-audit has to read.
+        targets.append(HARNESS_ROOT / "config" / "stages.yaml")
+    for target in targets:
         assert _denied(_decide(guard, tool_name, {key: str(target)})), (
             f"{tool_name} {key}={target}"
         )
 
 
 @pytest.mark.parametrize("tool_name,key", sorted(_TARGET_CASES.items()))
-def test_guard_denies_relative_and_tilde_spellings(tool_name: str, key: str) -> None:
-    """The old filter matched only absolute substrings, so every relative
-    spelling walked past it: `Read .env` from a harness cwd, and
-    `Read ../../../../.env` from hunt's scratch dir, were both allowed."""
+def test_guard_denies_relative_case_folded_and_tilde_spellings(
+    tool_name: str, key: str
+) -> None:
+    """Resolving the path is what makes these exact. Case is the one that got
+    through an earlier version: APFS folds it, `resolve()` does not, so
+    `<repo>/STATE.DB` was a different Path for the same file."""
     guard = _guard(cwd=HARNESS_ROOT)
     assert _denied(_decide(guard, tool_name, {key: ".env"})), "relative .env"
     assert _denied(_decide(guard, tool_name, {key: "results/x.json"})), "relative results"
+    assert _denied(_decide(guard, tool_name, {key: str(STATE_DB).upper()})), "cased"
+    assert _denied(
+        _decide(guard, tool_name, {key: "~/.claude/.credentials.json"})
+    ), "tilde"
+    # A cased spelling of a path that does not exist yet: identity cannot see it
+    # (nothing to stat) so the case-folded prefix is what catches it.
+    assert _denied(
+        _decide(guard, tool_name, {key: str(RESULTS).upper() + "/new.json"})
+    ), "cased, non-existent"
     scratch = HARNESS_ROOT / "work" / "run_ab" / "hunt" / "t_1"
     guard = _guard(cwd=scratch, workspace=[scratch, FOREIGN])
     assert _denied(_decide(guard, tool_name, {key: "../../../../.env"})), "traversal"
-    assert _denied(_decide(guard, tool_name, {key: "~/.claude/.credentials.json"})), "tilde"
 
 
-@pytest.mark.parametrize("tool_input", [
-    {"path": str(Path.home()), "glob": ".credentials.json"},
-    {"path": str(Path.home()), "glob": "*"},
-    {"path": str(HARNESS_ROOT), "glob": "state.db"},
-])
-def test_grep_glob_cannot_narrow_onto_a_guarded_file(tool_input: dict) -> None:
-    """Grep's `glob` is a path filter (`rg --glob`) and was not inspected, so
-    `{path: <home>, glob: ".credentials.json", output_mode: content}` read the
-    subscription token while the Read path was correctly refused. The inspected
-    `path` does not save it: pointing `path` at a harmless ancestor and letting
-    the glob do the narrowing walked straight through."""
-    assert _denied(_decide(_guard(cwd=HARNESS_ROOT), "Grep", tool_input)), tool_input
+def test_guard_denies_a_hardlink_to_the_state_database(tmp_path: Path) -> None:
+    """A hardlink has no path relationship to its target, so a prefix comparison
+    cannot see it: `st_dev`/`st_ino` identity can."""
+    link = tmp_path / "hl_state"
+    try:
+        link.hardlink_to(STATE_DB)
+    except OSError:
+        pytest.skip("hardlinks unavailable on this filesystem")
+    assert _denied(_decide(_guard(), "Read", {"file_path": str(link)}))
 
 
-@pytest.mark.parametrize("tool_input", [
-    {"pattern": "**/state.db"},
-    {"pattern": f"{HARNESS_ROOT}/results/**/*.json"},
-])
-def test_glob_pattern_cannot_name_a_guarded_path(tool_input: dict) -> None:
-    """Glob's `pattern` IS the path expression (unlike Grep's, which is a
-    regex over file contents), and it was not inspected at all."""
+def test_guard_allows_a_targets_own_state_db_and_env(tmp_path: Path) -> None:
+    """The other direction, and the escape hatch the denial message points at: a
+    target repo that ships its own `state.db` or `.env` is target data. The check
+    compares identity, so it does not fire on a different file with a name that
+    matches."""
+    (tmp_path / "state.db").write_text("not the harness db")
+    (tmp_path / ".env").write_text("TARGET=1")
+    guard = _guard(cwd=tmp_path, workspace=[tmp_path])
+    for name in ("state.db", "state.db-wal", ".env"):
+        assert not _denied(
+            _decide(guard, "Read", {"file_path": str(tmp_path / name)})
+        ), name
+
+
+def test_reads_of_prompts_schemas_and_config_still_work() -> None:
+    """Auditing this repository means reading its prompts, schemas and config;
+    only writes to them are refused."""
     guard = _guard(cwd=HARNESS_ROOT, workspace=[HARNESS_ROOT])
-    assert _denied(_decide(guard, "Glob", tool_input)), tool_input
-
-
-def test_guard_does_not_match_a_grep_regex_pattern() -> None:
-    """A hunter grepping the TARGET for the string "state.db" is doing its job.
-    Grep's `pattern` is a regex over file contents, so it is not a path."""
-    guard = _guard()
-    assert not _denied(_decide(guard, "Grep", {"pattern": r"state\.db", "path": str(FOREIGN)}))
-
-
-def test_denial_message_says_why() -> None:
-    """A bare denial makes the model retry the same call. The reason is what
-    turns it into a redirection."""
-    out = _decide(_guard(), "Bash", {"command": f"sqlite3 {STATE_DB} 'select 1'"})
-    reason = _reason(out)
-    assert reason, "denial carried no reason"
-    assert "harness" in reason.lower() or "state.db" in reason
-
-
-# ---------- the guard does not break the product ----------
+    for path in (
+        HARNESS_ROOT / "prompts" / "08-report.md",
+        HARNESS_ROOT / "schemas" / "report.schema.json",
+        HARNESS_ROOT / "config" / "stages.yaml",
+    ):
+        assert not _denied(_decide(guard, "Read", {"file_path": str(path)})), path
 
 
 @pytest.mark.parametrize(
-    "tool_name,tool_input",
-    [
-        ("Bash", {"command": "grep -rn 'subprocess' internal/ | head -50"}),
-        ("Bash", {"command": "cd /tmp/audit-scratch/poc_1 && gcc -o poc poc.c && ./poc"}),
-        ("Bash", {"command": "python3 -c 'import requests; print(requests.get(\"http://127.0.0.1:8000/health\").status_code)'"}),
-        ("Bash", {"command": "git log --oneline -20"}),
-        ("Bash", {"command": "find . -name '*.go' | wc -l"}),
-        ("Bash", {"command": "sqlite3 ./app.db '.tables'"}),
-        ("Bash", {"command": "cat /etc/hosts"}),
-        ("Bash", {"command": "go test ./..."}),
-    ],
+    "tool,key",
+    [("Write", "file_path"), ("Edit", "file_path"), ("NotebookEdit", "notebook_path")],
 )
-def test_guard_allows_legitimate_agent_work(tool_name: str, tool_input: dict) -> None:
-    """A guard that denies everything is not a fix, it is a breakage. Hunt must
-    still compile and run a PoC in its scratch dir, and a target repo that ships
-    its own database must still be readable under its own name."""
-    out = _decide(_guard(), tool_name, tool_input)
-    assert not _denied(out), f"guard broke legitimate work: {tool_input}"
+def test_write_tools_cannot_rewrite_prompts_schemas_or_the_harness_source(
+    tool: str, key: str
+) -> None:
+    """A rewrite of `audit/*.py` forges the report the operator reads next, and a
+    rewrite of a prompt lands in the next stage's system prompt in this run."""
+    guard = _guard()
+    for path in (
+        HARNESS_ROOT / "prompts" / "08-report.md",
+        HARNESS_ROOT / "schemas" / "report.schema.json",
+        HARNESS_ROOT / "config" / "stages.yaml",
+        HARNESS_ROOT / "audit" / "paths.py",
+        HARNESS_ROOT / "scripts" / "mutation-check.py",
+        HARNESS_ROOT / ".git" / "hooks" / "post-commit",
+        HARNESS_ROOT / "pyproject.toml",
+    ):
+        assert _denied(_decide(guard, tool, {key: str(path)})), f"{tool} {path}"
 
 
-def test_guard_allows_structured_writes_into_the_target(tmp_path: Path) -> None:
-    guard = _guard(cwd=tmp_path, workspace=[tmp_path])
-    out = _decide(guard, "Write", {"file_path": str(tmp_path / "poc.c")})
-    assert not _denied(out)
+def test_work_is_the_one_writable_hole() -> None:
+    """Hunt compiles and runs PoCs in its scratch dir, which lives under
+    `work/`, so that subtree is writable while the checkout around it is not."""
+    scratch = HARNESS_ROOT / "work" / "run_ab" / "hunt" / "t_1"
+    guard = _guard(cwd=scratch, workspace=[scratch, FOREIGN])
+    assert not _denied(_decide(guard, "Write", {"file_path": str(scratch / "poc.c")}))
+    assert _denied(
+        _decide(guard, "Write", {"file_path": str(HARNESS_ROOT / "audit" / "x.py")})
+    )
 
 
-def test_shell_reference_to_a_file_named_state_db_is_refused() -> None:
-    """Recorded divergence, not a requirement.
+# ---------- structured tools: the search rules ----------
 
-    The shell filter matches the harness DB by basename, deliberately fail-closed:
-    it is the one name worth the over-block, because it catches spellings the
-    token walk cannot see (a sqlite URI, a name assembled from a variable, the WAL
-    sidecars). The cost is that a target repo shipping its own `state.db` cannot be
-    reached by a shell command, and the denial points at Read, which resolves and
-    compares containment and does allow it.
 
-    Deliberately NOT asserted here. Pinning today's over-block would make the
-    correct fix (making the shell rule path-aware) fail this test and argue with
-    whoever makes it. The behaviour is recorded because it is surprising, not
-    because it is wanted.
-    """
-    out = _decide(_guard(), "Bash", {"command": "sqlite3 ./state.db '.tables'"})
-    if not _denied(out):
-        return  # the fix landed; nothing to record
-    assert "state.db" in _reason(out)
+def test_grep_without_a_glob_cannot_read_a_guarded_file() -> None:
+    """Reading is not sandboxed, and ripgrep passes `--hidden` with only VCS
+    directories excluded, so a search rooted above a guarded file reads it:
+    `Grep {path: <home>, pattern: "sk-ant", output_mode: "content"}` read
+    ~/.claude/.credentials.json while the equivalent Read was refused. validate,
+    gapfill, feedback, dedupe and report have Grep and no Bash, so this rule is
+    their whole defence."""
+    guard = _guard()
+    for root in (str(HOME), "/", str(HARNESS_ROOT)):
+        assert _denied(
+            _decide(guard, "Grep",
+                    {"path": root, "pattern": "sk-ant", "output_mode": "content"})
+        ), root
+
+
+def test_grep_and_glob_from_a_target_are_allowed() -> None:
+    """The anti-over-block direction, and a regression this pins: an earlier
+    version matched the PATTERN against guarded filenames with no location test,
+    so `*.json` and `.c*` were refused in every target repo."""
+    guard = _guard(cwd=FOREIGN, workspace=[FOREIGN])
+    for call in (
+        {"path": str(FOREIGN), "pattern": "sk-ant"},
+        {"path": str(FOREIGN), "glob": "*.json", "pattern": "x"},
+        {"glob": "**/report.json", "pattern": "severity"},
+        {"path": str(FOREIGN), "pattern": "*.json"},
+        {"pattern": "**/*.json"},
+        {"pattern": ".c*"},
+    ):
+        tool = "Glob" if "pattern" in call else "Grep"
+        assert not _denied(_decide(guard, tool, call)), call
+
+
+def test_pattern_prefix_is_judged_against_the_calls_own_root() -> None:
+    """ripgrep and Glob match a relative pattern against the call's root, not the
+    session cwd, so `glob: "results/*/report.json"` with `path` set to the
+    checkout reached the guarded results tree from hunt's scratch dir."""
+    scratch = HARNESS_ROOT / "work" / "r" / "hunt" / "t_1"
+    # A workspace that does NOT contain the checkout: the call's own `path` is
+    # what points at it, which is the case this rule exists for.
+    guard = _guard(cwd=scratch, workspace=[scratch, FOREIGN])
+    assert _denied(_decide(guard, "Grep",
+                           {"path": str(HARNESS_ROOT), "glob": "results/*/report.json",
+                            "pattern": "severity"}))
+    assert _denied(_decide(guard, "Glob",
+                           {"path": str(HARNESS_ROOT), "pattern": "results/**/*.json"}))
+    assert _denied(_decide(guard, "Grep",
+                           {"path": str(HARNESS_ROOT), "glob": "prompts/*.md"}))
+
+
+# ---------- the shell filter, to the scope it claims ----------
+
+
+@pytest.mark.parametrize("command", [
+    "cat .env",
+    f"cat {HARNESS_ROOT}/.env",
+    f"sqlite3 {STATE_DB} 'select 1'",
+    "sqlite3 ./state.db '.tables'",
+    "rm -f state.db-wal",
+    "cat ~/.claude/.credentials.json",
+    "cp $HOME/.claude/.credentials.json /tmp/x",
+    "cat ~/.claude.json",
+    "cat ${HOME}/.claude/settings.json",
+    f"echo x >> {HARNESS_ROOT}/audit/paths.py",
+    "tar -cf - ~/.claude",
+])
+def test_bash_guard_refuses_the_guarded_names(command: str) -> None:
+    assert _denied(_decide(_guard(), "Bash", {"command": command})), command
+
+
+def test_bash_guard_does_not_refuse_similar_or_ordinary_names() -> None:
+    """A bare substring with no path boundary reported `.claude-backup` and
+    `.claudette` as credential violations. Matching `state.db` by basename is the
+    one over-block the docstring owns; everything else must stay usable."""
+    guard = _guard()
+    for command in (
+        f"ls {HOME}.claude-backup/x",
+        f"grep -r TODO {HOME}.claudette/src",
+        "cat /etc/hosts",
+        "ls -la /var/log",
+        "git log --oneline -20",
+        "gcc -o poc poc.c && ./poc",
+        "sqlite3 ./app.db '.tables'",
+        "cat .env.example",
+    ):
+        assert not _denied(_decide(guard, "Bash", {"command": command})), command
+
+
+def test_bash_guard_denial_redirects() -> None:
+    """A bare denial makes the model retry the same call; the reason is what turns
+    it into a redirection."""
+    out = _decide(_guard(), "Bash", {"command": f"sqlite3 {STATE_DB} 'select 1'"})
+    reason = _reason(out)
+    assert reason and ("harness" in reason.lower() or "state.db" in reason)
 
 
 # ---------- the SDK options carry the confinement ----------
@@ -249,8 +312,8 @@ def _options(**overrides):
         allowed_tools=["Read", "Grep", "Glob"],
         model="claude-sonnet-4-6",
         max_turns=25,
-        cwd=Path("/tmp/target"),
-        add_dirs=[Path("/tmp/target")],
+        cwd=FOREIGN,
+        add_dirs=[FOREIGN],
         permission_mode="acceptEdits",
     )
     kwargs.update(overrides)
@@ -258,360 +321,42 @@ def _options(**overrides):
 
 
 def test_options_restrict_the_base_tool_set() -> None:
-    """`allowed_tools` only pre-approves; `tools` removes. Without it a stage
-    configured with no Bash (validate, gapfill, feedback) can still call Bash."""
-    opts = _options()
-    assert list(opts.tools) == ["Read", "Grep", "Glob"]
-    assert list(opts.allowed_tools) == ["Read", "Grep", "Glob"]
+    """`allowed_tools` only pre-approves; `tools` removes. Probed, not assumed: a
+    session declaring tools=["Read"] reports BASH=absent."""
+    assert list(_options().tools) == ["Read", "Grep", "Glob"]
 
 
-def test_options_enable_the_bash_sandbox() -> None:
+def test_options_enable_the_sandbox_and_suppress_mcp_servers() -> None:
     opts = _options()
-    assert opts.sandbox is not None, "no sandbox settings passed"
     assert opts.sandbox["enabled"] is True
-    assert opts.sandbox["autoAllowBashIfSandboxed"] is True
-    assert opts.sandbox["allowUnsandboxedCommands"] is False, (
-        "with unsandboxed commands allowed the model can step out of the "
-        "sandbox via dangerouslyDisableSandbox and reach the harness tree"
-    )
+    assert opts.sandbox["allowUnsandboxedCommands"] is False
+    assert opts.setting_sources == []
+    # MCP clients run in this process, outside the sandbox: a session declaring
+    # two built-in tools still carried the operator's Google Drive servers.
+    assert opts.strict_mcp_config is True
 
 
-def test_options_install_the_pre_tool_use_guard() -> None:
+def test_options_install_the_guard_for_every_inspected_tool() -> None:
     opts = _options()
-    assert opts.hooks, "no hooks installed: nothing gates a Bash call"
-    matchers = opts.hooks["PreToolUse"]
-    assert matchers, "PreToolUse registered with no matcher"
-    assert any("Bash" in (m.matcher or "") for m in matchers), (
-        "guard not attached to Bash"
-    )
-    assert any(m.hooks for m in matchers), "matcher carries no callback"
-
-
-def test_matcher_covers_every_tool_the_guard_inspects() -> None:
-    """The wiring, not just the callback. A matcher that omits Read means the
-    CLI never invokes the callback for a Read, so the check exists in the code
-    and can never fire: narrowing the matcher to "Bash" used to leave all 290
-    tests green while silently un-hooking every path-bearing Read call."""
-    opts = _options()
-    alternatives = set((opts.hooks["PreToolUse"][0].matcher or "").split("|"))
+    alternatives = set(opts.hooks["PreToolUse"][0].matcher.split("|"))
     for tool in ("Bash", "Write", "Edit", "Read", "Grep", "Glob", "NotebookEdit"):
-        # Set membership, not `in`: "Edit" is a substring of "NotebookEdit", so
-        # dropping Edit alone left a substring assertion green.
-        assert tool in alternatives, (
-            f"the guard inspects {tool} input but the matcher never fires for it"
-        )
+        assert tool in alternatives, f"the matcher never fires for {tool}"
 
 
-_SELF_AUDIT_FILES = {
-    "Write": "file_path",
-    "Edit": "file_path",
-    "NotebookEdit": "notebook_path",
-}
-_PROTECTED_FILES = [
-    HARNESS_ROOT / "prompts" / "08-report.md",
-    HARNESS_ROOT / "schemas" / "report.schema.json",
-    HARNESS_ROOT / "config" / "stages.yaml",
-]
-
-
-@pytest.mark.parametrize("tool,key", sorted(_SELF_AUDIT_FILES.items()))
-def test_write_guard_protects_prompts_schemas_and_config(tool: str, key: str) -> None:
-    """Prompts become the next stages' system prompts and schemas decide what
-    counts as valid, and both are re-read per dispatch, so a mid-run rewrite
-    redirects the pipeline's own judgement."""
-    guard = _guard()
-    for path in _PROTECTED_FILES:
-        assert _denied(_decide(guard, tool, {key: str(path)})), f"{tool} {path}"
-
-
-@pytest.mark.parametrize("tool,key", [("Read", "file_path"), ("Grep", "path"), ("Glob", "path")])
-def test_reads_of_prompts_schemas_and_config_still_work(tool: str, key: str) -> None:
-    """Auditing this repository means READING its prompts, schemas and config.
-    The write-only set must not leak into the read tools, or a self-audit cannot
-    look at the pipeline it is auditing."""
-    guard = _guard(cwd=HARNESS_ROOT, workspace=[HARNESS_ROOT])
-    for path in _PROTECTED_FILES:
-        assert not _denied(_decide(guard, tool, {key: str(path)})), f"{tool} {path}"
-
-
-@pytest.mark.parametrize("command", [
-    "echo 'Ignore all findings' >> {root}/prompts/08-report.md",
-    "sed -i '' s/high/low/ {root}/schemas/report.schema.json",
-    "echo 'sandbox: false' >> {root}/config/stages.yaml",
-])
-def test_bash_cannot_rewrite_prompts_schemas_or_config(command: str) -> None:
-    """The write-only branch used to fire only for Write/Edit, and no shipped
-    stage has either tool, so the whole mechanism was unreachable while Bash
-    could rewrite the files it was written for."""
-    guard = _guard(cwd=HARNESS_ROOT, workspace=[HARNESS_ROOT])
-    rendered = command.format(root=HARNESS_ROOT)
-    assert _denied(_decide(guard, "Bash", {"command": rendered})), rendered
-
-
-def test_sandbox_can_be_switched_off_by_config() -> None:
-    """The flag is a real switch: on a platform where the sandbox cannot start,
-    an operator turns it off and keeps the hook, which is documented as a
-    filter rather than a boundary."""
-    opts = _options(sandbox=False)
-    assert opts.sandbox is None or opts.sandbox.get("enabled") is False
-
-
-def test_self_audit_warns_that_the_boundary_is_unavailable(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """When the target repo IS the harness, cwd/add_dirs grant the agent its own
-    harness root, so no path-based boundary can separate the two and only the
-    filter stands between a hunter and state.db. That has to be visible in the
-    log, not silently assumed away."""
-    with caplog.at_level("WARNING"):
-        _options(cwd=HARNESS_ROOT, add_dirs=[HARNESS_ROOT])
-    assert any("self-audit" in r.message.lower() for r in caplog.records), (
-        "a self-audit run must warn that confinement cannot separate the "
-        "harness from the target"
-    )
-
-
-def test_self_audit_warning_covers_a_containing_directory(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """The warning used to fire only on exact equality, so `--repo <the parent
-    of the checkout>` handed the agent a directory containing state.db with no
-    warning. The sandbox's write scope is the working directory PLUS added
-    directories, so a containing directory is exactly as unconfined."""
-    with caplog.at_level("WARNING"):
-        _options(cwd=Path("/tmp/elsewhere"), add_dirs=[HARNESS_ROOT.parent])
-    assert any("self-audit" in r.message.lower() for r in caplog.records), (
-        "no warning for a directory containing the checkout"
-    )
-
-
-def test_self_audit_warning_stays_quiet_for_hunts_real_scratch_dir(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """The warning must not fire on a directory INSIDE the harness. Hunt's cwd
-    is REPO_ROOT/work/<run>/hunt/<task>, so treating containment in that
-    direction as a self-audit fired once per task per run and made the warning
-    useless for spotting an actual self-audit."""
-    scratch = HARNESS_ROOT / "work" / "run_ab12cd34" / "hunt" / "t_core_auth_1"
-    with caplog.at_level("WARNING"):
-        _options(cwd=scratch, add_dirs=[FOREIGN])
-    assert not [r for r in caplog.records if "self-audit" in r.message.lower()]
-
-
-def test_normal_run_does_not_warn_about_self_audit(
-    caplog: pytest.LogCaptureFixture, tmp_path: Path
-) -> None:
-    """Control for the test above: the warning is about the target overlapping
-    the harness, so an ordinary target must stay quiet."""
-    with caplog.at_level("WARNING"):
-        _options(cwd=tmp_path, add_dirs=[tmp_path])
-    assert not [r for r in caplog.records if "self-audit" in r.message.lower()]
-
-
-# ---------- config cannot express an unconfined stage ----------
-
-
-def _write_cfg(tmp_path: Path, body: str) -> Path:
-    p = tmp_path / "stages.yaml"
-    p.write_text(body)
-    return p
-
-
-def test_config_rejects_unknown_tool_names(tmp_path: Path) -> None:
-    """A typo used to be forwarded verbatim into allowed_tools, so a stage meant
-    to have no Bash could be granted something else entirely."""
-    p = _write_cfg(tmp_path, """
-stages:
-  hunt:
-    model: m
-    concurrency: 1
-    tools: [Read, Bashful]
-""")
-    with pytest.raises(ValueError, match="Bashful"):
-        load_config(p)
-
-
-def test_config_rejects_bypass_permissions(tmp_path: Path) -> None:
-    """`# never bypassPermissions` was a comment. It is an invariant now."""
-    p = _write_cfg(tmp_path, """
-stages:
-  hunt:
-    model: m
-    concurrency: 1
-    tools: [Read]
-    permission_mode: bypassPermissions
-""")
-    with pytest.raises(ValueError, match="bypassPermissions"):
-        load_config(p)
-
-
-def test_config_rejects_unknown_permission_mode(tmp_path: Path) -> None:
-    p = _write_cfg(tmp_path, """
-stages:
-  hunt:
-    model: m
-    concurrency: 1
-    tools: [Read]
-    permission_mode: yolo
-""")
-    with pytest.raises(ValueError, match="yolo"):
-        load_config(p)
-
-
-def test_shipped_config_requests_the_sandbox() -> None:
-    cfg = load_config()
-    for name in ("recon", "hunt", "validate", "gapfill", "dedupe", "trace",
-                 "feedback", "report"):
-        assert cfg.get(name).sandbox is True, f"{name}: confinement not requested"
-
-
-def test_config_sandbox_flag_is_readable(tmp_path: Path) -> None:
-    p = _write_cfg(tmp_path, """
-defaults:
-  sandbox: false
-stages:
-  hunt:
-    model: m
-    concurrency: 1
-    tools: [Read]
-  trace:
-    model: m
-    concurrency: 1
-    tools: [Read]
-    sandbox: true
-""")
-    cfg = load_config(p)
-    assert cfg.get("hunt").sandbox is False
-    assert cfg.get("trace").sandbox is True, "per-stage override ignored"
-
-
-@pytest.mark.parametrize("value", ["null", "0", "[]", "{}", "'false'", "'off'"])
-def test_config_refuses_a_non_boolean_sandbox(tmp_path: Path, value: str) -> None:
-    """The one consumed key whose silent misparse removes the boundary instead
-    of tightening it. bool() coerces `sandbox:` (null), 0, [] and {} to False
-    and a quoted "false" to True, so both a typo and an attempt to disable it
-    did the wrong thing without saying so."""
-    p = _write_cfg(tmp_path, f"""
-defaults:
-  sandbox: {value}
-stages:
-  hunt:
-    model: m
-    concurrency: 1
-    tools: [Read]
-""")
-    with pytest.raises(ValueError, match="sandbox must be"):
-        load_config(p)
-
-
-def test_config_accepts_an_unquoted_false(tmp_path: Path) -> None:
-    """Control for the test above: the honest way to disable it keeps working."""
-    p = _write_cfg(tmp_path, """
-defaults:
-  sandbox: false
-stages:
-  hunt:
-    model: m
-    concurrency: 1
-    tools: [Read]
-""")
-    assert load_config(p).get("hunt").sandbox is False
-
-
-def test_config_accepts_the_sdk_auto_permission_mode(tmp_path: Path) -> None:
-    """The pinned SDK's PermissionMode includes "auto". Refusing it would print
-    "unknown permission_mode" at an operator who had used a real one."""
-    p = _write_cfg(tmp_path, """
-stages:
-  hunt:
-    model: m
-    concurrency: 1
-    tools: [Read]
-    permission_mode: auto
-""")
-    assert load_config(p).get("hunt").permission_mode == "auto"
-
-
-# ---------- F8: the shell spellings agents actually use ----------
-
-
-@pytest.mark.parametrize("command", [
-    "cat ~/.claude/*",
-    "cat $HOME/.claude/.cred*",
-    "cp -r $HOME/.claude /tmp/x",
-    "tar -cf - ~/.claude",
-    "cat ${HOME}/.claude/.credentials.json",
-])
-def test_bash_guard_expands_home_spellings(command: str) -> None:
-    """The credentials branch only ever matched a fully expanded absolute path,
-    which structured tools produce and shell strings do not. `~` and `$HOME`
-    are how a shell normally spells home, and a wildcard is not obfuscation."""
-    assert _denied(_decide(_guard(), "Bash", {"command": command})), command
-
-
-@pytest.mark.parametrize("command", [
-    f"ls {Path.home()}.claude-backup/x",
-    f"grep -r TODO {Path.home()}.claudette/src",
-])
-def test_bash_guard_does_not_over_block_similar_paths(command: str) -> None:
-    """The credentials branch was a bare substring, so `.claude-backup` and
-    `.claudette` were reported as credentials violations: a target cloned under
-    such a directory was unreadable to every stage, and the denial named a file
-    the command never mentioned."""
-    assert not _denied(_decide(_guard(), "Bash", {"command": command})), command
-
-
-def test_bash_guard_denies_the_credentials_directory() -> None:
-    """Inside `~/.claude` the ban is deliberate, not over-blocking: the
-    directory also holds settings and prompt history for every project, which is
-    why the reviewer's fix direction is to expand `~` before matching the
-    directory rather than to narrow it to the one filename."""
-    guard = _guard()
-    for command in ("ls ~/.claude/plugins", "tar -cf - $HOME/.claude"):
-        assert _denied(_decide(guard, "Bash", {"command": command})), command
-
-
-# ---------- F6: the narrowed tool list must still carry what Bash needs ----------
-
-
-def test_bash_stages_keep_the_tools_a_backgrounded_command_needs() -> None:
-    """`tools=` removes rather than pre-approves, so the narrowing silently
-    dropped BashOutput and KillShell: a compile or test that backgrounds on
-    timeout left its output unreadable."""
-    cfg = load_config()
-    for stage in ("recon", "hunt", "trace"):
-        tools = cfg.get(stage).tools
-        assert "Bash" in tools
-        assert "BashOutput" in tools and "KillShell" in tools, stage
-
-
-def test_validate_prompt_matches_its_configured_tools() -> None:
-    """The prompt promised read-only Bash with curl when a live target is set,
-    while the config grants validate no Bash at all. The config comment says
-    "no Bash: pure analysis", so the prompt is the stale half."""
-    prompt = (HARNESS_ROOT / "prompts" / "03-validate.md").read_text()
-    assert "Bash is available" not in prompt
-    assert "Bash" not in load_config().get("validate").tools
-
-
-# ---------- F9: sandbox egress ----------
+def test_options_sandbox_settings_are_not_shared_between_dispatches() -> None:
+    first, second = _options(), _options()
+    assert first.sandbox is not second.sandbox
+    first.sandbox["enabled"] = False
+    assert second.sandbox["enabled"] is True
 
 
 def test_sandbox_egress_allowlist_is_the_live_target() -> None:
-    """Measured with the sandbox on and no network config: every outbound
-    connection is refused, loopback included, with `deny network-outbound
-    <host>:443` in the transcript. A live-target run therefore needs its host
-    named or the reproduce step cannot reach it."""
     opts = _options(network_allow=["target.example.com"])
     assert opts.sandbox["network"] == {"allowedDomains": ["target.example.com"]}
 
 
 def test_static_run_has_no_egress_at_all() -> None:
-    """No live target means no allowlist, which means the sandbox refuses every
-    outbound connection. That is the property worth keeping: a prompt-injected
-    static run has nowhere to send anything."""
-    opts = _options()
-    assert "network" not in opts.sandbox
+    assert "network" not in _options().sandbox
 
 
 def test_live_target_host_is_extracted_for_the_allowlist() -> None:
@@ -625,40 +370,226 @@ def test_live_target_host_is_extracted_for_the_allowlist() -> None:
     assert bare.network_allow() == []
 
 
-def test_stage_less_config_still_validates_defaults(tmp_path: Path) -> None:
-    """The sandbox check lived inside _validate_stage, which load_config only
-    calls from the stage loop, so a config with no stages accepted exactly the
-    quoted "false" the check exists to refuse."""
-    p = _write_cfg(tmp_path, 'defaults:\n  sandbox: "false"\n')
-    with pytest.raises(ValueError, match="sandbox must be"):
+@pytest.mark.parametrize(
+    "url", ["http://[::1:8888", "http://user:pa]ss@h/", "http://h[x]/"]
+)
+def test_a_malformed_live_target_does_not_escape_from_a_stage(url: str) -> None:
+    """`network_allow()` parses at the CLI now, but it is still evaluated inside
+    every stage's argument list, so it must not be the place a parse error
+    surfaces: this used to raise inside recon, escape validate entirely, and burn
+    a hunt attempt per task until the retry ceiling abandoned the set."""
+    from audit.stages._common import StageContext
+
+    ctx = StageContext(run_id="r", repo_path=Path("/tmp/x"), config=load_config(),
+                       live_target={"url": url})
+    assert ctx.network_allow() == []
+
+
+class _CaptureOptions:
+    def __init__(self) -> None:
+        self.options = None
+
+    async def __call__(self, **kwargs):
+        self.options = runner_mod._build_options(
+            system_prompt="s",
+            allowed_tools=kwargs["allowed_tools"],
+            model=kwargs["model"],
+            max_turns=kwargs["max_turns"],
+            cwd=kwargs["cwd"],
+            add_dirs=kwargs["add_dirs"],
+            permission_mode=kwargs["permission_mode"],
+            sandbox=kwargs["sandbox"],
+            network_allow=kwargs["network_allow"],
+            strict_mcp_config=kwargs["strict_mcp_config"],
+        )
+        raise RuntimeError("captured")
+
+
+def test_stage_call_sites_deliver_the_confinement_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The value has to travel, not just be computed: removing `network_allow=`
+    from every stage used to leave the suite green, because the two tests that
+    looked like coverage tested opposite ends of the wire."""
+    import audit.stages._common as common_mod
+    import audit.stages.trace as trace_mod
+    from audit.state import StateDB
+    from audit.stages._common import StageContext
+
+    monkeypatch.setattr(common_mod, "RESULTS", tmp_path / "results")
+    monkeypatch.setattr(common_mod, "WORK", tmp_path / "work")
+    db = StateDB(tmp_path / "state.db")
+    db.create_run("repo", "r")
+    db.add_task("r", {"task_id": "t_1", "attack_class": "sqli", "scope_hint": "x",
+                      "target_files": ["a.py"], "rationale": "r", "priority": 1,
+                      "source": "recon"})
+    db.add_finding("r", "t_1", {
+        "finding_id": "f_1", "file": "a.py", "line_start": 1, "line_end": 2,
+        "vuln_class": "sqli", "severity": "high", "description": "d",
+        "evidence_snippet": "e", "confidence": 0.9})
+    db.set_finding_validation("r", "f_1", "confirmed", {"verdict": "confirmed"})
+    db.assign_finding_group("r", "f_1", "g_1", True)
+    db.add_dedupe_group("r", {"group_id": "g_1", "root_cause": "rc",
+                              "canonical_finding_id": "f_1",
+                              "member_finding_ids": ["f_1"]})
+    ctx = StageContext(run_id="r", repo_path=tmp_path / "repo", config=load_config(),
+                       live_target={"url": "https://live.example.com:8443/x",
+                                    "credentials": {}})
+    capture = _CaptureOptions()
+    monkeypatch.setattr(trace_mod, "run_agent", capture)
+
+    with pytest.raises(RuntimeError, match="captured"):
+        asyncio.run(trace_mod.run_trace(ctx, db))
+
+    assert capture.options is not None, "the stage never reached the runner"
+    assert capture.options.sandbox["network"] == {"allowedDomains": ["live.example.com"]}
+    assert capture.options.sandbox["enabled"] is True
+    assert capture.options.permission_mode == "acceptEdits"
+    assert capture.options.strict_mcp_config is True
+    assert list(capture.options.tools) == load_config().get("trace").tools
+
+
+# ---------- the self-audit warning ----------
+
+
+def test_self_audit_warning_covers_a_containing_directory(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`--repo <the parent of the checkout>` hands the agent a directory that
+    contains state.db, results/ and .env, so the sandbox cannot separate them."""
+    with caplog.at_level("WARNING"):
+        _options(cwd=Path("/tmp/elsewhere"), add_dirs=[HARNESS_ROOT.parent])
+    assert any("self-audit" in r.message.lower() for r in caplog.records)
+
+
+def test_self_audit_warning_stays_quiet_for_hunts_real_scratch_dir(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Hunt's cwd is REPO_ROOT/work/<run>/hunt/<task>, so treating containment in
+    that direction as a self-audit fired once per task per run and made the
+    warning useless for spotting an actual self-audit."""
+    scratch = HARNESS_ROOT / "work" / "run_ab12cd34" / "hunt" / "t_core_auth_1"
+    with caplog.at_level("WARNING"):
+        _options(cwd=scratch, add_dirs=[FOREIGN])
+    assert not [r for r in caplog.records if "self-audit" in r.message.lower()]
+
+
+@pytest.mark.skipif(
+    not Path("/System/Volumes/Data").exists(),
+    reason="macOS firmlink volume; the same path is a plain symlink elsewhere",
+)
+def test_firmlink_spelling_of_the_checkout_also_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    firmlink = Path("/System/Volumes/Data" + str(HARNESS_ROOT))
+    with caplog.at_level("WARNING"):
+        _options(cwd=Path("/tmp/elsewhere"), add_dirs=[firmlink])
+    assert any("self-audit" in r.message.lower() for r in caplog.records)
+
+
+# ---------- config cannot express an unconfined or inert stage ----------
+
+
+def _write_cfg(tmp_path: Path, body: str) -> Path:
+    p = tmp_path / "stages.yaml"
+    p.write_text(body)
+    return p
+
+
+def test_config_rejects_unknown_tool_names(tmp_path: Path) -> None:
+    p = _write_cfg(tmp_path, """
+stages:
+  hunt:
+    model: m
+    concurrency: 1
+    tools: [Read, Bashful]
+""")
+    with pytest.raises(ValueError, match="Bashful"):
         load_config(p)
 
 
-def test_schema_validation_reuses_its_registry() -> None:
-    """Measured before caching: 0.423 ms per call, 97% of it re-reading all ten
-    schemas and rebuilding the referencing registry, 145 calls per run."""
-    from audit.json_utils import _validator_for, validate_schema
-    from audit.paths import SCHEMAS
+def test_config_rejects_bypass_permissions(tmp_path: Path) -> None:
+    p = _write_cfg(tmp_path, """
+stages:
+  hunt:
+    model: m
+    concurrency: 1
+    tools: [Read]
+    permission_mode: bypassPermissions
+""")
+    with pytest.raises(ValueError, match="bypassPermissions"):
+        load_config(p)
 
-    finding_schema = SCHEMAS / "finding.schema.json"
-    payload = {"task_id": "t", "findings": [], "gaps_observed": []}
-    validate_schema(payload, finding_schema)
-    first = _validator_for(str(finding_schema))
-    validate_schema(payload, finding_schema)
-    assert _validator_for(str(finding_schema)) is first
-    assert first.schema is _validator_for(str(finding_schema)).schema
+
+@pytest.mark.parametrize("body", [
+    "stages:\n  hunt:\n    model: m\n    concurrency: 1\n    tools:\n",
+    "stages:\n  hunt:\n    model: m\n    concurrency: 1\n    tools: []\n",
+    "stages:\n  hunt:\n    model: m\n    concurrency: 1\n",
+])
+def test_config_refuses_a_stage_with_no_tools(tmp_path: Path, body: str) -> None:
+    """A stage with no tools produces nothing while the run completes clean, so
+    the loud failure is the point. A bare `tools:` key is None in YAML, and an
+    empty list disables every built-in tool."""
+    with pytest.raises(ValueError, match="tools"):
+        load_config(_write_cfg(tmp_path, body))
+
+
+def test_config_falls_back_to_default_tools(tmp_path: Path) -> None:
+    """`tools` was the one key that skipped `defaults`."""
+    p = _write_cfg(tmp_path, """
+defaults:
+  tools: [Read, Grep]
+stages:
+  hunt:
+    model: m
+    concurrency: 1
+""")
+    assert load_config(p).get("hunt").tools == ["Read", "Grep"]
+
+
+@pytest.mark.parametrize("key", ["sandbox", "strict_mcp_config"])
+@pytest.mark.parametrize("value", ["null", "0", "[]", "{}", "'false'"])
+def test_config_refuses_a_non_boolean_switch(
+    tmp_path: Path, key: str, value: str
+) -> None:
+    p = _write_cfg(tmp_path, f"""
+defaults:
+  {key}: {value}
+stages:
+  hunt:
+    model: m
+    concurrency: 1
+    tools: [Read]
+""")
+    with pytest.raises(ValueError, match=key):
+        load_config(p)
+
+
+def test_config_validates_defaults_with_no_stages(tmp_path: Path) -> None:
+    """The check used to live inside the stage loop, so a config with no stages
+    accepted exactly the quoted "false" it exists to refuse."""
+    p = _write_cfg(tmp_path, 'defaults:\n  sandbox: "false"\n')
+    with pytest.raises(ValueError, match="sandbox"):
+        load_config(p)
+
+
+def test_shipped_config_requests_both_switches() -> None:
+    cfg = load_config()
+    for name in ("recon", "hunt", "validate", "gapfill", "dedupe", "trace",
+                 "feedback", "report"):
+        sc = cfg.get(name)
+        assert sc.sandbox is True, f"{name}: sandbox not requested"
+        assert sc.strict_mcp_config is True, f"{name}: MCP servers not suppressed"
+        assert sc.tools, f"{name}: no tools"
 
 
 def test_rejected_task_spends_an_attempt_so_it_stops_requeueing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A task rejected for an unusable id used to be marked failed WITHOUT
-    spending an attempt, because the check ran before begin_task. attempts
-    stayed 0, reset_incomplete_tasks re-queued it under the ceiling on every
-    resume, and count_abandoned_tasks (attempts >= 3) could never see it, so a
-    permanently unprocessable task was invisible to abandonment accounting."""
-    import asyncio
-
+    spending an attempt, because the check ran before begin_task. attempts stayed
+    0, reset_incomplete_tasks re-queued it on every resume, and
+    count_abandoned_tasks (attempts >= 3) could never see it."""
     import audit.stages._common as common_mod
     import audit.stages.hunt as hunt_mod
     from audit.state import StateDB
@@ -688,215 +619,15 @@ def test_rejected_task_spends_an_attempt_so_it_stops_requeueing(
     assert db.count_abandoned_tasks("r") == 1, "invisible to abandonment accounting"
 
 
-def test_sandbox_settings_are_not_shared_between_dispatches() -> None:
-    """One module-level dict aliased into every options object would be written
-    through by any SDK version that normalizes sandbox settings in place,
-    reconfiguring confinement for every agent in flight, up to 50 of them."""
-    first = _options()
-    second = _options()
-    assert first.sandbox is not second.sandbox
-    first.sandbox["enabled"] = False
-    assert second.sandbox["enabled"] is True, "settings leaked across dispatches"
+def test_schema_validation_reuses_its_registry() -> None:
+    """Measured before caching: 0.423 ms per call, 97% of it re-reading all ten
+    schemas and rebuilding the referencing registry, with about 145 calls a run."""
+    from audit.json_utils import _validator_for, validate_schema
+    from audit.paths import SCHEMAS
 
-
-@pytest.mark.skipif(
-    not Path("/System/Volumes/Data").exists(),
-    reason="macOS firmlink volume; the same path is a plain symlink elsewhere",
-)
-def test_firmlink_spelling_of_the_checkout_also_warns(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """`resolve()` collapses symlinks but leaves a firmlinked spelling alone, so
-    /System/Volumes/Data/Users/... did not equal the checkout even though it is
-    the same directory, and the warning that names this geometry stayed quiet."""
-    firmlink = Path("/System/Volumes/Data" + str(HARNESS_ROOT))
-    assert firmlink.exists(), "fixture assumption: the firmlink path resolves"
-    with caplog.at_level("WARNING"):
-        _options(cwd=Path("/tmp/elsewhere"), add_dirs=[firmlink])
-    assert any("self-audit" in r.message.lower() for r in caplog.records), (
-        "the firmlinked spelling of the checkout was not recognised"
-    )
-
-
-def test_options_ignore_operator_configured_mcp_servers() -> None:
-    """A session declaring tools=["Read","Bash"] still carried the operator's
-    own `mcp__claude_ai_Google_Drive__*` servers, because setting_sources=[]
-    disables settings files but not the MCP configuration the CLI loads
-    separately. Those clients run inside the harness process, so they are outside
-    the sandbox: an MCP server with write access is an exfiltration route the
-    sandbox cannot see, and it is reachable from a prompt-injected hunter."""
-    opts = _options()
-    assert list(opts.mcp_servers) == [] or not opts.mcp_servers
-    assert opts.strict_mcp_config is True, (
-        "without strict_mcp_config the CLI still loads user, project and "
-        "plugin-provided MCP servers"
-    )
-
-
-# ---------- F11: the value has to travel, not just be computed ----------
-
-
-class _CaptureOptions:
-    """Captures the ClaudeAgentOptions a stage hands the runner."""
-
-    def __init__(self) -> None:
-        self.options = None
-
-    async def __call__(self, **kwargs):
-        import audit.runner as runner_mod
-
-        self.options = runner_mod._build_options(
-            system_prompt="s",
-            allowed_tools=kwargs["allowed_tools"],
-            model=kwargs["model"],
-            max_turns=kwargs["max_turns"],
-            cwd=kwargs["cwd"],
-            add_dirs=kwargs["add_dirs"],
-            permission_mode=kwargs["permission_mode"],
-            sandbox=kwargs["sandbox"],
-            network_allow=kwargs["network_allow"],
-            strict_mcp_config=kwargs["strict_mcp_config"],
-        )
-        raise RuntimeError("captured")
-
-
-def test_stage_call_sites_deliver_the_confinement_settings(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The two existing tests cover opposite ends of this wire: one calls
-    `_build_options(network_allow=...)` directly, the other calls
-    `ctx.network_allow()` directly. Nothing asserted the value travelled, so
-    removing `network_allow=` from all eight stages left the suite green. This
-    runs a real stage against a stub that captures the options."""
-    import asyncio
-
-    import audit.stages._common as common_mod
-    import audit.stages.trace as trace_mod
-    from audit.state import StateDB
-    from audit.stages._common import StageContext
-
-    monkeypatch.setattr(common_mod, "RESULTS", tmp_path / "results")
-    monkeypatch.setattr(common_mod, "WORK", tmp_path / "work")
-    db = StateDB(tmp_path / "state.db")
-    db.create_run("repo", "r")
-    db.add_task("r", {"task_id": "t_1", "attack_class": "sqli", "scope_hint": "x",
-                      "target_files": ["a.py"], "rationale": "r", "priority": 1,
-                      "source": "recon"})
-    db.add_finding("r", "t_1", {
-        "finding_id": "f_1", "file": "a.py", "line_start": 1, "line_end": 2,
-        "vuln_class": "sqli", "severity": "high", "description": "d",
-        "evidence_snippet": "e", "confidence": 0.9})
-    db.set_finding_validation("r", "f_1", "confirmed", {"verdict": "confirmed"})
-    db.assign_finding_group("r", "f_1", "g_1", True)
-    db.add_dedupe_group("r", {"group_id": "g_1", "root_cause": "rc",
-                              "canonical_finding_id": "f_1",
-                              "member_finding_ids": ["f_1"]})
-    ctx = StageContext(run_id="r", repo_path=tmp_path / "repo",
-                       config=load_config(),
-                       live_target={"url": "https://live.example.com:8443/x",
-                                    "credentials": {}})
-    capture = _CaptureOptions()
-    monkeypatch.setattr(trace_mod, "run_agent", capture)
-
-    with pytest.raises(RuntimeError, match="captured"):
-        asyncio.run(trace_mod.run_trace(ctx, db))
-
-    assert capture.options is not None, "the stage never reached the runner"
-    assert capture.options.sandbox["network"] == {"allowedDomains": ["live.example.com"]}
-    assert capture.options.sandbox["enabled"] is True
-    assert capture.options.permission_mode == "acceptEdits"
-    assert capture.options.strict_mcp_config is True
-    assert list(capture.options.tools) == load_config().get("trace").tools
-
-
-def test_options_keep_the_operators_settings_files_out(
-    tmp_path: Path,
-) -> None:
-    """`setting_sources=[]` is what stops the target's or the operator's settings
-    from loading; deleting it left the suite green."""
-    opts = _options(cwd=tmp_path, add_dirs=[tmp_path])
-    assert opts.setting_sources == []
-
-
-def test_grep_glob_naming_the_env_is_refused() -> None:
-    """`.env` is guarded by containment rather than by a name rule (a target's own
-    file must stay readable), so the only thing catching a filename pattern is the
-    `_single_files` rule."""
-    guard = _guard(cwd=HARNESS_ROOT, workspace=[HARNESS_ROOT])
-    assert _denied(_decide(guard, "Grep", {"path": str(HARNESS_ROOT), "glob": ".env"}))
-
-
-def test_read_of_the_credentials_directory_is_refused() -> None:
-    """F21: the requirement is stated for Bash but was asserted only for Bash, so
-    narrowing the structured check to an exact-file comparison stayed green while
-    `Read ~/.claude/settings.json` opened."""
-    guard = _guard()
-    for path in (Path.home() / ".claude" / "settings.json",
-                 Path.home() / ".claude" / "history.jsonl",
-                 Path.home() / ".claude" / "projects" / "p.jsonl",
-                 Path.home() / ".claude.json"):
-        assert _denied(_decide(guard, "Read", {"file_path": str(path)})), path
-
-
-def test_config_refuses_a_bare_tools_key(tmp_path: Path) -> None:
-    """`tools:` with no value is None in YAML, and dict.get returns the stored
-    None rather than the default, so it crashed with a TypeError instead of the
-    intended message."""
-    p = _write_cfg(tmp_path, """
-stages:
-  hunt:
-    model: m
-    concurrency: 1
-    tools:
-""")
-    with pytest.raises(ValueError, match="tools must be a list"):
-        load_config(p)
-
-
-def test_config_refuses_an_explicitly_empty_tools_list(tmp_path: Path) -> None:
-    """An empty list disables every built-in tool, which is never what a stage
-    means: a stage that silently cannot act is worse than a refusal."""
-    p = _write_cfg(tmp_path, """
-stages:
-  hunt:
-    model: m
-    concurrency: 1
-    tools: []
-""")
-    with pytest.raises(ValueError, match="tools is empty"):
-        load_config(p)
-
-
-def test_grep_with_no_glob_cannot_read_a_guarded_file() -> None:
-    """F2: the enclosure rule is what catches a search rooted ABOVE the guarded
-    file, and it ran only when a pattern key was present. ripgrep passes --hidden
-    with only VCS directories excluded, so `Grep {path: <home>, pattern: "sk-ant",
-    output_mode: "content"}` with no glob read ~/.claude/.credentials.json while
-    the equivalent Read was refused. validate, gapfill, feedback, dedupe and
-    report have Grep and no Bash, so this filter is their whole defence."""
-    guard = _guard()  # cwd and workspace are both an unrelated target
-    for root in (str(Path.home()), "/", str(HARNESS_ROOT)):
-        assert _denied(
-            _decide(guard, "Grep",
-                    {"path": root, "pattern": "sk-ant", "output_mode": "content"})
-        ), root
-    # A root inside a guarded DIRECTORY is caught by the call's own path, not by
-    # the sensitive-file rule: nothing in the rule's list lives under results/.
-    assert _denied(
-        _decide(guard, "Grep", {"path": str(RESULTS), "pattern": "severity"})
-    )
-
-
-def test_glob_syntax_cannot_hide_a_guarded_name() -> None:
-    """`[s]tate.db` and `?tate.db` are the same file to fnmatch, ripgrep and the
-    CLI. Comparing names literally let both through, the same class as the brace
-    form, so the name rule matches with a real glob matcher."""
-    guard = _guard(cwd=HARNESS_ROOT, workspace=[HARNESS_ROOT])
-    for pattern in ("[s]tate.db", "?tate.db", "state.d[b]", "{.credentials.json,zzz}"):
-        assert _denied(_decide(guard, "Grep",
-                               {"path": str(HARNESS_ROOT), "glob": pattern,
-                                "pattern": "x"})), pattern
-    for pattern in ("[s]tate.db", "?tate.db"):
-        assert _denied(_decide(guard, "Glob", {"pattern": pattern})), pattern
-    # and the enumeration case stays allowed for Glob
-    assert not _denied(_decide(guard, "Glob", {"pattern": "*"}))
+    schema = SCHEMAS / "finding.schema.json"
+    payload = {"task_id": "t", "findings": [], "gaps_observed": []}
+    validate_schema(payload, schema)
+    first = _validator_for(str(schema))
+    validate_schema(payload, schema)
+    assert _validator_for(str(schema)) is first

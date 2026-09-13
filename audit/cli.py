@@ -479,25 +479,21 @@ def _render_markdown_report(report: dict) -> str:
             err=True,
         )
     # A warning the operator sees immediately before a traceback is worse than
-    # either on its own. The schema errors the warning already computed name every
-    # required key that is absent, at the top level and inside a finding, so the
-    # stub lists those rather than indexing twelve fields a four-key check did not
-    # cover.
-    # Missing keys AND wrong types: a payload whose `findings` is a string has
-    # every required key and still cannot be indexed, and the list-length check
-    # below then reports a nonsense count from the string's length.
+    # either on its own, and a payload can be unrenderable in more ways than one:
+    # a missing key, a wrong type at the top level, or a wrong type nested inside
+    # a finding. jsonschema reports the PATH of each in `"{path}: {message}"`, so
+    # the stub lists paths and never claims a value is a key.
     broken = sorted({
-        m.group(1) for m in (
-            re.search(r": '([\w]+)' (?:is a required property|is not of type)", e)
-            for e in errors
-        ) if m
+        e.split(":", 1)[0].strip().replace("<root>", "top level")
+        for e in errors
+        if " is a required property" in e or " is not of type " in e
     })
     if broken or not isinstance(report.get("findings"), list):
         missing = broken or ["findings"]
         stub = [
             "# Vulnerability report — UNRENDERABLE",
             "",
-            "The report file is missing required top-level keys: "
+            "The report file is missing required data, or has the wrong type, at: "
             + ", ".join(_md_code(k) for k in missing)
             + ".",
             "",
