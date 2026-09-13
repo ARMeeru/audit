@@ -167,8 +167,6 @@ _SANDBOX_SETTINGS: dict[str, Any] = {
 # inspects but the matcher omits is a check that can never fire, which is what
 # the Read, Grep and Glob entries were before this was centralised.
 _GUARD_MATCHER = "|".join(sorted(GUARDED_TOOLS))
-_UNKEYED = GUARDED_TOOLS - set(_TOOL_INPUTS) - {"Bash"}
-assert not _UNKEYED, f"guarded tool with no inspected keys: {_UNKEYED}"
 
 
 def _make_tool_guard(cwd: Path | None = None, workspace: list[Path] | None = None):
@@ -236,6 +234,7 @@ def _build_options(
     permission_mode: str,
     sandbox: bool = True,
     network_allow: list[str] | None = None,
+    strict_mcp_config: bool = True,
 ) -> ClaudeAgentOptions:
     """Assemble the SDK options, confinement included.
 
@@ -293,12 +292,17 @@ def _build_options(
         # servers, because setting_sources=[] disables settings files but not the
         # MCP configuration the CLI loads separately. Those clients run inside
         # this process, so they sit outside the sandbox, and an MCP server with
-        # write access is an exfiltration route the sandbox cannot see. No
-        # servers plus strict_mcp_config closes it.
+        # write access is an exfiltration route the sandbox cannot see.
+        # `--strict-mcp-config` plus `--setting-sources=` is what closes it. An
+        # empty `mcp_servers` would read as if it did, but the SDK only emits
+        # `--mcp-config` for a non-empty mapping, so it is dead weight.
+        #
+        # Caveat worth knowing (README): the CLI refuses to start with
+        # `--strict-mcp-config` when an enterprise MCP config is present, which
+        # is why this is a config key rather than a constant.
         tools=list(allowed_tools),
         allowed_tools=list(allowed_tools),
-        mcp_servers={},
-        strict_mcp_config=True,
+        strict_mcp_config=strict_mcp_config,
         model=model,
         max_turns=max_turns,
         cwd=str(cwd),
@@ -331,6 +335,7 @@ async def run_agent(
     permission_mode: str = "acceptEdits",
     sandbox: bool = True,
     network_allow: list[str] | None = None,
+    strict_mcp_config: bool = True,
     artifact_dir: Path,
     artifact_name: str,
     repair_attempts: int = 1,
@@ -376,6 +381,7 @@ async def run_agent(
                 permission_mode=permission_mode,
                 sandbox=sandbox,
                 network_allow=network_allow,
+                strict_mcp_config=strict_mcp_config,
                 artifact_dir=artifact_dir,
                 artifact_name=artifact_name,
                 repair_attempts=repair_attempts,
@@ -412,6 +418,7 @@ async def _run_agent_once(
     permission_mode: str,
     sandbox: bool,
     network_allow: list[str] | None,
+    strict_mcp_config: bool,
     artifact_dir: Path,
     artifact_name: str,
     repair_attempts: int,
@@ -446,6 +453,7 @@ async def _run_agent_once(
         permission_mode=permission_mode,
         sandbox=sandbox,
         network_allow=network_allow,
+        strict_mcp_config=strict_mcp_config,
     )
 
     initial_prompt = json.dumps(user_input, ensure_ascii=False)

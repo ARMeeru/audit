@@ -9,7 +9,6 @@ import logging
 import re
 import sqlite3
 import time
-import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -412,6 +411,20 @@ class StateDB:
         self._rebuild(("findings",))
 
     # ---------- runs ----------
+
+    def resolve_run_id(self, run_id: str) -> str | None:
+        """The stored id matching `run_id`, ignoring case, or None.
+
+        `runs.run_id` is BINARY-collated while the filesystem folds case, so a
+        cased spelling looked up nothing in SQLite and printed someone else's
+        report from disk. Every command that takes an id from a human goes
+        through here so run, resume, status and report agree.
+        """
+        self._require_upgraded()
+        row = self._conn.execute(
+            "SELECT run_id FROM runs WHERE lower(run_id) = lower(?)", (run_id,)
+        ).fetchone()
+        return row["run_id"] if row else None
 
     def create_run(self, repo_path: str, run_id: str | None = None) -> str:
         # A run id names directories under results/ and work/. Validating here

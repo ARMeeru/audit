@@ -530,6 +530,31 @@ def test_trace_fails_one_finding_on_an_unusable_identifier(
     assert db.get_trace("poc", "f_1") is None, "no verdict may be persisted"
 
 
+def test_trace_does_not_swallow_a_schema_error(
+    stage_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other direction of the same handler. A bare `except ValueError` ate
+    json.JSONDecodeError from reading a schema file and reported it as an unusable
+    identifier, so an operator went looking for an id that was fine."""
+    import json as _json
+
+    db, ctx = stage_env
+    _add_confirmed_canonical_finding(db, "f_1")
+    db.set_finding_validation("poc", "f_1", "confirmed", {"verdict": "confirmed"})
+    db.assign_finding_group("poc", "f_1", "g_1", True)
+    db.add_dedupe_group("poc", {
+        "group_id": "g_1", "root_cause": "rc",
+        "canonical_finding_id": "f_1", "member_finding_ids": ["f_1"],
+    })
+
+    async def boom(**_kwargs):
+        raise _json.JSONDecodeError("Expecting ',' delimiter", '{"type": "objec', 15)
+
+    monkeypatch.setattr(trace_mod, "run_agent", boom)
+    with pytest.raises(_json.JSONDecodeError):
+        asyncio.run(trace_mod.run_trace(ctx, db))
+
+
 def test_validate_fails_one_finding_on_an_unusable_identifier(
     stage_env, monkeypatch: pytest.MonkeyPatch
 ) -> None:

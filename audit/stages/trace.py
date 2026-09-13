@@ -59,6 +59,7 @@ async def run_trace(ctx: StageContext, db: StateDB) -> int:
                     permission_mode=sc.permission_mode,
                     sandbox=sc.sandbox,
                     network_allow=ctx.network_allow(),
+                    strict_mcp_config=sc.strict_mcp_config,
                     artifact_dir=ctx.results_dir("trace"),
                     artifact_name=f.finding_id,
                     repair_attempts=sc.repair_attempts,

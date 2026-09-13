@@ -134,6 +134,7 @@ async def run_hunt(
                     permission_mode=sc.permission_mode,
                     sandbox=sc.sandbox,
                     network_allow=ctx.network_allow(),
+                    strict_mcp_config=sc.strict_mcp_config,
                     artifact_dir=ctx.results_dir("hunt"),
                     artifact_name=task.task_id,
                     repair_attempts=sc.repair_attempts,

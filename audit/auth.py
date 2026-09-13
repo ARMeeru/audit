@@ -98,16 +98,18 @@ def _base_url_rejection_reason(url: str) -> str:
     """
     original = url or ""
     raw = original.strip()
-    if not raw:
-        # Whitespace-only is the same as unset, which is the subscription path.
-        return ""
     if original != raw:
-        # Judge what the CLI will receive, not a cleaned-up copy: this module
-        # never writes the stripped value back to os.environ, so the two would
-        # otherwise differ. U+00A0 and friends survive strip() into the env and
-        # make the CLI fail on a URL that passed every gate here.
-        return ("it has leading or trailing whitespace (including Unicode "
-                "spaces), which is not stripped before the CLI parses it")
+        # Normalise rather than refuse, and write it back so the value judged
+        # here is the value the CLI receives. A padded value out of a `.env` is
+        # ordinary and `urlparse` copes with it; refusing aborted the run over
+        # whitespace. Whitespace-only becomes unset, which is the subscription
+        # path, instead of handing the CLI a string it cannot parse.
+        if raw:
+            os.environ["ANTHROPIC_BASE_URL"] = raw
+        else:
+            os.environ.pop("ANTHROPIC_BASE_URL", None)
+    if not raw:
+        return ""
     if "\\" in raw:
         return (
             "it contains a backslash. Python and WHATWG URL parsers disagree "

@@ -86,6 +86,7 @@ async def run_dedupe(ctx: StageContext, db: StateDB) -> int:
             permission_mode=sc.permission_mode,
             sandbox=sc.sandbox,
             network_allow=ctx.network_allow(),
+            strict_mcp_config=sc.strict_mcp_config,
             artifact_dir=ctx.results_dir("dedupe"),
             artifact_name="dedupe",
             repair_attempts=sc.repair_attempts,

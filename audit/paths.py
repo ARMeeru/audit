@@ -7,29 +7,29 @@ Three things live here.
 component. Two trust levels feed it: operator input (`--run-id`) and model output
 derived from the target repo (`task_id`, artifact names). Before it existed,
 `RESULTS / run_id` and `WORK / run_id / "hunt" / task_id` were joined raw and
-followed by `mkdir(parents=True, exist_ok=True)`, so one `..` in either produced
-a directory creation and a write outside the harness.
+followed by `mkdir(parents=True, exist_ok=True)`, so one `..` in either produced a
+directory creation and a write outside the harness.
 
-`structured_path_hit` decides, for a tool that carries an explicit path
-(`file_path`, `path`, `glob`, ...), whether that path lands in the harness's own
-files. It resolves the path and compares containment, so `..`, relative
-spellings and `~` are all handled by the filesystem rather than by a string
-table.
+`structured_path_hit` decides, for a tool that carries an explicit path, whether
+that path lands in the harness's own files. It resolves the path and compares by
+filesystem identity, so case-folded spellings, hardlinks, `..`, relative
+spellings, `~` and symlinks are all handled by the filesystem rather than by a
+string table.
 
-`bash_guard_hit` is the same question for a shell command, where there is no
-structure to resolve. It is a FILTER over a string and nothing more: a path built
-at runtime (`p=$(printf %s <b64>|base64 -d); sqlite3 "$p"`), a variable, or any
-other indirection walks past it. The OS sandbox in runner._build_options is the
-boundary. This exists for the two cases where no sandbox can separate harness
-from target (a self-audit, and a platform where the sandbox cannot start), and
-its denials are written to redirect the agent rather than stall it.
+`bash_guard_hit` does the same for a shell command. It is a FILTER and nothing
+more: it expands the shell's home spellings, applies the name rules, and
+containment-checks the path-shaped tokens it can see, resolved against the
+directory the command runs in. A path built at runtime
+(`p=$(printf %s <b64>|base64 -d); sqlite3 "$p"`) walks past it. The OS sandbox in
+runner._build_options is the boundary; this exists for the two geometries where no
+sandbox can separate harness from target (a self-audit, and a platform where the
+sandbox cannot start), and its denials are written to redirect the agent.
 """
 
 from __future__ import annotations
 
 import re
 import uuid
-from fnmatch import fnmatch
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -41,8 +41,8 @@ WORK = REPO_ROOT / "work"
 STATE_DB = REPO_ROOT / "state.db"
 ENV_FILE = REPO_ROOT / ".env"
 
-# The subscription credential file. auth.py imports this rather than defining
-# its own, so the guard and the login path can never drift apart.
+# The subscription credential file, unresolved on purpose: a symlinked
+# credentials file must not move the guarded directory to its target.
 CREDENTIALS_FILE = Path.home() / ".claude" / ".credentials.json"
 
 
@@ -60,8 +60,8 @@ class UnsafeIdentifier(ValueError):
 # `^f_[a-z0-9_-]{1,64}$`, so a schema-legal id runs to 66 characters, and
 # _resolve_finding_id appends a `_N` suffix on a collision. A ceiling below the
 # schemas' own limits turns a legal id into a crash, which is what this used to
-# do. The character class and the traversal rejection are what carry the
-# security property; the length is a sanity bound.
+# do. The character class and the traversal rejection carry the security
+# property; the length is a sanity bound.
 _COMPONENT_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
 
 
@@ -94,14 +94,17 @@ def new_run_id() -> str:
     return f"run_{uuid.uuid4().hex[:8]}"
 
 
+# ---------- what is guarded ----------
+
+
 def guarded_paths() -> dict[str, Path]:
-    """The harness's own state and secrets: off limits to every tool.
+    """The harness's state and secrets: off limits to every tool.
 
     Read at call time rather than captured at import so a test (or a future
-    --state-dir) can move them. `WORK` is deliberately absent: the Hunt scratch
-    dir lives under it and the prompt tells the agent to compile and run PoCs
-    there, so a write ban would break the product, and nothing under `work/`
-    carries integrity.
+    --state-dir) can move them. `WORK` is deliberately absent here: the Hunt
+    scratch dir lives under it and the prompt tells the agent to compile and run
+    PoCs there, so a write ban would break the product, and nothing under
+    `work/` carries integrity.
     """
     return {
         "the harness state database": STATE_DB,
@@ -113,34 +116,171 @@ def guarded_paths() -> dict[str, Path]:
 def write_only_guards() -> dict[str, Path]:
     """Harness files an agent may read but never rewrite.
 
-    The prompts become the next stages' system prompts and the schemas decide
-    what counts as valid, and `_run_agent_once` re-reads both per dispatch, so a
-    rewrite mid-run redirects the pipeline's own judgement. They are readable on
-    purpose: auditing this repository means reading them.
+    The whole checkout, not three subdirectories. Prompts become the next
+    stages' system prompts, schemas decide what counts as valid, and the stage
+    config carries the confinement switch; but `audit/*.py` is what the next
+    invocation loads and what renders a report the operator will read, so
+    rewriting it forges a result just as directly. `WORK` is carved out by
+    `_carved_out`: it is the one writable hole, because that is where PoCs are
+    compiled.
+
+    Readable on purpose: auditing this repository means reading it.
     """
+    return {"the harness source and repository": REPO_ROOT}
+
+
+def credentials_entries() -> dict[str, Path]:
+    """Every Claude-side path holding a credential or the operator's context.
+
+    Explicit rather than derived from `CREDENTIALS_FILE.parent`: one directory
+    plus a regex could not express "this directory, and this config file beside
+    it, but not `.claude-backup`", so widening the boundary to admit the backups
+    let `~/.claude.json` through. The directory itself is here because it holds
+    settings and per-project prompt history.
+    """
+    home = Path.home()
     return {
-        "the harness prompts": PROMPTS,
-        "the harness schemas": SCHEMAS,
-        "the harness stage config": CONFIG,
+        "the Claude state directory": home / ".claude",
+        "Claude credentials": home / ".claude" / ".credentials.json",
+        "the Claude config file": home / ".claude.json",
+        "the Claude config backup": home / ".claude.json.backup",
     }
 
 
-def _bash_guarded() -> dict[str, Path]:
-    """Everything a shell command may not touch.
+def _sensitive_files() -> dict[str, Path]:
+    """Guarded entries that are FILES, so a filename pattern can name them."""
+    return {
+        "the harness state database": STATE_DB,
+        "the harness .env": ENV_FILE,
+        **credentials_entries(),
+    }
 
-    Bash gets the union, including the read-allowed files, because a shell
-    command can write to anything it can read and its text carries no read/write
-    signal. A `cat prompts/08-report.md` in self-audit geometry is refused and
-    the agent is pointed at Read instead, which is the tool that can only read.
+
+def _writable_exceptions() -> tuple[Path, ...]:
+    """Where a write is allowed even though the tree around it is guarded."""
+    return (WORK,)
+
+
+# ---------- name rules ----------
+
+
+def sensitive_name_hit(name: str) -> str | None:
+    """Match a bare filename against the guarded names, by stem where it matters.
+
+    `state.db-wal` and `state.db-shm` carry rows the main file has not
+    checkpointed (WAL mode is on) and containment cannot see them:
+    `Path("state.db-wal").is_relative_to(Path("state.db"))` is False.
     """
-    return {**guarded_paths(), **write_only_guards()}
+    lowered = name.casefold()
+    if lowered == STATE_DB.name or lowered.startswith(STATE_DB.name + "-"):
+        return "the harness state database (WAL sidecars included)"
+    for label, entry in credentials_entries().items():
+        if lowered == entry.name.casefold():
+            return label
+    # `.env` is deliberately NOT a name rule. The harness's copy is guarded by
+    # containment (it sits inside the checkout), while a target's own `.env` is
+    # target data an agent may legitimately read.
+    return None
 
 
-# Tools that can write, and the tool_input fields each guarded tool carries.
-# runner.py derives its PreToolUse matcher from the keys here, so a tool whose
-# calls the guard inspects cannot be left out of the matcher: a matcher that
-# omits a tool means the CLI never invokes the callback for it, and the check
-# then exists in the code and can never fire.
+# ---------- containment ----------
+
+
+def canonical_path(path: Path) -> Path:
+    """Resolve a path and normalise the macOS firmlink prefix.
+
+    `/System/Volumes/Data/Users/x` and `/Users/x` are the same directory, and
+    `resolve()` collapses symlinks but leaves a firmlinked spelling alone, so the
+    two compared as different paths.
+    """
+    try:
+        resolved = Path(path).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return Path(path)
+    text = str(resolved)
+    if text.startswith("/System/Volumes/Data/"):
+        return Path(text[len("/System/Volumes/Data"):])
+    return resolved
+
+
+def _same_file(left: Path, right: Path) -> bool:
+    """True when both paths are the same inode.
+
+    `resolve()` is not enough on a case-insensitive filesystem: APFS folds case,
+    so `<repo>/STATE.DB` and `<repo>/state.db` are different `Path` objects for
+    the same file, which let a shift key walk past the guard. A hardlink has no
+    path relationship at all and is caught here too.
+    """
+    try:
+        a, b = left.stat(), right.stat()
+    except OSError:
+        return False
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+
+
+def _inside(child: Path, root: Path) -> bool:
+    """Containment that survives case folding.
+
+    Identity for the same file, then a casefolded prefix comparison for
+    everything else, including paths that do not exist yet (a Write to a new file
+    inside a guarded directory). Casefolding over-blocks at worst, which is the
+    direction to fail in.
+    """
+    if _same_file(child, root):
+        return True
+    child_text = str(child).casefold().rstrip("/")
+    root_text = str(root).casefold().rstrip("/")
+    return child_text == root_text or child_text.startswith(root_text + "/")
+
+
+def _carved_out(path: Path) -> bool:
+    return any(_inside(path, hole) for hole in _writable_exceptions())
+
+
+def _resolve(raw: str, base: Path) -> Path:
+    """Absolute, canonical path for a value a tool is about to use."""
+    text = str(raw)
+    try:
+        path = Path(text).expanduser()
+    except (RuntimeError, ValueError):
+        return canonical_path(base / text)
+    if not path.is_absolute():
+        path = base / path
+    return canonical_path(path)
+
+
+def _resolved(map_: dict[str, Path]) -> dict[str, Path]:
+    """Resolve a guarded-map once, rather than per comparison inside a loop."""
+    return {label: _resolve(str(entry), REPO_ROOT) for label, entry in map_.items()}
+
+
+def _hits_guarded(
+    path: Path,
+    roots: dict[str, Path],
+    *,
+    credentials: dict[str, Path] | None = None,
+    resolved_roots: dict[str, Path] | None = None,
+) -> str | None:
+    """What `path` reaches, or None.
+
+    `_inside` is enough for both kinds of credentials entry: for a file it
+    reduces to "the same file", for a directory it covers everything under it,
+    and it works for a directory that does not exist yet.
+    """
+    for label, entry in (credentials or _resolved(credentials_entries())).items():
+        if _inside(path, entry):
+            return f"{label} ({entry})"
+    name_hit = sensitive_name_hit(path.name)
+    if name_hit is not None:
+        return f"{name_hit} (matched {path.name!r})"
+    for label, entry in (resolved_roots or _resolved(roots)).items():
+        if _inside(path, entry) and not _carved_out(path):
+            return f"{label} ({entry})"
+    return None
+
+
+# ---------- which roots apply to which tool ----------
+
 WRITE_TOOLS = frozenset({"Write", "Edit", "NotebookEdit"})
 
 _TOOL_INPUTS: dict[str, dict[str, tuple[str, ...]]] = {
@@ -149,10 +289,8 @@ _TOOL_INPUTS: dict[str, dict[str, tuple[str, ...]]] = {
     "Edit": {"targets": ("file_path",)},
     "NotebookEdit": {"targets": ("notebook_path",)},
     # Glob's `pattern` is a path expression; Grep's `pattern` is a regex over
-    # file contents and its `glob` is a path filter (`rg --glob`). Inspecting
-    # the right field per tool is the difference between a guard and decoration:
-    # a Grep pattern of "state.db" is a hunter grepping the target for a string,
-    # while its `glob` of ".credentials.json" is a search for a file.
+    # file CONTENTS and its `glob` is a path filter (`rg --glob`). Inspecting the
+    # right field per tool is the difference between a guard and decoration.
     "Glob": {"targets": ("path",), "patterns": ("pattern",)},
     "Grep": {"targets": ("path",), "patterns": ("glob",)},
 }
@@ -161,197 +299,261 @@ _BASH_TOOL = "Bash"
 GUARDED_TOOLS = frozenset(_TOOL_INPUTS) | {_BASH_TOOL}
 
 
-def _guarded_roots(writes: bool) -> dict[str, Path]:
-    """Roots off limits for a tool that writes, or for one that only reads.
+def _roots_for(tool_name: str) -> dict[str, Path]:
+    """Whichever roots apply to a tool.
 
-    Read tools get the integrity-and-secrets set. Write tools get that plus the
-    files a self-audit must be able to read (prompts, schemas, stage config),
-    which are re-read per dispatch and would otherwise let a rewrite redirect
-    the pipeline's own judgement. Bash appears to be a read tool and is not: a
-    shell command can write to anything it can read, so it takes the union.
+    Read tools take the integrity-and-secrets set. Write tools and Bash take that
+    plus the whole checkout, because a shell command can write to anything it can
+    read, and no shipped stage has Write or Edit at all, which is what made the
+    old write-only branch unreachable.
     """
-    return {**guarded_paths(), **write_only_guards()} if writes else guarded_paths()
+    roots = {**guarded_paths(), **credentials_entries()}
+    if tool_name in WRITE_TOOLS or tool_name == _BASH_TOOL:
+        roots = {**roots, **write_only_guards()}
+    return roots
 
 
-# macOS firmlinks: /System/Volumes/Data/Users/x and /Users/x are the same
-# directory, and `resolve()` collapses symlinks but leaves a firmlinked spelling
-# alone, so the two compared as different paths and the self-audit check missed
-# the firmlinked form of its own checkout.
-_FIRMLINK_PREFIX = "/System/Volumes/Data"
+# ---------- pattern handling ----------
+
+# A pattern that names everything. Meaningful for Grep's content rule,
+# meaningless for deciding whether a file was named.
+_MATCH_EVERYTHING = ("*", "**", "*.*", "**/*", "**/.*", ".*")
 
 
-def canonical_path(path: Path) -> Path:
-    """Resolve a path and normalise the macOS firmlink prefix."""
-    try:
-        resolved = Path(path).expanduser().resolve()
-    except (OSError, RuntimeError, ValueError):
-        return Path(path)
-    text = str(resolved)
-    if text.startswith(_FIRMLINK_PREFIX + "/"):
-        return Path(text[len(_FIRMLINK_PREFIX):])
-    return resolved
+def expand_braces(pattern: str) -> list[str]:
+    """Expand `{a,b}` alternation the way ripgrep and the CLI's glob do.
 
-
-def _resolve(raw: str, cwd: Path) -> Path | None:
-    """Best-effort absolute path for a value a tool is about to use."""
-    try:
-        path = Path(str(raw)).expanduser()
-    except (RuntimeError, ValueError):
-        # expanduser raises RuntimeError for a malformed ~user on some systems
-        return None
-    if not path.is_absolute():
-        path = Path(cwd) / path
-    try:
-        return canonical_path(path)
-    except (OSError, ValueError):
-        return None
-
-
-def _encloses(root: Path, target: Path) -> bool:
-    return root == target or target.is_relative_to(root)
-
-
-def _single_files() -> dict[str, Path]:
-    """Guarded entries that are files rather than trees.
-
-    Only these can be named by a filename glob, so only these matter to the
-    pattern rule below.
+    Python's fnmatch has no brace syntax: `fnmatch(".credentials.json",
+    "{.credentials.json,zzz}")` is False, so a brace-wrapped pattern naming a
+    guarded file was allowed. The CLI preserves the brace form rather than
+    splitting it and ripgrep expands it, so it has to be expanded before
+    matching.
     """
-    return {
-        "the harness state database": STATE_DB,
-        "the harness .env": ENV_FILE,
-        "Claude credentials": CREDENTIALS_FILE,
-    }
+    match = re.search(r"\{([^{}]*)\}", pattern)
+    if match is None:
+        return [pattern]
+    expanded: list[str] = []
+    for branch in match.group(1).split(","):
+        expanded.extend(
+            expand_braces(pattern[: match.start()] + branch + pattern[match.end():])
+        )
+    return expanded
+
+
+def _pattern_names_guarded(pattern: str, *, contents: bool) -> str | None:
+    """Does this file-selection pattern name a guarded file?
+
+    `contents` is True for Grep, where reading a guarded file leaks it, and
+    False for Glob, where a name comes back and a bare wildcard is ordinary
+    enumeration: only a pattern that names something more specific counts.
+    """
+    if not pattern:
+        return None
+    for branch in expand_braces(pattern):
+        name = branch.rstrip("/").split("/")[-1]
+        literal = name
+        for meta in ("*", "?", "[", "{"):
+            literal = literal.split(meta, 1)[0]
+        for label, entry in _sensitive_files().items():
+            target = entry.name.casefold()
+            if name.casefold() == target:
+                return f"{label} (matched {pattern!r})"
+            # `state.db-*` names the WAL sidecars through their stem.
+            if literal and target.startswith(literal.casefold()) and len(literal) > 3:
+                return f"{label} (matched {pattern!r})"
+            if contents and name.casefold() in _MATCH_EVERYTHING:
+                return f"{label} (a pattern that matches every file)"
+    if "{" in pattern and pattern.count("{") != pattern.count("}"):
+        # A form this module cannot expand: fail closed rather than guess.
+        return "a search pattern in a form this guard cannot parse"
+    return None
+
+
+def _search_roots(tool_input: dict, workspace: list[Path]) -> list[Path]:
+    """Where a slash-bearing pattern is resolved from.
+
+    The call's own `path` when it has one: ripgrep and Glob match a relative
+    pattern against the call's root, not the session's working directory, so
+    resolving against cwd let `glob: "results/*/report/report.json"` reach the
+    guarded results tree from hunt's scratch dir. The session workspace is the
+    fallback, and every root is tried, so a self-audit's relative pattern still
+    lands on the checkout.
+    """
+    raw = [tool_input[k] for k in ("path",) if tool_input.get(k)]
+    if raw:
+        return [_resolve(str(r), workspace[0]) for r in raw]
+    return [canonical_path(p) for p in workspace]
+
+
+def _is_absolute(text: str) -> bool:
+    return str(text).startswith("/") or str(text).startswith("~")
+
+
+# ---------- the structured-tool check ----------
 
 
 def structured_path_hit(
     tool_name: str, tool_input: dict, *, cwd: Path, workspace: list[Path]
 ) -> str | None:
-    """Containment check for the paths a structured tool carries.
-
-    Resolving first is what makes `..`, relative spellings, `~` and symlinks
-    work without a string table, and it is why `ls ~/.claude-backup` is no
-    longer mistaken for the credentials directory.
-
-    Two rules, because tools differ:
-
-    * a target value that lands in a guarded tree is refused outright;
-    * a search tool whose filename pattern can match a guarded FILE, from a
-      root that encloses it, is refused. That is the `Grep {path: <home>,
-      glob: ".credentials.json"}` case, and it is deliberately narrow: it
-      matches the pattern against the guarded filenames, so an ordinary
-      `Grep {path: <repo>, pattern: "sqlite3"}` in a self-audit still works.
-    """
-    roots = _guarded_roots(writes=tool_name in WRITE_TOOLS)
+    """Containment check for the paths a structured tool carries."""
+    roots = _roots_for(tool_name)
     fields = _TOOL_INPUTS.get(tool_name, {})
-    credentials = _resolve(str(CREDENTIALS_FILE), cwd) or CREDENTIALS_FILE
+    pattern_keys = fields.get("patterns", ())
+    contents = tool_name == "Grep"
 
-    def _check(value_path: Path) -> str | None:
-        if value_path == credentials or value_path.is_relative_to(credentials.parent):
-            return f"Claude credentials (under {credentials.parent})"
-        for label, root in roots.items():
-            root_res = _resolve(str(root), cwd) or root
-            if value_path == root_res or value_path.is_relative_to(root_res):
-                return f"{label} ({root_res})"
+    credentials = _resolved(credentials_entries())
+    resolved_roots = _resolved(roots)
+
+    def _check(candidates: list[Path]) -> str | None:
+        for candidate in candidates:
+            hit = _hits_guarded(
+                canonical_path(candidate),
+                roots,
+                credentials=credentials,
+                resolved_roots=resolved_roots,
+            )
+            if hit:
+                return hit
         return None
 
-    for key in (*fields.get("targets", ()), *fields.get("patterns", ())):
+    # A direct path resolves against the session's working directory, which is
+    # what the tool itself does with a relative spelling.
+    for key in fields.get("targets", ()):
         raw = tool_input.get(key)
         if not raw:
             continue
-        # A pattern contributes its literal prefix: `<results>/**/*.json` is
-        # judged on `<results>`, not on the pattern text, and a bare `state.db`
-        # is judged relative to the session's cwd.
-        text = str(raw)
-        for meta in ("**", "*", "?", "[", "{"):
-            text = text.split(meta, 1)[0]
-        resolved = _resolve(text.rstrip("/") or ".", cwd)
-        if resolved is not None:
-            hit = _check(resolved)
-            if hit:
-                return hit
+        hit = _check(_literal_candidates(str(raw), base=cwd))
+        if hit:
+            return hit
 
-    pattern_keys = fields.get("patterns", ())
-    raw_roots = [tool_input[k] for k in fields.get("targets", ()) if tool_input.get(k)]
-    search_roots = (
-        [Path(str(r)) for r in raw_roots] if raw_roots else [Path(p) for p in workspace]
-    )
+    # A pattern is judged on its literal prefix (`results/**/*.json` on
+    # `results`), resolved from the root the tool would use: ripgrep and Glob
+    # match a relative pattern against the call's own root, not the session cwd,
+    # so resolving from cwd let `glob: "results/*/report/report.json"` reach the
+    # guarded results tree from hunt's scratch dir.
+    search_roots = _search_roots(tool_input, workspace)
     for key in pattern_keys:
-        pattern = str(tool_input.get(key) or "")
-        if not pattern:
+        raw = tool_input.get(key)
+        if not raw:
             continue
-        name = pattern.rstrip("/").split("/")[-1]
-        for label, guarded in _single_files().items():
-            guarded_res = _resolve(str(guarded), cwd) or guarded
-            if not fnmatch(guarded_res.name, name):
-                continue
-            for root in search_roots:
-                root_res = _resolve(str(root), cwd)
-                if root_res is not None and _encloses(root_res, guarded_res):
-                    return f"{label} (reachable from {root_res}, matched {name!r})"
+        named = _pattern_names_guarded(str(raw), contents=contents)
+        if named is not None:
+            return named
+        hit = _check(_literal_candidates(str(raw), base=search_roots))
+        if hit:
+            return hit
+
+    # A Grep with no glob reads every file under its root, guarded ones included:
+    # ripgrep passes --hidden with only VCS directories excluded. A root that
+    # encloses a guarded file therefore leaks it, and the caller's fix is a
+    # narrowing glob.
+    if contents and (not pattern_keys or not tool_input.get(pattern_keys[0])):
+        for base in search_roots:
+            for label, entry in _sensitive_files().items():
+                resolved = _resolve(str(entry), REPO_ROOT)
+                if _inside(resolved, base) and not _carved_out(resolved):
+                    return (
+                        f"{label} ({resolved}, reachable from {base}: this search "
+                        "has no glob excluding it)"
+                    )
     return None
 
 
-_CREDENTIALS_DIR_RE = re.compile(
-    re.escape(str(CREDENTIALS_FILE.parent)) + r"(?![\w.-])"
-)
+def _literal_candidates(value: str, *, base) -> list[Path]:
+    """Where a path, or a pattern's literal prefix, could land.
+
+    An absolute value stands alone. A relative one comes off `base`, which is
+    either a single directory or the roots a search tool would use.
+    """
+    literal = value
+    for meta in ("**", "*", "?", "[", "{"):
+        literal = literal.split(meta, 1)[0]
+    literal = literal.rstrip("/")
+    roots = list(base) if isinstance(base, list) else [base]
+    if not literal:
+        return roots
+    if _is_absolute(literal):
+        return [Path(literal)]
+    return [root / literal for root in roots]
+
+
+# ---------- the shell filter ----------
 
 
 def _expand_shell_home(text: str) -> str:
-    """Expand `~` and `$HOME` so the natural shell spellings can be matched.
+    """Expand the shell's home spellings so the name rules can see them.
 
-    Without this the credentials branch only ever matched a fully expanded
-    absolute path, which structured tools produce and shell strings do not:
-    `cat ~/.claude/*` was allowed while `cat /Users/x/.claude/.credentials.json`
-    was denied.
+    `~` and `$HOME` are how a shell normally spells home, and they were invisible
+    to a matcher that only knew absolute paths. Quoted forms and `~user` are
+    included: `cat "$HOME"/.claude/x` is the shellcheck-recommended spelling, and
+    substituting inside the quotes left a stray `"` in the path.
     """
     home = str(Path.home())
-    text = re.sub(r"\$\{HOME\}|\$HOME\b", home, text)
-    text = re.sub(r"(?<![\w~])~(?=[/\s]|$)", home, text)
+    text = re.sub(r"""["']?\$\{?HOME\}?["']?""", home, text)
+    text = re.sub(r"""["']?~(?:[A-Za-z_][A-Za-z0-9_-]*)?["']?""", home, text)
     return text
 
 
-def bash_guard_hit(command: str, *, cwd: Path) -> str | None:
-    """What a shell command is reaching for, or None if it looks harmless.
+_TOKEN_SPLIT_RE = re.compile(r"""[;&|()<>\s"']+""")
+_PATH_SHAPED_RE = re.compile(
+    r"^(?:.*/)?[\w.@+-]+(?:/[\w.@*?\[\]{}+-]+)+/?$|^[\w@+-]*\.[A-Za-z0-9]+$"
+)
 
-    A FILTER, not a boundary: see the module docstring. Fails closed on the
-    harness DB by basename, so a target repo shipping its own `state.db` is
-    refused too; the denial names Read/Grep as the way on.
+
+def _cd_base(command: str, cwd: Path) -> Path:
+    """The directory a later relative token resolves against.
+
+    A `cd X && ...` moves the shell before the rest of the command runs, so
+    resolving every token against the session cwd both missed
+    `cd <checkout> && cat .env` and refused `cd <target> && cat config/app.yml`.
+    Only `cd` occurrences are honoured; anything cleverer is obfuscation and out
+    of scope by design.
+    """
+    base = cwd
+    for match in re.finditer(r"(?:^|[;&|]\s*)cd\s+([^\s;&|]+)", command):
+        base = _resolve(match.group(1), base)
+    return base
+
+
+def bash_guard_hit(command: str, *, cwd: Path) -> str | None:
+    """What a shell command reaches for, or None if it looks harmless.
+
+    A FILTER, not a boundary: see the module docstring. It fails closed on the
+    guarded names and on the paths it can resolve. Anything it cannot see (a
+    substitution, a variable, a path assembled at runtime) is why the sandbox
+    exists.
     """
     if not command:
         return None
     text = _expand_shell_home(command)
-    lowered = text.lower()
+    lowered = text.casefold()
+    roots = _roots_for(_BASH_TOOL)
 
-    if "state.db" in lowered:
-        return "the harness's state database (matched 'state.db')"
-    if _CREDENTIALS_DIR_RE.search(text) or CREDENTIALS_FILE.name in lowered:
-        return f"Claude credentials (matched {CREDENTIALS_FILE.parent})"
+    # The harness database is matched by basename, deliberately fail-closed. It
+    # is the one name worth the over-block: it catches spellings the token walk
+    # cannot see (a sqlite URI, a name built from a variable, the WAL sidecars),
+    # and the cost is that a target shipping its own `state.db` cannot be read by
+    # a shell command. The structured tools reach that file by containment, so
+    # the agent is pointed at Read rather than left stuck.
+    if STATE_DB.name in lowered:
+        return "the harness state database (matched 'state.db')"
 
-    roots = _bash_guarded()
-    for label, root in roots.items():
-        if str(root).lower() in lowered:
-            return f"{label} (matched {root})"
-
-    # Relative spellings. A shell resolves `results/x` against its own cwd, so
-    # the spelling only reaches the harness tree when that cwd is at or inside
-    # it, which is the self-audit geometry. Matching requires a real path shape
-    # (`results/`, not the bare word) to keep the over-block off commands that
-    # merely mention the word. A `cd` earlier in the same command can move the
-    # shell afterwards, so this is a heuristic on top of a heuristic and the
-    # sandbox remains the thing that actually holds.
-    cwd_res = _resolve(str(cwd), REPO_ROOT)
-    if cwd_res is not None and (cwd_res == REPO_ROOT or cwd_res.is_relative_to(REPO_ROOT)):
-        for label, root in roots.items():
-            try:
-                rel = root.relative_to(REPO_ROOT).as_posix()
-            except ValueError:
-                continue
-            pattern = (
-                rf"(?<![\w./-]){re.escape(rel)}/"
-                if root.is_dir()
-                else rf"(?<![\w./-]){re.escape(rel)}(?![\w.-])"
-            )
-            if re.search(pattern, text):
-                return f"{label} (matched relative '{rel}' from {cwd_res})"
+    base = _cd_base(command, cwd)
+    credentials = _resolved(credentials_entries())
+    resolved_roots = _resolved(roots)
+    for token in _TOKEN_SPLIT_RE.split(text):
+        if not token or token.startswith("-"):
+            continue
+        if "/" not in token and not _PATH_SHAPED_RE.match(token):
+            continue
+        if not _is_absolute(token):
+            token = str(base / token)
+        hit = _hits_guarded(
+            canonical_path(token),
+            roots,
+            credentials=credentials,
+            resolved_roots=resolved_roots,
+        )
+        if hit:
+            return hit
     return None

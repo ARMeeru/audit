@@ -23,6 +23,8 @@ _FALSY_ENV = {"", "0", "false", "no", "off"}
 from audit.config import load_config
 from audit.json_utils import validate_schema
 from audit.orchestrator import CostExceeded, run_pipeline
+from urllib.parse import urlparse
+
 from audit.paths import (
     RESULTS as RESULTS_ROOT,
     SCHEMAS,
@@ -44,6 +46,43 @@ def _allow_api_key_from_env_or_flag(flag: bool) -> bool:
     if flag:
         return True
     return os.environ.get("AUDIT_ALLOW_API_KEY", "").strip().lower() not in _FALSY_ENV
+
+
+def _require_target_url(url: str | None, credentials: dict) -> dict | None:
+    """Validate `--target-url` at the flag, not inside a stage.
+
+    `urlparse` raises on a malformed authority, and the raw flag was handed to
+    `StageContext`, whose `network_allow()` is evaluated inside every stage's
+    argument list. So `--target-url http://[::1:8888` raised inside recon, hunt
+    and validate: validate escaped entirely (killing the stage after hunt spend
+    was sunk) and hunt burned an attempt per task until the retry ceiling
+    abandoned the whole set. The same shape as `_require_run_id`: fail at the
+    flag with a usage error.
+
+    A missing scheme is not an error (the CLI's own gateway handling accepts
+    `host:port`), but a value with no host at all is: an empty allowlist is
+    indistinguishable from "no live target", and the run would silently lose all
+    egress while every prompt still described a live target.
+    """
+    if not url:
+        return None
+    text = url.strip()
+    candidate = text if "://" in text else f"https://{text}"
+    try:
+        parsed = urlparse(candidate)
+    except ValueError as e:
+        raise click.BadParameter(
+            f"--target-url is not a valid URL ({e}): {url!r}"
+        ) from None
+    if parsed.scheme not in ("http", "https"):
+        raise click.BadParameter(
+            f"--target-url must be http or https, got {parsed.scheme!r}"
+        )
+    if not parsed.hostname:
+        raise click.BadParameter(
+            f"--target-url has no host: {url!r} (expected host[:port])"
+        )
+    return {"url": candidate, "credentials": credentials}
 
 
 def _require_run_id(run_id: str) -> str:
@@ -186,17 +225,18 @@ def run(repo: str, run_id: str | None, resume: bool, max_cost_usd: float | None,
 
     # Live-target plumbing — agents will receive {"url": ..., "credentials": {...}}
     # in their user_input when set.
-    live_target: dict | None = None
-    if target_url:
-        creds: dict[str, str] = {}
-        for kv in target_creds:
-            if "=" not in kv:
-                console.print(f"[red]invalid --target-creds {kv!r} — expected KEY=VALUE[/red]")
-                sys.exit(2)
-            k, _, v = kv.partition("=")
-            creds[k.strip()] = v.strip()
-        live_target = {"url": target_url, "credentials": creds}
-        console.print(f"[cyan]live target:[/cyan] {target_url} (creds: {sorted(creds)})")
+    creds: dict[str, str] = {}
+    for kv in target_creds:
+        if "=" not in kv:
+            console.print(f"[red]invalid --target-creds {kv!r} — expected KEY=VALUE[/red]")
+            sys.exit(2)
+        k, _, v = kv.partition("=")
+        creds[k.strip()] = v.strip()
+    live_target = _require_target_url(target_url, creds)
+    if live_target:
+        console.print(
+            f"[cyan]live target:[/cyan] {live_target['url']} (creds: {sorted(creds)})"
+        )
     elif target_creds:
         console.print("[yellow]--target-creds without --target-url is ignored[/yellow]")
 
@@ -251,8 +291,8 @@ def status(run_id: str | None) -> None:
         if run_id is None:
             _show_runs_table(db)
             return
-        run_id = _require_run_id(run_id)
-        run = db.get_run(run_id)
+        run_id = db.resolve_run_id(_require_run_id(run_id))
+        run = db.get_run(run_id) if run_id else None
         if run is None:
             console.print(f"[red]unknown run_id {run_id!r}[/red]")
             sys.exit(1)
@@ -268,7 +308,14 @@ def report(run_id: str, fmt: str) -> None:
     """Print (or generate) the final report."""
     db = StateDB(DB_PATH)
     try:
-        report_path = RESULTS_ROOT / _require_run_id(run_id) / "report" / "report.json"
+        # Resolve first: runs.run_id is BINARY-collated while the filesystem
+        # folds case, so a cased spelling would otherwise print the right run's
+        # report under the wrong label, or none at all.
+        canonical = db.resolve_run_id(_require_run_id(run_id))
+        if canonical is None:
+            console.print(f"[red]unknown run_id {run_id!r}[/red]")
+            sys.exit(1)
+        report_path = RESULTS_ROOT / canonical / "report" / "report.json"
         if not report_path.exists():
             console.print(f"[red]no report at {report_path}[/red]")
             sys.exit(1)
@@ -397,11 +444,14 @@ def _md_code(v) -> str:
     strips.
     """
     text = _fold_line_terminators(v)
-    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
-    delimiter = "`" * (longest + 1)
+    delimiter = "`" * (_longest_backtick_run(text) + 1)
     if text.startswith("`") or text.endswith("`"):
         text = f" {text} "
     return f"{delimiter}{text}{delimiter}"
+
+
+def _longest_backtick_run(text: str) -> int:
+    return max((len(run) for run in re.findall(r"`+", text)), default=0)
 
 
 def _code_fence(content: str) -> str:
@@ -409,12 +459,7 @@ def _code_fence(content: str) -> str:
     `content`: target-influenced evidence that contains ``` must not be able
     to close the code block early and inject markdown into the
     rendered report."""
-    longest = 0
-    run = 0
-    for ch in content:
-        run = run + 1 if ch == "`" else 0
-        longest = max(longest, run)
-    return "`" * max(3, longest + 1)
+    return "`" * max(3, _longest_backtick_run(content) + 1)
 
 
 def _render_markdown_report(report: dict) -> str:
@@ -429,11 +474,15 @@ def _render_markdown_report(report: dict) -> str:
             err=True,
         )
     # A warning the operator sees immediately before a traceback is worse than
-    # either on its own, so the required top-level keys are checked rather than
-    # indexed. A payload missing them is exactly the class the warning above
-    # exists to describe: hand-edited or pre-schema files.
-    required = ("run_id", "target", "summary", "findings")
-    missing = [k for k in required if k not in report]
+    # either on its own. The schema errors the warning already computed name every
+    # required key that is absent, at the top level and inside a finding, so the
+    # stub lists those rather than indexing twelve fields a four-key check did not
+    # cover.
+    missing = sorted({
+        m.group(1) for m in (
+            re.search(r": '([\w]+)' is a required property$", e) for e in errors
+        ) if m
+    })
     if missing:
         stub = [
             "# Vulnerability report — UNRENDERABLE",
@@ -461,7 +510,16 @@ def _render_markdown_report(report: dict) -> str:
     lines.append(f"Target: {_md_code(report['target']['repo_path'])}  ")
     s = report["summary"]
     by = s.get("by_severity", {})
-    total = _md_inline(s.get("total", 0))
+    # The list is the authority on what the document contains. A payload whose
+    # summary lacks `total` rendered "Total findings: 0" above full finding
+    # sections, a document contradicting itself.
+    total = _md_inline(len(report["findings"]))
+    if s.get("total") not in (None, len(report["findings"])):
+        click.echo(
+            f"warning: summary.total says {s.get('total')!r} but "
+            f"{len(report['findings'])} findings are present",
+            err=True,
+        )
     counts = ", ".join(f"{_md_inline(k)}: {_md_inline(v)}" for k, v in by.items())
     lines.append(f"**Total findings: {total}** — {counts}" if by
                  else f"**Total findings: {total}**")
@@ -521,7 +579,7 @@ def _render_markdown_report(report: dict) -> str:
         )
         lines.append("")
         for fid in untraced:
-            lines.append(f"- `{_md_inline(fid)}`")
+            lines.append(f"- {_md_code(fid)}")
         lines.append("")
     return "\n".join(lines)
 

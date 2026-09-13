@@ -462,11 +462,43 @@ def test_legitimate_base_urls_are_still_accepted(url: str) -> None:
     assert auth_mod._base_url_rejection_reason(url) == ""
 
 
-@pytest.mark.parametrize("url", EDGE_WHITESPACE_BASE_URLS)
-def test_base_url_with_edge_whitespace_is_rejected(url: str) -> None:
-    """Judged on the string the CLI will parse, not on a cleaned-up copy: this
-    module never writes the stripped value back to os.environ."""
-    assert auth_mod._base_url_rejection_reason(url), f"accepted {url!r}"
+@pytest.mark.parametrize(
+    "url,expected",
+    [
+        ("  https://api.anthropic.com  ", "https://api.anthropic.com"),
+        ("\thttps://api.anthropic.com\n", "https://api.anthropic.com"),
+        ("https://api.anthropic.com\u00a0", "https://api.anthropic.com"),
+        (" https://api.anthropic.com ", "https://api.anthropic.com"),
+    ],
+)
+def test_edge_whitespace_is_normalised_into_the_env(
+    monkeypatch: pytest.MonkeyPatch, url: str, expected: str
+) -> None:
+    """Judged on the string the CLI will parse, which means the stripped value is
+    written back rather than refused. U+00A0 survives strip() into the
+    environment, so a padded value passed every gate here and then failed in the
+    CLI, while refusing it outright aborted a run over whitespace an operator
+    never sees."""
+    _require_claude_cli()
+    _clear_all_auth_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-fake")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", url)
+    status = auth_mod.configure_auth(allow_api_key=True)
+    assert status.auth_mode == "api_key"
+    assert os.environ["ANTHROPIC_BASE_URL"] == expected
+
+
+@pytest.mark.parametrize("url", ["\u00a0", "   ", "\t\n"])
+def test_whitespace_only_base_url_becomes_unset(url: str) -> None:
+    """It used to be accepted as "unset" while staying in the environment, so the
+    preflight was green and the CLI received a string it cannot parse."""
+    import pytest
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("ANTHROPIC_BASE_URL", url)
+        mp.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth")
+        auth_mod.configure_auth()
+        assert "ANTHROPIC_BASE_URL" not in os.environ
 
 
 @pytest.mark.parametrize("url", ["", "   "])

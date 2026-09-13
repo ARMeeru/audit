@@ -27,8 +27,10 @@
 >   without an auth token.
 > - **Report evidence is fence-safe**: target-influenced evidence renders inside
 >   a fence it cannot break; `AUDIT_ALLOW_API_KEY=no/off` parse as opt-out.
-> - **Egress correction**: network egress is NOT restricted to the target host
->   by any enforced mechanism. It is a prompt-level instruction only; recon
+> - **Egress**: the sandbox refuses every outbound connection unless a host is
+>   allowlisted, and `--target-url` allowlists that host for the run, so egress is
+>   enforced rather than prompted. Within a stage that has the sandbox off, the
+>   old caveat applies: recon
 >   credentials are stored plaintext in result artifacts. Run in a disposable
 >   VM or container when the target is sensitive.
 >
@@ -217,10 +219,11 @@ audit run --repo /path/to/target --run-id live \
 ```
 
 Rules the agents follow when `--target-url` is set:
-- Network egress is NOT enforced to that host: it is a prompt-level
-  instruction only, and the CLI itself contacts isbndb/OpenLibrary-style
-  services and your gateway. Run sensitive targets inside a disposable VM
-  or container.
+- Network egress is enforced by the sandbox to that host: a static run reaches
+  nothing at all, and a live-target run reaches its target host. A target that
+  redirects to a third-party host needs that stage's `sandbox` switched off, and
+  the CLI's own bookkeeping (your gateway) happens outside the sandboxed command.
+  Run sensitive targets inside a disposable VM or container regardless.
 - A finding that doesn't reproduce against the live target is dropped or
   rejected (depending on stage) — "no fabrication".
 - Credentials flow into every relevant stage's user_input as a dict.
@@ -285,9 +288,11 @@ Hunt agents have Bash and run inside per-task scratch dirs. They also run under
 the SDK's OS sandbox (macOS and Linux), enabled by default and configurable per
 stage via `sandbox` in `config/stages.yaml`:
 
-- writes outside the agent's working directory are refused by the sandbox, so an
-  agent cannot rewrite `state.db` or the `results/` tree even when the code it
-  is reading talks it into trying;
+- writes outside the agent's working directory and the directories you add with
+  `--add-dir` are refused by the sandbox, so an agent cannot rewrite `state.db`
+  or the `results/` tree even when the code it is reading talks it into trying.
+  The audited source itself IS inside that scope (it is added as a directory),
+  so a hunter can write to the target it is reading;
 - a PreToolUse filter additionally refuses tool calls naming `state.db`, the
   results tree, the harness `.env` or the Claude credentials file, and says why.
   It is a filter over a command string, **not** a boundary: a path built at
@@ -311,16 +316,26 @@ not have. `scripts/mutation-check.py` is the executable form of the claims above
 it breaks one protection at a time and fails if the sensor that should notice
 stays green.
 
-- **Bash commands are filtered by string, not by structure.** A path built at
-  runtime (`p=$(printf %s <base64> | base64 -d); sqlite3 "$p" ...`), a variable
-  or any other indirection walks past the filter. Structured tools are checked by
-  resolving the path and comparing containment, so those are exact.
+- **Bash commands are filtered by string, not by structure.** The filter
+  normalises the spellings it can see (`~`, `$HOME`, quoting, `//`, `/./`, `..`,
+  a leading `cd`), but a path built at runtime (`p=$(printf %s <base64> | base64
+  -d); sqlite3 "$p" ...`), a variable or any other indirection walks past it. It
+  matches the harness database by basename, so a target shipping its own
+  `state.db` cannot be reached by a shell command; use Read, which compares by
+  identity and does allow it.
+- **Structured tools are checked by identity, not by string.** A path is resolved
+  and compared with `st_dev`/`st_ino` where it exists, with a case-folded prefix
+  comparison otherwise, so case-folded spellings, hardlinks, symlinks and
+  not-yet-existing paths are all handled. That is a filesystem comparison, not a
+  guarantee about what the tool does with the path afterwards.
 - **A self-audit is unconfined by construction.** `--repo` pointing at this
   checkout, or at a directory containing it, hands the agent the tree the
   harness keeps `state.db` and `results/` in. The run logs a warning. Keeping
   those paths outside the audited tree is the structural fix and is not done yet.
-- **A platform where the sandbox cannot start** leaves the filter alone. That is
-  the one case where `sandbox: false` is the honest setting.
+- **A platform where the sandbox cannot start** leaves the filter alone, and a
+  target that redirects to a third-party host needs that stage's sandbox off.
+  Both are honest reasons to set `sandbox: false`; neither is a reason to leave
+  it off for a whole run.
 - **Prompt files can still be rewritten by a shell command in self-audit
   geometry.** Write and Edit are refused for the prompts, schemas and stage
   config, and Bash is refused by name, but a Bash command that builds the path at
@@ -333,6 +348,13 @@ stays green.
   access is an exfiltration route the sandbox cannot see. If you want a stage to
   have one, pass it explicitly through `mcp_servers` rather than relying on your
   global configuration.
+- **Loopback is not available under the sandbox, whatever the allowlist says.**
+  Measured: with `allowedDomains` set to `127.0.0.1`, `localhost` or
+  `127.0.0.1:<port>`, a connection to a local server is still refused with
+  `deny network-outbound`. The allowlist is by host and does not cover the
+  loopback interface, so a stage whose PoC needs a local server must run with
+  `sandbox: false`. Note that the port is not part of the allowlist either: a
+  target is allowlisted by host.
 - **Reads are not restricted at all in a normal run.** An agent can read any file
   the user can, including anything under `--add-dir`. The filter covers the
   harness's own secrets and state, not the rest of the filesystem.

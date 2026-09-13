@@ -36,6 +36,7 @@ async def run_recon(ctx: StageContext, db: StateDB, max_tasks: int = DEFAULT_MAX
             permission_mode=sc.permission_mode,
             sandbox=sc.sandbox,
             network_allow=ctx.network_allow(),
+            strict_mcp_config=sc.strict_mcp_config,
             artifact_dir=ctx.results_dir("recon"),
             artifact_name="recon",
             repair_attempts=sc.repair_attempts,

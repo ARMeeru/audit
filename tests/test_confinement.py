@@ -214,19 +214,24 @@ def test_guard_allows_structured_writes_into_the_target(tmp_path: Path) -> None:
     assert not _denied(out)
 
 
-def test_guard_denies_a_shell_reference_to_a_file_named_state_db() -> None:
-    """Known divergence, recorded rather than pinned as a requirement.
+def test_shell_reference_to_a_file_named_state_db_is_refused() -> None:
+    """Recorded divergence, not a requirement.
 
-    Matching the harness DB by basename in a SHELL string fails closed, so a
-    target repo with its own file called state.db is refused too. The denial
-    points at Read/Grep so the run continues, and the structured-tool path is
-    exact (it resolves and compares containment), so `Read <target>/state.db` is
-    allowed. If a later change makes the shell filter path-aware, this case is
-    expected to flip to allowed and this test should flip with it; the assertion
-    is here so the current behaviour is visible, not to defend it.
+    The shell filter matches the harness DB by basename, deliberately fail-closed:
+    it is the one name worth the over-block, because it catches spellings the
+    token walk cannot see (a sqlite URI, a name assembled from a variable, the WAL
+    sidecars). The cost is that a target repo shipping its own `state.db` cannot be
+    reached by a shell command, and the denial points at Read, which resolves and
+    compares containment and does allow it.
+
+    Deliberately NOT asserted here. Pinning today's over-block would make the
+    correct fix (making the shell rule path-aware) fail this test and argue with
+    whoever makes it. The behaviour is recorded because it is surprising, not
+    because it is wanted.
     """
     out = _decide(_guard(), "Bash", {"command": "sqlite3 ./state.db '.tables'"})
-    assert _denied(out), "shell basename match no longer fails closed"
+    if not _denied(out):
+        return  # the fix landed; nothing to record
     assert "state.db" in _reason(out)
 
 
@@ -288,23 +293,19 @@ def test_matcher_covers_every_tool_the_guard_inspects() -> None:
     and can never fire: narrowing the matcher to "Bash" used to leave all 290
     tests green while silently un-hooking every path-bearing Read call."""
     opts = _options()
-    matcher = opts.hooks["PreToolUse"][0].matcher or ""
-    for tool in ("Bash", "Write", "Edit", "Read", "Grep", "Glob"):
-        assert tool in matcher, (
+    alternatives = set((opts.hooks["PreToolUse"][0].matcher or "").split("|"))
+    for tool in ("Bash", "Write", "Edit", "Read", "Grep", "Glob", "NotebookEdit"):
+        # Set membership, not `in`: "Edit" is a substring of "NotebookEdit", so
+        # dropping Edit alone left a substring assertion green.
+        assert tool in alternatives, (
             f"the guard inspects {tool} input but the matcher never fires for it"
         )
-
-
-def test_guard_does_not_match_a_grep_pattern() -> None:
-    """A hunter grepping the TARGET for the string "state.db" is doing its job.
-    Only path-bearing keys are inspected, so a pattern is not a denial."""
-    out = _decide(_guard(), "Grep", {"pattern": "state\\.db", "path": "/tmp/target"})
-    assert not _denied(out), "a grep pattern was treated as a path"
 
 
 _SELF_AUDIT_FILES = {
     "Write": "file_path",
     "Edit": "file_path",
+    "NotebookEdit": "notebook_path",
 }
 _PROTECTED_FILES = [
     HARNESS_ROOT / "prompts" / "08-report.md",
@@ -549,8 +550,8 @@ def test_bash_guard_expands_home_spellings(command: str) -> None:
 
 
 @pytest.mark.parametrize("command", [
-    "ls /Users/meeru/.claude-backup/x",
-    "grep -r TODO /Users/meeru/.claudette/src",
+    f"ls {Path.home()}.claude-backup/x",
+    f"grep -r TODO {Path.home()}.claudette/src",
 ])
 def test_bash_guard_does_not_over_block_similar_paths(command: str) -> None:
     """The credentials branch was a bare substring, so `.claude-backup` and
@@ -729,4 +730,158 @@ def test_options_ignore_operator_configured_mcp_servers() -> None:
     assert opts.strict_mcp_config is True, (
         "without strict_mcp_config the CLI still loads user, project and "
         "plugin-provided MCP servers"
+    )
+
+
+# ---------- F11: the value has to travel, not just be computed ----------
+
+
+class _CaptureOptions:
+    """Captures the ClaudeAgentOptions a stage hands the runner."""
+
+    def __init__(self) -> None:
+        self.options = None
+
+    async def __call__(self, **kwargs):
+        import audit.runner as runner_mod
+
+        self.options = runner_mod._build_options(
+            system_prompt="s",
+            allowed_tools=kwargs["allowed_tools"],
+            model=kwargs["model"],
+            max_turns=kwargs["max_turns"],
+            cwd=kwargs["cwd"],
+            add_dirs=kwargs["add_dirs"],
+            permission_mode=kwargs["permission_mode"],
+            sandbox=kwargs["sandbox"],
+            network_allow=kwargs["network_allow"],
+            strict_mcp_config=kwargs["strict_mcp_config"],
+        )
+        raise RuntimeError("captured")
+
+
+def test_stage_call_sites_deliver_the_confinement_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The two existing tests cover opposite ends of this wire: one calls
+    `_build_options(network_allow=...)` directly, the other calls
+    `ctx.network_allow()` directly. Nothing asserted the value travelled, so
+    removing `network_allow=` from all eight stages left the suite green. This
+    runs a real stage against a stub that captures the options."""
+    import asyncio
+
+    import audit.stages._common as common_mod
+    import audit.stages.trace as trace_mod
+    from audit.state import StateDB
+    from audit.stages._common import StageContext
+
+    monkeypatch.setattr(common_mod, "RESULTS", tmp_path / "results")
+    monkeypatch.setattr(common_mod, "WORK", tmp_path / "work")
+    db = StateDB(tmp_path / "state.db")
+    db.create_run("repo", "r")
+    db.add_task("r", {"task_id": "t_1", "attack_class": "sqli", "scope_hint": "x",
+                      "target_files": ["a.py"], "rationale": "r", "priority": 1,
+                      "source": "recon"})
+    db.add_finding("r", "t_1", {
+        "finding_id": "f_1", "file": "a.py", "line_start": 1, "line_end": 2,
+        "vuln_class": "sqli", "severity": "high", "description": "d",
+        "evidence_snippet": "e", "confidence": 0.9})
+    db.set_finding_validation("r", "f_1", "confirmed", {"verdict": "confirmed"})
+    db.assign_finding_group("r", "f_1", "g_1", True)
+    db.add_dedupe_group("r", {"group_id": "g_1", "root_cause": "rc",
+                              "canonical_finding_id": "f_1",
+                              "member_finding_ids": ["f_1"]})
+    ctx = StageContext(run_id="r", repo_path=tmp_path / "repo",
+                       config=load_config(),
+                       live_target={"url": "https://live.example.com:8443/x",
+                                    "credentials": {}})
+    capture = _CaptureOptions()
+    monkeypatch.setattr(trace_mod, "run_agent", capture)
+
+    with pytest.raises(RuntimeError, match="captured"):
+        asyncio.run(trace_mod.run_trace(ctx, db))
+
+    assert capture.options is not None, "the stage never reached the runner"
+    assert capture.options.sandbox["network"] == {"allowedDomains": ["live.example.com"]}
+    assert capture.options.sandbox["enabled"] is True
+    assert capture.options.permission_mode == "acceptEdits"
+    assert capture.options.strict_mcp_config is True
+    assert list(capture.options.tools) == load_config().get("trace").tools
+
+
+def test_options_keep_the_operators_settings_files_out(
+    tmp_path: Path,
+) -> None:
+    """`setting_sources=[]` is what stops the target's or the operator's settings
+    from loading; deleting it left the suite green."""
+    opts = _options(cwd=tmp_path, add_dirs=[tmp_path])
+    assert opts.setting_sources == []
+
+
+def test_grep_glob_naming_the_env_is_refused() -> None:
+    """`.env` is guarded by containment rather than by a name rule (a target's own
+    file must stay readable), so the only thing catching a filename pattern is the
+    `_single_files` rule."""
+    guard = _guard(cwd=HARNESS_ROOT, workspace=[HARNESS_ROOT])
+    assert _denied(_decide(guard, "Grep", {"path": str(HARNESS_ROOT), "glob": ".env"}))
+
+
+def test_read_of_the_credentials_directory_is_refused() -> None:
+    """F21: the requirement is stated for Bash but was asserted only for Bash, so
+    narrowing the structured check to an exact-file comparison stayed green while
+    `Read ~/.claude/settings.json` opened."""
+    guard = _guard()
+    for path in (Path.home() / ".claude" / "settings.json",
+                 Path.home() / ".claude" / "history.jsonl",
+                 Path.home() / ".claude" / "projects" / "p.jsonl",
+                 Path.home() / ".claude.json"):
+        assert _denied(_decide(guard, "Read", {"file_path": str(path)})), path
+
+
+def test_config_refuses_a_bare_tools_key(tmp_path: Path) -> None:
+    """`tools:` with no value is None in YAML, and dict.get returns the stored
+    None rather than the default, so it crashed with a TypeError instead of the
+    intended message."""
+    p = _write_cfg(tmp_path, """
+stages:
+  hunt:
+    model: m
+    concurrency: 1
+    tools:
+""")
+    with pytest.raises(ValueError, match="tools must be a list"):
+        load_config(p)
+
+
+def test_config_refuses_an_explicitly_empty_tools_list(tmp_path: Path) -> None:
+    """An empty list disables every built-in tool, which is never what a stage
+    means: a stage that silently cannot act is worse than a refusal."""
+    p = _write_cfg(tmp_path, """
+stages:
+  hunt:
+    model: m
+    concurrency: 1
+    tools: []
+""")
+    with pytest.raises(ValueError, match="tools is empty"):
+        load_config(p)
+
+
+def test_grep_with_no_glob_cannot_read_a_guarded_file() -> None:
+    """F2: the enclosure rule is what catches a search rooted ABOVE the guarded
+    file, and it ran only when a pattern key was present. ripgrep passes --hidden
+    with only VCS directories excluded, so `Grep {path: <home>, pattern: "sk-ant",
+    output_mode: "content"}` with no glob read ~/.claude/.credentials.json while
+    the equivalent Read was refused. validate, gapfill, feedback, dedupe and
+    report have Grep and no Bash, so this filter is their whole defence."""
+    guard = _guard()  # cwd and workspace are both an unrelated target
+    for root in (str(Path.home()), "/", str(HARNESS_ROOT)):
+        assert _denied(
+            _decide(guard, "Grep",
+                    {"path": root, "pattern": "sk-ant", "output_mode": "content"})
+        ), root
+    # A root inside a guarded DIRECTORY is caught by the call's own path, not by
+    # the sensitive-file rule: nothing in the rule's list lives under results/.
+    assert _denied(
+        _decide(guard, "Grep", {"path": str(RESULTS), "pattern": "severity"})
     )

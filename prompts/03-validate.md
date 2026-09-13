@@ -63,17 +63,17 @@ A single JSON object matching `schemas/validation.schema.json`. No prose.
    take pre-parsed structured input that breaks the attack class.
 5. Construct the **strongest** benign explanation. Then weigh it
    against the offensive read.
-6. **If `live_target` is in input**, attempt to reproduce the finding
-   against it before deciding. A confirmed-static + reproduced-live
-   verdict is the strongest signal; confirmed-static + failed-live
-   should be downgraded to `rejected` unless the reason for non-
-   reproduction is clearly an environmental difference.
+6. This stage has no Bash in any mode, so nothing here executes against a
+   target. If `live_target` is in input, Hunt's record of what it reproduced
+   there is the evidence to weigh: a confirmed-static finding Hunt reproduced
+   live is the strongest signal, and one Hunt recorded as failing live is a
+   strong rejection signal unless the reason is clearly environmental. Read that
+   record rather than attempting your own request.
 7. Decide:
-   - **rejected**: the benign explanation is clearly correct, OR the
-     bug fails to reproduce against the live target.
-   - **confirmed**: the offensive read survives every counterargument
-     you can construct AND (when applicable) reproduces against the
-     live target.
+   - **rejected**: the benign explanation is clearly correct, OR Hunt recorded
+     the bug failing to reproduce against the live target.
+   - **confirmed**: the offensive read survives every counterargument you can
+     construct.
    - **needs_more_info**: a decisive disambiguation requires runtime
      observation you can't perform, dynamic config, or repo-external
      info. Suggest the test that would resolve it in `suggested_test`.

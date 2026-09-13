@@ -43,6 +43,11 @@ class StageConfig:
     # Bash and the harness's own state.db; turn it off only on a platform where
     # it cannot start, and read the residual-risk register in README.md first.
     sandbox: bool = True
+    # Whether to ignore MCP servers the operator's own configuration would load.
+    # On by default: those clients run inside the harness process, outside the
+    # sandbox, so a write-capable one is an exfiltration route. Turn it off on a
+    # machine where an enterprise MCP config makes the CLI refuse to start.
+    strict_mcp_config: bool = True
 
 
 @dataclass
@@ -72,7 +77,24 @@ def _validate_stage(name: str, spec: dict, defaults: dict) -> None:
     """Fail loudly on a stage that would run with a tool set or permission mode
     nobody intended. Unknown keys are still ignored (forward compatibility), but
     the keys we do consume are checked."""
-    tools = spec.get("tools", [])
+    # `tools:` with no value is None in YAML, and dict.get returns the stored
+    # None rather than the default, so this used to raise TypeError instead of
+    # the intended message.
+    if "tools" in spec and not isinstance(spec["tools"], list):
+        # A bare `tools:` key is None in YAML, and dict.get returns the stored
+        # None rather than the default, which used to raise a TypeError.
+        raise ValueError(
+            f"stage {name!r}: tools must be a list of tool names, got "
+            f"{spec['tools']!r}"
+        )
+    tools = spec.get("tools") or []
+    if "tools" in spec and not tools:
+        # An empty list disables every built-in tool, which is never what a stage
+        # means; failing here beats a stage that silently cannot act.
+        raise ValueError(
+            f"stage {name!r}: tools is empty (an unset key such as `tools:` "
+            "means the same thing). Name the tools, or remove the key."
+        )
     for tool in tools:
         if tool not in KNOWN_TOOLS:
             raise ValueError(
@@ -97,15 +119,21 @@ def _validate_stage(name: str, spec: dict, defaults: dict) -> None:
     # neither said anything. Require a real boolean. The defaults block is
     # checked by _validate_defaults, separately, so it is covered on a config
     # with no stages at all.
-    _check_sandbox(f"stage {name!r}", spec)
+    _check_bool(f"stage {name!r}", spec, "sandbox")
+    _check_bool(f"stage {name!r}", spec, "strict_mcp_config")
 
 
-def _check_sandbox(where: str, block: dict) -> None:
-    """The sandbox value must be a real boolean."""
-    if "sandbox" in block and not isinstance(block["sandbox"], bool):
+def _check_bool(where: str, block: dict, key: str) -> None:
+    """A confinement switch must be a real boolean.
+
+    YAML resolves `key:` with no value to None, and bool(None), bool(0), bool([])
+    and bool({}) are all False while bool("false") is True: a typo removed the
+    protection and an attempt to disable it kept it, both silently.
+    """
+    if key in block and not isinstance(block[key], bool):
         raise ValueError(
-            f"{where}: sandbox must be an unquoted true or false, got "
-            f"{block['sandbox']!r}. A quoted \"false\" does not disable it."
+            f"{where}: {key} must be an unquoted true or false, got "
+            f"{block[key]!r}. A quoted \"false\" does not disable it."
         )
 
 
@@ -117,7 +145,8 @@ def _validate_defaults(defaults: dict) -> None:
     the quoted "false" the check exists to refuse. The guard has to run whether
     or not there is a stage to hang it on.
     """
-    _check_sandbox("defaults", defaults)
+    _check_bool("defaults", defaults, "sandbox")
+    _check_bool("defaults", defaults, "strict_mcp_config")
 
 
 def load_config(path: Path | None = None) -> HarnessConfig:
@@ -133,7 +162,7 @@ def load_config(path: Path | None = None) -> HarnessConfig:
             name=name,
             model=spec["model"],
             concurrency=int(spec["concurrency"]),
-            tools=list(spec["tools"]),
+            tools=list(spec.get("tools") or []),
             max_turns=int(spec.get("max_turns", defaults.get("max_turns", 25))),
             permission_mode=spec.get(
                 "permission_mode", defaults.get("permission_mode", "acceptEdits")
@@ -145,6 +174,12 @@ def load_config(path: Path | None = None) -> HarnessConfig:
                 spec.get("est_cost_usd", defaults.get("est_cost_usd", 1.5))
             ),
             sandbox=bool(spec.get("sandbox", defaults.get("sandbox", True))),
+            strict_mcp_config=bool(
+                spec.get(
+                    "strict_mcp_config",
+                    defaults.get("strict_mcp_config", True),
+                )
+            ),
         )
     loops = raw.get("loops", {}) or {}
     return HarnessConfig(

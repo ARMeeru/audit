@@ -23,9 +23,18 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+# Rows run against a throwaway copy. Mutating the live tree meant an interrupt
+# between the write and the restore left the checkout broken, and it made the
+# script unsafe to run beside anything else. The copy is made once; each row
+# mutates and restores inside it.
+COPY = Path(tempfile.mkdtemp(prefix="audit-mutation-")) / "repo"
+_IGNORE = shutil.ignore_patterns(
+    ".git", ".venv", "venv", "__pycache__", "results", "work", ".delta",
+)
 PY = str(REPO / ".venv/bin/python")
 CONF = "tests/test_confinement.py"
 PATHS = "tests/test_path_ids.py"
@@ -72,19 +81,20 @@ MUTATIONS = [
     ("Grep path key dropped from the map", "audit/paths.py",
      '    "Grep": {"targets": ("path",), "patterns": ("glob",)},',
      '    "Grep": {"targets": (), "patterns": ("glob",)},',
-     [f"{CONF}::test_grep_glob_cannot_narrow_onto_a_guarded_file"], []),
+     [f"{CONF}::test_grep_with_no_glob_cannot_read_a_guarded_file"], []),
     ("NotebookEdit key dropped from the map", "audit/paths.py",
      '    "NotebookEdit": {"targets": ("notebook_path",)},',
      '    "NotebookEdit": {"targets": ()},',
      [f"{CONF}::test_guard_denies_structured_paths_into_harness_state"], []),
-    ("write-only set dropped for write tools", "audit/paths.py",
-     '    return {**guarded_paths(), **write_only_guards()} if writes else guarded_paths()',
-     "    return guarded_paths()",
+    ("write-only guards emptied", "audit/paths.py",
+     '    return {"the harness source and repository": REPO_ROOT}',
+     "    return {}",
+     [f"{CONF}::test_write_guard_protects_prompts_schemas_and_config",
+      f"{CONF}::test_bash_cannot_rewrite_prompts_schemas_or_config"], []),
+    ("write roots not applied to write tools", "audit/paths.py",
+     "    if tool_name in WRITE_TOOLS or tool_name == _BASH_TOOL:",
+     "    if tool_name == _BASH_TOOL:",
      [f"{CONF}::test_write_guard_protects_prompts_schemas_and_config"], []),
-    ("write-only set dropped for bash", "audit/paths.py",
-     "    return {**guarded_paths(), **write_only_guards()}\n",
-     "    return guarded_paths()\n",
-     [f"{CONF}::test_bash_cannot_rewrite_prompts_schemas_or_config"], []),
     # (F13) the matcher: omitting a tool left the suite green
     ("matcher narrowed to Bash only", "audit/paths.py",
      'GUARDED_TOOLS = frozenset(_TOOL_INPUTS) | {_BASH_TOOL}',
@@ -143,7 +153,7 @@ MUTATIONS = [
      "        _validate_stage(name, spec, defaults)\n", "",
      [f"{CONF}::test_config_rejects_unknown_tool_names"], []),
     ("sandbox type check removed", "audit/config.py",
-     '    if "sandbox" in block and not isinstance(block["sandbox"], bool):',
+     '    if key in block and not isinstance(block[key], bool):',
      "    if False:",
      [f"{CONF}::test_config_refuses_a_non_boolean_sandbox",
       f"{CONF}::test_stage_less_config_still_validates_defaults"], []),
@@ -212,17 +222,17 @@ MUTATIONS = [
      [f"{CLI}::test_inline_escaper_strips_leading_whitespace",
       f"{CLI}::test_indented_description_cannot_open_a_code_block"], []),
     ("code spans go back through the prose escaper", "audit/cli.py",
-     '    text = _fold_line_terminators(v)\n    longest = max(',
-     '    text = _md_inline(v)\n    longest = max(',
+     '    text = _fold_line_terminators(v)\n    delimiter =',
+     '    text = _md_inline(v)\n    delimiter =',
      # only the backslash sensor: escaping also keeps a span closed, so the
      # backtick sensor is insensitive to this one and is covered below.
      [f"{CLI}::test_code_span_fields_render_without_backslashes"], []),
     ("code span delimiter not padded", "audit/cli.py",
-     'delimiter = "`" * (longest + 1)', 'delimiter = "`"',
+     'delimiter = "`" * (_longest_backtick_run(text) + 1)', 'delimiter = "`"',
      [f"{CLI}::test_a_backtick_in_a_field_cannot_end_its_code_span"], []),
     ("missing-key guard removed", "audit/cli.py",
-     '    required = ("run_id", "target", "summary", "findings")',
-     "    required = ()",
+     're.search(r": \'([\\w]+)\' is a required property$", e)',
+     're.search(r": \'([\\w]+)\' is NOT a required property$", e)',
      [f"{CLI}::test_unrenderable_report_says_what_is_missing"], []),
     ("degraded not surfaced", "audit/cli.py",
      '    if report.get("degraded"):', "    if False:",
@@ -237,13 +247,13 @@ MUTATIONS = [
      [f"{CLI}::test_markdown_render_warns_on_a_schema_invalid_payload"], []),
     # ---- auth ----
     ("base-url validator neutered", "audit/auth.py",
-     '    original = url or ""\n    raw = original.strip()',
-     '    return ""\n    original = url or ""\n    raw = original.strip()',
+     'def _base_url_rejection_reason(url: str) -> str:',
+     'def _base_url_rejection_reason(url: str) -> str:\n    return ""',
      [f"{AUTH}::test_backslash_base_url_reason_names_the_character",
-      f"{AUTH}::test_base_url_with_edge_whitespace_is_rejected"], []),
-    ("edge whitespace judged stripped", "audit/auth.py",
+      f"{AUTH}::test_edge_whitespace_is_normalised_into_the_env"], []),
+    ("edge whitespace not normalised", "audit/auth.py",
      "    if original != raw:", "    if False:",
-     [f"{AUTH}::test_base_url_with_edge_whitespace_is_rejected"], []),
+     [f"{AUTH}::test_edge_whitespace_is_normalised_into_the_env"], []),
     ("broken ports no longer refused", "audit/auth.py",
      '    except ValueError:\n        return f"its port is not a valid port number ({parts.netloc!r})"',
      '    except ValueError:\n        return ""',
@@ -256,19 +266,38 @@ MUTATIONS = [
 ]
 
 
+def _prepare_copy() -> None:
+    """One clean copy of the tracked tree, without the venv or run artifacts."""
+    shutil.copytree(REPO, COPY, ignore=_IGNORE, dirs_exist_ok=True)
+
+
+class HarnessError(RuntimeError):
+    pass
+
+
 def run(tests: list[str]) -> set[str]:
     if not tests:
         return set()
-    # -B and no existing __pycache__: a mutation writes the source, pytest
+    # -B and no __pycache__ in the copy: a mutation writes the source, pytest
     # imports it, and the restore can land inside the same mtime tick, in which
     # case a cached .pyc compiled from the MUTATED source is reused and the
     # sensor looks green. That produced two non-reproducible verdicts before.
-    for cache in REPO.rglob("__pycache__"):
+    for cache in COPY.rglob("__pycache__"):
         shutil.rmtree(cache, ignore_errors=True)
+    # The venv's editable install maps `audit` straight back to the live
+    # checkout through a meta_path finder, so PYTHONPATH alone would import HEAD
+    # and prove nothing. Drop the finder and put the copy first.
+    bootstrap = (
+        "import sys; "
+        "sys.meta_path = [f for f in sys.meta_path "
+        "if type(f).__name__ != '_EditableFinder']; "
+        f"sys.path.insert(0, {str(COPY)!r}); "
+        "import pytest, sys as _s; "
+        f"_s.exit(pytest.main(['-q', '--no-header', '-p', 'no:cacheprovider', *{tests!r}]))"
+    )
     proc = subprocess.run(
-        [PY, "-B", "-m", "pytest", "-q", "--no-header", "-p", "no:cacheprovider",
-         *tests],
-        cwd=REPO, capture_output=True, text=True,
+        [PY, "-B", "-c", bootstrap],
+        cwd=COPY, capture_output=True, text=True,
         env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
     )
     if proc.returncode not in (0, 1):
@@ -276,8 +305,10 @@ def run(tests: list[str]) -> set[str]:
         # arrive here as an empty failed set, which reads as "sensor stayed
         # green" and hides a harness bug. It happened once: an anchor matched the
         # wrong function and left a dangling ` if writes else ...`.
-        print(f"  !! pytest exit {proc.returncode}: mutation likely broke the file")
-        print("  " + (proc.stdout[-600:] or proc.stderr[-600:]).replace("\n", "\n  "))
+        raise HarnessError(
+            f"pytest exit {proc.returncode} (mutation likely broke the file)\n"
+            + (proc.stdout[-600:] or proc.stderr[-600:])
+        )
     failed = set()
     for line in proc.stdout.splitlines():
         if line.startswith("FAILED ") or line.startswith("ERROR "):
@@ -286,11 +317,27 @@ def run(tests: list[str]) -> set[str]:
     return failed
 
 
+def _fingerprint() -> str:
+    """A hash of the live sources, so the harness can prove it changed nothing."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    for sub in ("audit", "tests", "config", "prompts", "schemas", "scripts"):
+        for path in sorted((REPO / sub).rglob("*")):
+            if path.is_file() and "__pycache__" not in path.parts:
+                digest.update(str(path).encode())
+                digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
 def main() -> int:
     problems = 0
+    start_fingerprint = _fingerprint()
     print(f"{'mutation':46} {'red':>4} {'green':>6}  verdict")
+    _prepare_copy()
+    print(f"copy: {COPY}\n")
     for name, rel, old, new, expect_red, expect_green in MUTATIONS:
-        path = REPO / rel
+        path = COPY / rel
         original = path.read_text()
         if old not in original:
             print(f"{name:46} {'-':>4} {'-':>6}  SKIP: anchor not found in {rel}")
@@ -299,6 +346,10 @@ def main() -> int:
         path.write_text(original.replace(old, new, 1))
         try:
             failed = run(expect_red + expect_green)
+        except HarnessError as e:
+            print(f"{name:46} {'-':>4} {'-':>6}  HARNESS ERROR: {e}")
+            problems += 1
+            continue
         finally:
             path.write_text(original)
         red_ids = {t.split("::", 1)[1] for t in expect_red}
@@ -315,9 +366,16 @@ def main() -> int:
                 problems += 1
         print(f"{name:46} {len(expect_red):>4} {len(expect_green):>6}  {verdict}")
 
-    dirty = subprocess.run(["git", "diff", "--quiet"], cwd=REPO).returncode
     print()
-    print("tree clean vs HEAD" if dirty == 0 else "TREE DIRTY (fixes uncommitted?)")
+    print(
+        "live tree untouched by this run"
+        if _fingerprint() == start_fingerprint
+        else "LIVE TREE CHANGED: the harness must never mutate the checkout"
+    )
+    if _fingerprint() != start_fingerprint:
+        problems += 1
+    shutil.rmtree(COPY.parent, ignore_errors=True)
+    print(f"rows run: {len(MUTATIONS)}")
     print("ALL MUTATIONS BEHAVED" if problems == 0 else f"{problems} problem(s)")
     return 1 if problems else 0
 
