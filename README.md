@@ -293,14 +293,8 @@ stage via `sandbox` in `config/stages.yaml`:
   It is a filter over a command string, **not** a boundary: a path built at
   runtime, base64-encoded, or held in a variable walks straight past it.
 
-Two cases where the sandbox is not the boundary, both worth knowing before you
-rely on it:
-
-- **A self-audit** (`--repo` pointing at this checkout) hands the harness tree to
-  the agent as its own working directory, so no path-based restriction can
-  separate the two. Only the filter applies. Such a run logs a warning.
-- **A platform where the sandbox cannot start** (Linux without a working
-  sandbox) falls back to the filter alone.
+Two cases are worth knowing before you rely on either layer, and both are in the
+register below rather than repeated here.
 
 For an untrusted target, run the audit inside a disposable VM or container
 anyway: a target with malicious build scripts could otherwise execute on your
