@@ -696,3 +696,22 @@ def test_sandbox_settings_are_not_shared_between_dispatches() -> None:
     assert first.sandbox is not second.sandbox
     first.sandbox["enabled"] = False
     assert second.sandbox["enabled"] is True, "settings leaked across dispatches"
+
+
+@pytest.mark.skipif(
+    not Path("/System/Volumes/Data").exists(),
+    reason="macOS firmlink volume; the same path is a plain symlink elsewhere",
+)
+def test_firmlink_spelling_of_the_checkout_also_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`resolve()` collapses symlinks but leaves a firmlinked spelling alone, so
+    /System/Volumes/Data/Users/... did not equal the checkout even though it is
+    the same directory, and the warning that names this geometry stayed quiet."""
+    firmlink = Path("/System/Volumes/Data" + str(HARNESS_ROOT))
+    assert firmlink.exists(), "fixture assumption: the firmlink path resolves"
+    with caplog.at_level("WARNING"):
+        _options(cwd=Path("/tmp/elsewhere"), add_dirs=[firmlink])
+    assert any("self-audit" in r.message.lower() for r in caplog.records), (
+        "the firmlinked spelling of the checkout was not recognised"
+    )
