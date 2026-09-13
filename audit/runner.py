@@ -38,7 +38,15 @@ from claude_agent_sdk import (
 )
 
 from audit.json_utils import extract_json, validate_schema
-from audit.paths import REPO_ROOT, guard_hit, safe_component, write_guard_hit
+from audit.paths import (
+    GUARDED_TOOLS,
+    REPO_ROOT,
+    _TOOL_INPUTS,
+    bash_guard_hit,
+    canonical_path,
+    safe_component,
+    structured_path_hit,
+)
 
 log = logging.getLogger(__name__)
 
@@ -131,18 +139,17 @@ def _classify_api_error(
 # Two layers, and they are not equivalent.
 #
 # The sandbox (SDK `sandbox` settings) is the boundary. Commands run inside the
-# OS sandbox, which allows writes under the agent's own working directory and
-# refuses them elsewhere, so a hunter that has been talked into rewriting
-# state.db cannot: the syscall fails.
+# OS sandbox, which allows writes under the agent's own working directory and the
+# directories it was granted, and refuses them elsewhere, so a hunter that has
+# been talked into rewriting state.db cannot: the syscall fails.
 #
-# The tool guard below is a FILTER over the command string. It catches the
-# direct attempt and the obvious ones, and it is what stands in the way when
-# the sandbox cannot start (Linux without a working sandbox) or when no
-# path-based boundary can exist at all (a self-audit, where the target repo IS
-# the harness checkout, so cwd grants the agent its own state directory).
-# Obfuscation defeats it: `p=$(printf %s <b64>|base64 -d); sqlite3 "$p" ...`
-# walks past. It is defence in depth, never the boundary, and must not be
-# described as one.
+# The tool guard below is a FILTER. For structured tools it resolves the path and
+# compares containment, which is exact. For Bash there is no structure to
+# resolve, so it is a string match, and a path built at runtime
+# (`p=$(printf %s <b64>|base64 -d); sqlite3 "$p" ...`) walks past it. It is the
+# only layer in the two geometries where no sandbox can separate harness from
+# target: a self-audit, and a platform where the sandbox cannot start. Defence in
+# depth, never the boundary, and it must not be described as one.
 
 _SANDBOX_SETTINGS: dict[str, Any] = {
     "enabled": True,
@@ -155,39 +162,41 @@ _SANDBOX_SETTINGS: dict[str, Any] = {
     "allowUnsandboxedCommands": False,
 }
 
-# Every tool whose input the guard inspects, Bash included. It has to name all
-# of them: a matcher that omits Read means the CLI never calls the callback for
-# a Read, so the check exists in the code and cannot fire in production. The
-# cost is a callback round trip on Read/Grep/Glob too, which is why the keys
-# inspected are path-bearing ones only.
-_GUARD_MATCHER = "Bash|Write|Edit|NotebookEdit|Read|Grep|Glob"
-
-# Where a tool keeps the path or command it is about to use. Deliberately not
-# `pattern`: a Grep pattern of "state.db" is a hunter looking for that string in
-# the target, not an attempt to touch the harness's own file.
-_PATH_KEYS = ("command", "file_path", "notebook_path", "path")
-
-# Tools that write. Only these get the extended, write-only guard set (prompts,
-# schemas, stage config), because a self-audit may legitimately READ those.
-_WRITE_TOOLS = ("Write", "Edit", "NotebookEdit")
+# Which tool_input fields carry a path, and which tools the matcher must name,
+# both come from audit.paths so the vocabulary cannot drift: a tool the guard
+# inspects but the matcher omits is a check that can never fire, which is what
+# the Read, Grep and Glob entries were before this was centralised.
+_GUARD_MATCHER = "|".join(sorted(GUARDED_TOOLS))
+_UNKEYED = GUARDED_TOOLS - set(_TOOL_INPUTS) - {"Bash"}
+assert not _UNKEYED, f"guarded tool with no inspected keys: {_UNKEYED}"
 
 
-def _make_tool_guard():
-    """Build the PreToolUse callback that refuses harness-state tool calls.
+def _make_tool_guard(cwd: Path | None = None, workspace: list[Path] | None = None):
+    """Build the PreToolUse callback that refuses harness-file tool calls.
 
     PreToolUse rather than `can_use_tool`: the SDK documents that a whole-tool
     `allowed_tools` entry plus `permission_mode="acceptEdits"` shadows the
     permission callback entirely, so `can_use_tool` would never fire for the
     tools that matter here. PreToolUse fires for every call.
+
+    `cwd` is the session's working directory and `workspace` the directories a
+    bare pattern resolves against. Built without them, the guard assumes the
+    harness root, which fails closed.
     """
+    session_cwd = Path(cwd) if cwd is not None else REPO_ROOT
+    workspace_dirs = [Path(p) for p in (workspace or [session_cwd])]
 
     async def _guard(input: dict, tool_use_id: str | None, context: dict) -> dict:
         tool_name = input.get("tool_name", "")
         tool_input = input.get("tool_input") or {}
-        text = " ".join(
-            str(tool_input[key]) for key in _PATH_KEYS if tool_input.get(key)
-        )
-        hit = write_guard_hit(text) if tool_name in _WRITE_TOOLS else guard_hit(text)
+        if tool_name == "Bash":
+            hit = bash_guard_hit(str(tool_input.get("command", "")), cwd=session_cwd)
+        elif tool_name in _TOOL_INPUTS:
+            hit = structured_path_hit(
+                tool_name, tool_input, cwd=session_cwd, workspace=workspace_dirs
+            )
+        else:
+            hit = None
         if hit is None:
             return {}
         return {
@@ -226,33 +235,50 @@ def _build_options(
     add_dirs: list[Path] | None,
     permission_mode: str,
     sandbox: bool = True,
+    network_allow: list[str] | None = None,
 ) -> ClaudeAgentOptions:
     """Assemble the SDK options, confinement included.
 
     Split out of _run_agent_once so the confinement can be asserted without an
     API call (and without pytest-asyncio, which the suite does not install).
+
+    `network_allow` is the sandbox's egress allowlist, normally just the host of
+    the operator's `--target-url`. Measured, not assumed: with the sandbox on and
+    no network config, every outbound connection is refused, loopback included,
+    with `deny network-outbound <host>:443` in the transcript. A static run
+    therefore has no egress at all, which is a property worth having; a
+    live-target run needs its target named here or its reproduce step cannot
+    reach it.
     """
     cwd = Path(cwd)
     dirs = [Path(p) for p in (add_dirs or [])]
-    # Overlap in EITHER direction: the agent was handed the harness checkout
-    # itself, a directory containing it, or a directory inside it. Equality
-    # alone missed the containing case, and the containing case is exactly as
-    # unconfined: the sandbox's write scope is the working directory PLUS
-    # added directories, so a parent directory confers write access to
-    # state.db, results/ and .env just as directly.
+    # The agent was handed a directory that encloses the harness checkout, which
+    # is the only overlap that matters: the sandbox's write scope is the working
+    # directory PLUS the added directories, so a directory containing the
+    # checkout confers access to state.db, results/ and .env. A harness-chosen
+    # cwd that merely sits inside the checkout (hunt's scratch dir is
+    # REPO_ROOT/work/<run>/hunt/<task>) is not this case and must not be
+    # reported as one, or the warning fires on every task of every run and stops
+    # meaning anything.
+    granted = (cwd, *dirs)
     if any(
-        p.resolve() == REPO_ROOT
-        or p.resolve().is_relative_to(REPO_ROOT)
-        or REPO_ROOT.is_relative_to(p.resolve())
-        for p in (cwd, *dirs)
+        canonical_path(p) == REPO_ROOT or REPO_ROOT.is_relative_to(canonical_path(p))
+        for p in granted
     ):
         log.warning(
-            "[confinement] self-audit: the target repo is (or contains, or sits "
-            "inside) the harness checkout, so the OS sandbox cannot separate them. "
-            "The sandbox still blocks writes outside the checkout, but state.db "
-            "sits inside it and is protected only by the tool filter, which "
-            "obfuscation can walk past."
+            "[confinement] self-audit: the target was granted the harness checkout "
+            "itself or a directory containing it, so the OS sandbox cannot separate "
+            "them. state.db and results/ sit inside it and are then protected only "
+            "by the tool filter, which obfuscation can walk past."
         )
+    sandbox_settings: dict[str, Any] | None = None
+    if sandbox:
+        # A fresh dict per dispatch: one shared mutable literal would be written
+        # through by any SDK version that normalizes sandbox settings in place,
+        # reconfiguring confinement for every agent already in flight.
+        sandbox_settings = dict(_SANDBOX_SETTINGS)
+        if network_allow:
+            sandbox_settings["network"] = {"allowedDomains": list(network_allow)}
     return ClaudeAgentOptions(
         system_prompt=system_prompt,
         # `tools` is the set that EXISTS; `allowed_tools` only pre-approves.
@@ -267,8 +293,15 @@ def _build_options(
         add_dirs=[str(p) for p in dirs],
         permission_mode=permission_mode,
         setting_sources=[],
-        sandbox=_SANDBOX_SETTINGS if sandbox else None,
-        hooks={"PreToolUse": [HookMatcher(matcher=_GUARD_MATCHER, hooks=[_make_tool_guard()])]},
+        sandbox=sandbox_settings,
+        hooks={
+            "PreToolUse": [
+                HookMatcher(
+                    matcher=_GUARD_MATCHER,
+                    hooks=[_make_tool_guard(cwd, [cwd, *dirs])],
+                )
+            ]
+        },
     )
 
 
@@ -285,6 +318,7 @@ async def run_agent(
     max_turns: int = 25,
     permission_mode: str = "acceptEdits",
     sandbox: bool = True,
+    network_allow: list[str] | None = None,
     artifact_dir: Path,
     artifact_name: str,
     repair_attempts: int = 1,
@@ -329,6 +363,7 @@ async def run_agent(
                 max_turns=max_turns,
                 permission_mode=permission_mode,
                 sandbox=sandbox,
+                network_allow=network_allow,
                 artifact_dir=artifact_dir,
                 artifact_name=artifact_name,
                 repair_attempts=repair_attempts,
@@ -364,6 +399,7 @@ async def _run_agent_once(
     max_turns: int,
     permission_mode: str,
     sandbox: bool,
+    network_allow: list[str] | None,
     artifact_dir: Path,
     artifact_name: str,
     repair_attempts: int,
@@ -397,6 +433,7 @@ async def _run_agent_once(
         add_dirs=add_dirs,
         permission_mode=permission_mode,
         sandbox=sandbox,
+        network_allow=network_allow,
     )
 
     initial_prompt = json.dumps(user_input, ensure_ascii=False)

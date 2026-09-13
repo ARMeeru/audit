@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from audit.paths import UnsafeIdentifier
 from audit.runner import AgentRunError, QuotaExhaustedError, TransientAgentError, run_agent
 from audit.state import Finding, StateDB
 from audit.stages._common import StageContext
@@ -63,6 +64,7 @@ async def run_validate(ctx: StageContext, db: StateDB) -> int:
                     max_turns=sc.max_turns,
                     permission_mode=sc.permission_mode,
                     sandbox=sc.sandbox,
+                    network_allow=ctx.network_allow(),
                     artifact_dir=ctx.results_dir("validate"),
                     artifact_name=f.finding_id,
                     repair_attempts=sc.repair_attempts,
@@ -97,7 +99,7 @@ async def run_validate(ctx: StageContext, db: StateDB) -> int:
                 # re-burning spend via the dispatch attempts ceiling.
                 return
 
-            except ValueError as e:
+            except UnsafeIdentifier as e:
                 # An identifier that cannot become a filename. This finding's
                 # problem, not the run's: propagating it out of the gather marks
                 # the whole run failed, after the exploration spend is sunk.

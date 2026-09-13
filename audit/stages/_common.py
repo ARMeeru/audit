@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 from audit.config import HarnessConfig, StageConfig
-from audit.paths import PROMPTS, REPO_ROOT, RESULTS, SCHEMAS, WORK, safe_component
+from audit.paths import PROMPTS, RESULTS, SCHEMAS, WORK, safe_component
 
 # Re-exported so a future module imports the paths policy instead of rebuilding
 # it. Rebound from audit.paths, not duplicated: tests patch these names on this
@@ -33,6 +34,19 @@ class StageContext:
         if self.scope_notes:
             out["scope_notes"] = self.scope_notes
         return out
+
+    def network_allow(self) -> list[str]:
+        """Egress the sandbox should permit: the operator's live target, if any.
+
+        Measured: with the sandbox on and no network config, every outbound
+        connection is refused, loopback included. A static run therefore reaches
+        nothing, which is the property worth keeping; a live-target run has to
+        name its target or the reproduce step cannot execute. Only the host is
+        allowed, not the whole URL, and a target that redirects to a CDN needs
+        the stage's sandbox switched off.
+        """
+        host = urlparse(str((self.live_target or {}).get("url", ""))).hostname
+        return [host] if host else []
 
     def prompt(self, name: str) -> Path:
         path = PROMPTS / f"{name}.md"

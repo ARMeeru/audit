@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
-from audit.paths import safe_component
+from audit.paths import new_run_id, safe_component
 
 
 SCHEMA = """
@@ -417,7 +417,18 @@ class StateDB:
         # A run id names directories under results/ and work/. Validating here
         # as well as at the call sites means no path can be built from an
         # unvalidated id even if a future caller forgets.
-        run_id = safe_component(run_id or f"run_{uuid.uuid4().hex[:8]}", kind="run_id")
+        run_id = safe_component(run_id or new_run_id(), kind="run_id")
+        # macOS and Windows filesystems fold case, so two ids differing only
+        # in case share one directory while SQLite keeps two rows: writing
+        # through one and reading through the other silently crosses runs.
+        clash = self._conn.execute(
+            "SELECT run_id FROM runs WHERE lower(run_id) = lower(?)", (run_id,)
+        ).fetchone()
+        if clash is not None:
+            raise ValueError(
+                f"run id {run_id!r} collides with {clash['run_id']!r} on a "
+                "case-insensitive filesystem"
+            )
         self._conn.execute(
             "INSERT INTO runs (run_id, repo_path, started_at, status) VALUES (?, ?, ?, ?)",
             (run_id, repo_path, time.time(), "running"),

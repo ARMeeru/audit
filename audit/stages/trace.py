@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from audit.paths import UnsafeIdentifier
 from audit.runner import AgentRunError, QuotaExhaustedError, TransientAgentError, run_agent
 from audit.state import Finding, StateDB
 from audit.stages._common import StageContext, truncated_recon_summary
@@ -57,6 +58,7 @@ async def run_trace(ctx: StageContext, db: StateDB) -> int:
                     max_turns=sc.max_turns,
                     permission_mode=sc.permission_mode,
                     sandbox=sc.sandbox,
+                    network_allow=ctx.network_allow(),
                     artifact_dir=ctx.results_dir("trace"),
                     artifact_name=f.finding_id,
                     repair_attempts=sc.repair_attempts,
@@ -87,7 +89,7 @@ async def run_trace(ctx: StageContext, db: StateDB) -> int:
                 # real API spend still gets recorded.
                 return
 
-            except ValueError as e:
+            except UnsafeIdentifier as e:
                 # An identifier that cannot become a filename. Fail this
                 # finding, not the run: an exception escaping the gather marks
                 # every other trace as lost too. No row, so --resume retries it.

@@ -67,6 +67,7 @@ async def run_report(ctx: StageContext, db: StateDB) -> Path:
             max_turns=sc.max_turns,
             permission_mode=sc.permission_mode,
             sandbox=sc.sandbox,
+            network_allow=ctx.network_allow(),
             artifact_dir=ctx.results_dir("report"),
             artifact_name="report_agent",
             repair_attempts=max(sc.repair_attempts, 2),  # report MUST validate

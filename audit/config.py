@@ -7,13 +7,16 @@ from pathlib import Path
 
 import yaml
 
+from audit.paths import CONFIG
+
 # The tools a stage may be granted. An unknown name used to be forwarded
 # verbatim into ClaudeAgentOptions.allowed_tools, so a typo'd or invented entry
 # silently became an approved tool.
 KNOWN_TOOLS = frozenset(
-    {"Read", "Write", "Edit", "NotebookEdit", "Bash", "Grep", "Glob",
-     "WebFetch", "WebSearch", "Task", "TodoWrite"}
+    {"Read", "Write", "Edit", "NotebookEdit", "Bash", "BashOutput", "KillShell",
+     "Grep", "Glob", "WebFetch", "WebSearch", "Task", "TodoWrite"}
 )
+
 
 # The SDK's permission modes. `bypassPermissions` is deliberately excluded:
 # stages.yaml has always carried "# never bypassPermissions" as a comment, and a
@@ -38,7 +41,7 @@ class StageConfig:
     # Whether to run this stage's agents under the SDK's OS sandbox. On by
     # default because the sandbox is the only real boundary between an agent's
     # Bash and the harness's own state.db; turn it off only on a platform where
-    # it cannot start, and read the residual-risk note in FORK-NOTES.md first.
+    # it cannot start, and read the residual-risk register in README.md first.
     sandbox: bool = True
 
 
@@ -91,20 +94,38 @@ def _validate_stage(name: str, spec: dict, defaults: dict) -> None:
     # boundary rather than tightening it. YAML is helpful enough that
     # `sandbox:` (null), `0`, `[]` and `{}` all coerce to False through bool(),
     # and a quoted "false" coerces to True: both directions are wrong and
-    # neither said anything. Require a real boolean.
-    for where, block in (("defaults", defaults), (f"stage {name!r}", spec)):
-        if "sandbox" in block and not isinstance(block["sandbox"], bool):
-            raise ValueError(
-                f"{where}: sandbox must be an unquoted true or false, got "
-                f"{block['sandbox']!r}. A quoted \"false\" does not disable it."
-            )
+    # neither said anything. Require a real boolean. The defaults block is
+    # checked by _validate_defaults, separately, so it is covered on a config
+    # with no stages at all.
+    _check_sandbox(f"stage {name!r}", spec)
+
+
+def _check_sandbox(where: str, block: dict) -> None:
+    """The sandbox value must be a real boolean."""
+    if "sandbox" in block and not isinstance(block["sandbox"], bool):
+        raise ValueError(
+            f"{where}: sandbox must be an unquoted true or false, got "
+            f"{block['sandbox']!r}. A quoted \"false\" does not disable it."
+        )
+
+
+def _validate_defaults(defaults: dict) -> None:
+    """Validate the defaults block on its own.
+
+    The sandbox check used to live inside _validate_stage, which load_config only
+    calls from the stage loop, so a config with no stages at all accepted exactly
+    the quoted "false" the check exists to refuse. The guard has to run whether
+    or not there is a stage to hang it on.
+    """
+    _check_sandbox("defaults", defaults)
 
 
 def load_config(path: Path | None = None) -> HarnessConfig:
     if path is None:
-        path = Path(__file__).resolve().parent.parent / "config" / "stages.yaml"
+        path = CONFIG / "stages.yaml"
     raw = yaml.safe_load(path.read_text())
     defaults = raw.get("defaults", {}) or {}
+    _validate_defaults(defaults)
     stages: dict[str, StageConfig] = {}
     for name, spec in (raw.get("stages") or {}).items():
         _validate_stage(name, spec, defaults)

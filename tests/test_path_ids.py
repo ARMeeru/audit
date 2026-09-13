@@ -40,6 +40,11 @@ ESCAPES = [
     "~/.ssh",
     "a\x00b",
     "a\nb",
+    # `$` in an anchored `match` also matches before a trailing newline, so
+    # these two were accepted and became real directory names on disk.
+    "run_x\n",
+    "..\n",
+    "a\r",
     "",
     "x" * 129,
     "é",
@@ -63,15 +68,20 @@ def test_create_run_rejects_a_traversing_run_id(tmp_path: Path) -> None:
         db.create_run(str(tmp_path / "repo"), "../escape")
 
 
+# `match="unsafe"` on purpose. A bare `pytest.raises(ValueError)` was satisfied
+# for the NUL cases by CPython's own `os.mkdir: embedded null character in path`,
+# so two of these entries passed identically at origin/main and could never have
+# detected the defect they were written for. Matching the harness's own message
+# makes every entry red against the unfixed code for the right reason.
 @pytest.mark.parametrize("bad", ESCAPES)
 def test_results_dir_rejects_a_traversing_run_id(tmp_path: Path, bad: str) -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="unsafe"):
         _ctx(bad, tmp_path).results_dir("report")
 
 
 @pytest.mark.parametrize("bad", ESCAPES)
 def test_hunt_work_dir_rejects_a_traversing_task_id(tmp_path: Path, bad: str) -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="unsafe"):
         _ctx("run_ok", tmp_path).work_dir("hunt", bad)
 
 
@@ -82,8 +92,18 @@ def test_artifact_path_rejects_a_traversing_name(tmp_path: Path, bad: str) -> No
         "audit.runner._artifact_path is missing: the artifact filename is built "
         "inline from a model-supplied name"
     )
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="unsafe"):
         fn(tmp_path, bad)
+
+
+def test_create_run_rejects_a_case_insensitive_collision(tmp_path: Path) -> None:
+    """macOS and Windows fold case, so two ids differing only in case share one
+    directory while SQLite keeps two rows: writing through one and reading
+    through the other silently crosses runs."""
+    db = StateDB(tmp_path / "state.db")
+    db.create_run(str(tmp_path / "repo"), "run_ab12cd34")
+    with pytest.raises(ValueError, match="case-insensitive"):
+        db.create_run(str(tmp_path / "repo"), "RUN_AB12CD34")
 
 
 @pytest.mark.parametrize("good", GOOD)

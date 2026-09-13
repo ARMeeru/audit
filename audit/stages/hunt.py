@@ -6,7 +6,7 @@ import asyncio
 import logging
 from typing import Awaitable, Callable
 
-from audit.paths import safe_component
+from audit.paths import UnsafeIdentifier, safe_component
 from audit.runner import (
     AgentRunError,
     QuotaExhaustedError,
@@ -65,21 +65,6 @@ async def run_hunt(
             if aborted.is_set():
                 counters["skipped"] += 1
                 return
-            # `task_id` becomes both a scratch directory name and an artifact
-            # filename. The agent path is already covered: every producer of
-            # tasks $refs hunt_task.schema.json, which pins task_id to
-            # ^[a-z0-9_-]{1,64}$, so a traversing id never survives validation.
-            # This is the backstop for an id that arrives by another route (a
-            # tampered or hand-edited DB, a future importer), and it turns that
-            # into one failed task instead of a stage-level crash or an escape.
-            try:
-                safe_component(task.task_id, kind="task_id")
-            except ValueError as bad_id:
-                log.error("[%s] hunt task %r rejected: %s", ctx.run_id,
-                          task.task_id, bad_id)
-                db.update_task_status(ctx.run_id, task.task_id, "failed")
-                counters["tasks_failed"] += 1
-                return
             reserved = 0.0
             if budget_check is not None:
                 # Reserve a SNAPSHOT rather than reading `estimate` at
@@ -101,6 +86,27 @@ async def run_hunt(
                     counters["skipped"] += 1
                     return
             db.begin_task(ctx.run_id, task.task_id)
+            # `task_id` becomes both a scratch directory name and an artifact
+            # filename. The agent path is already covered: every producer of
+            # tasks $refs hunt_task.schema.json, which pins task_id to
+            # ^[a-z0-9_-]{1,64}$, so a traversing id never survives validation.
+            # This is the backstop for an id that arrives by another route (a
+            # tampered or hand-edited DB, a future importer), and it turns that
+            # into one failed task instead of a stage-level crash or an escape.
+            #
+            # After begin_task on purpose: that is what spends the attempt, and
+            # a rejection that spends none is re-queued by every resume forever
+            # while staying invisible to the abandonment count, which filters on
+            # attempts >= the ceiling.
+            try:
+                safe_component(task.task_id, kind="task_id")
+            except UnsafeIdentifier as bad_id:
+                log.error("[%s] hunt task %r rejected: %s", ctx.run_id,
+                          task.task_id, bad_id)
+                db.update_task_status(ctx.run_id, task.task_id, "failed")
+                counters["tasks_failed"] += 1
+                in_flight[0] -= reserved
+                return
             scratch = ctx.work_dir("hunt", task.task_id)
             subsystem_hint = task.target_files[0] if task.target_files else None
             user_input = {
@@ -127,6 +133,7 @@ async def run_hunt(
                     max_turns=sc.max_turns,
                     permission_mode=sc.permission_mode,
                     sandbox=sc.sandbox,
+                    network_allow=ctx.network_allow(),
                     artifact_dir=ctx.results_dir("hunt"),
                     artifact_name=task.task_id,
                     repair_attempts=sc.repair_attempts,
