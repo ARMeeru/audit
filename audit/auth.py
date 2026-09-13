@@ -96,9 +96,18 @@ def _base_url_rejection_reason(url: str) -> str:
     instead. Only string-shape problems are handled: a value that fails to parse
     at all is left to _is_gateway_base, which already fails closed on it.
     """
-    raw = (url or "").strip()
+    original = url or ""
+    raw = original.strip()
     if not raw:
+        # Whitespace-only is the same as unset, which is the subscription path.
         return ""
+    if original != raw:
+        # Judge what the CLI will receive, not a cleaned-up copy: this module
+        # never writes the stripped value back to os.environ, so the two would
+        # otherwise differ. U+00A0 and friends survive strip() into the env and
+        # make the CLI fail on a URL that passed every gate here.
+        return ("it has leading or trailing whitespace (including Unicode "
+                "spaces), which is not stripped before the CLI parses it")
     if "\\" in raw:
         return (
             "it contains a backslash. Python and WHATWG URL parsers disagree "

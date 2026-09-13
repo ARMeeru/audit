@@ -403,6 +403,20 @@ STRING_LEVEL_REJECTIONS = FOREIGN_HOST_BASE_URLS + [
     "https://api.anthropic.com\x00.evil.com",
 ]
 
+# Edge whitespace the CLI would receive but this module used to judge a
+# stripped copy of: strip() removes U+00A0 and friends, so the gates read
+# "https://api.anthropic.com" and passed while the environment still held the
+# padded string, which the CLI then rejected.
+EDGE_WHITESPACE_BASE_URLS = [
+    "https://api.anthropic.com\u00a0",
+    "https://api.anthropic.com\u3000",
+    "https://api.anthropic.com\t",
+    "\thttps://api.anthropic.com",
+    "https://api.anthropic.com\n",
+    " https://api.anthropic.com ",
+]
+
+
 LEGIT_BASE_URLS = [
     "https://api.anthropic.com",
     "https://api.anthropic.com/v1",
@@ -446,6 +460,13 @@ def test_legitimate_base_urls_are_still_accepted(url: str) -> None:
     """The anti-overblocking direction: gateways, ports and IPv6 literals are
     normal configurations, and a validator that rejects them is a breakage."""
     assert auth_mod._base_url_rejection_reason(url) == ""
+
+
+@pytest.mark.parametrize("url", EDGE_WHITESPACE_BASE_URLS)
+def test_base_url_with_edge_whitespace_is_rejected(url: str) -> None:
+    """Judged on the string the CLI will parse, not on a cleaned-up copy: this
+    module never writes the stripped value back to os.environ."""
+    assert auth_mod._base_url_rejection_reason(url), f"accepted {url!r}"
 
 
 @pytest.mark.parametrize("url", ["", "   "])
