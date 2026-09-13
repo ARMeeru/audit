@@ -22,6 +22,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PROMPTS = REPO_ROOT / "prompts"
 SCHEMAS = REPO_ROOT / "schemas"
+CONFIG = REPO_ROOT / "config"
 RESULTS = REPO_ROOT / "results"
 WORK = REPO_ROOT / "work"
 STATE_DB = REPO_ROOT / "state.db"
@@ -32,7 +33,13 @@ ENV_FILE = REPO_ROOT / ".env"
 CREDENTIALS_FILE = Path.home() / ".claude" / ".credentials.json"
 
 
-_COMPONENT_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+# 128 rather than 64: finding.schema.json pins finding_id to
+# `^f_[a-z0-9_-]{1,64}$`, so a schema-legal id runs to 66 characters, and
+# _resolve_finding_id appends a `_N` suffix on a collision. A ceiling below the
+# schemas' own limits turns a legal id into a crash, which is what this used to
+# do. The character class and the traversal rejection are what carry the
+# security property; the length is a sanity bound.
+_COMPONENT_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 
 def safe_component(value: str, *, kind: str = "identifier") -> str:
@@ -40,7 +47,7 @@ def safe_component(value: str, *, kind: str = "identifier") -> str:
 
     Accepts the shapes the harness generates (`run_ab12cd34`, `f_1`, `task-01`)
     and nothing else: no separators, no traversal, no control characters, no
-    non-ASCII, at most 64 characters. `kind` names the offending field in the
+    non-ASCII, at most 128 characters. `kind` names the offending field in the
     message so an operator knows what to change and a repair loop knows what to
     re-emit.
     """
@@ -48,7 +55,7 @@ def safe_component(value: str, *, kind: str = "identifier") -> str:
         raise ValueError(
             f"unsafe {kind} {value!r}: a path component must match "
             f"{_COMPONENT_RE.pattern} (letters, digits, dot, underscore, hyphen; "
-            "1-64 characters)"
+            "1-128 characters)"
         )
     if value in (".", ".."):
         raise ValueError(f"unsafe {kind} {value!r}: path traversal")
@@ -56,7 +63,7 @@ def safe_component(value: str, *, kind: str = "identifier") -> str:
 
 
 def guarded_paths() -> dict[str, Path]:
-    """The harness's own mutable state and secrets.
+    """The harness's own mutable state and secrets: off limits to every tool.
 
     Read from this module at call time rather than captured at import, so a test
     (or a future --state-dir) can move them. `WORK` is deliberately absent: the
@@ -68,6 +75,23 @@ def guarded_paths() -> dict[str, Path]:
         "the harness state database": STATE_DB,
         "the harness results tree": RESULTS,
         "the harness .env": ENV_FILE,
+    }
+
+
+def write_only_guards() -> dict[str, Path]:
+    """Files a self-audit legitimately READS but must never rewrite.
+
+    The prompts become the next stages' system prompts and the schemas decide
+    what counts as valid, so a rewrite mid-run redirects the pipeline's own
+    judgement. They are absent from guarded_paths() on purpose: auditing this
+    repository means reading them, and a text filter cannot tell a read from a
+    write. Tool calls that carry an explicit path can, so these are refused for
+    Write/Edit only.
+    """
+    return {
+        "the harness prompts": PROMPTS,
+        "the harness schemas": SCHEMAS,
+        "the harness stage config": CONFIG,
     }
 
 
@@ -85,6 +109,15 @@ def guard_hit(text: str) -> str | None:
     target repo with its own file called `state.db` is refused too. The denial
     names a safe alternative so the run continues instead of stalling.
     """
+    return _hit(text, guarded_paths())
+
+
+def write_guard_hit(text: str) -> str | None:
+    """guard_hit, plus the files that are read-allowed but write-forbidden."""
+    return _hit(text, {**guarded_paths(), **write_only_guards()})
+
+
+def _hit(text: str, roots: dict[str, Path]) -> str | None:
     if not text:
         return None
     lowered = text.lower()
@@ -92,7 +125,7 @@ def guard_hit(text: str) -> str | None:
         return "the harness's state database (matched 'state.db')"
     if CREDENTIALS_FILE.name in lowered or str(CREDENTIALS_FILE.parent).lower() in lowered:
         return f"Claude credentials (matched {CREDENTIALS_FILE.name})"
-    for label, root in guarded_paths().items():
+    for label, root in roots.items():
         if str(root).lower() in lowered:
             return f"{label} (matched {root})"
     return None

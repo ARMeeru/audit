@@ -45,7 +45,7 @@ def _require_run_id(run_id: str) -> str:
 from audit.config import load_config
 from audit.json_utils import validate_schema
 from audit.orchestrator import CostExceeded, run_pipeline
-from audit.paths import REPO_ROOT, RESULTS as RESULTS_ROOT, STATE_DB, safe_component
+from audit.paths import RESULTS as RESULTS_ROOT, STATE_DB, safe_component
 from audit.state import StateDB
 from audit.stages._common import SCHEMAS
 
@@ -348,12 +348,20 @@ def _md_inline(s: str) -> str:
     reading attacker-influenced target code, so a field added later must be
     safe by default. Code fences still use _code_fence.
 
-    Line terminators are folded to spaces. Escaping the character class alone
-    was not enough: `=` is not in it, so a field carrying a newline followed by
-    `===` turned the preceding line into a setext heading. Every caller
-    interpolates into a single line by construction, so folding loses nothing
-    and removes the whole class of block-level injection."""
+    Two structural escapes had to be closed beyond the character class:
+
+    * line terminators fold to spaces, because `=` is not in the class and a
+      field carrying a newline followed by `===` turned the preceding line into
+      a setext heading;
+    * leading whitespace is stripped, because a field emitted at column zero
+      (the description) with a leading tab or four spaces opened an indented
+      code block, which silently re-rendered the finding's prose as quoted code.
+
+    With both, a single-line interpolation cannot start a block. `_other_leaks`
+    in the tests polices all three routes.
+    """
     text = re.sub(r"[\r\n\v\f\x85\u2028\u2029]+", " ", str(s))
+    text = text.lstrip(" \t")
     return re.sub(r"([\\`*_{}\[\]()#+\-.!|<>])", r"\\\1", text)
 
 

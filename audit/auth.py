@@ -115,9 +115,9 @@ def _base_url_rejection_reason(url: str) -> str:
     try:
         parts = urlparse(candidate)
         host = parts.hostname or ""
-        port = parts.port
     except ValueError:
-        # Unparseable: _is_gateway_base catches this case and fails closed.
+        # An unparseable authority (e.g. `http://[`). Left to _is_gateway_base,
+        # which catches this and fails closed with its own message.
         return ""
     if parts.username is not None or parts.password is not None:
         return (
@@ -126,6 +126,14 @@ def _base_url_rejection_reason(url: str) -> str:
         )
     if not host:
         return "it has no host"
+    try:
+        # A non-numeric port, an empty one, or one out of range raises here
+        # rather than at parse time. A broken port is a misconfiguration, so it
+        # is refused like any other: this branch must not assume the value has
+        # already been caught upstream, because it has not.
+        port = parts.port
+    except ValueError:
+        return f"its port is not a valid port number ({parts.netloc!r})"
     # The authority must be exactly host[:port]. Anything else (the '@' Python
     # already split off, percent-encoding, a stray character) is a place where
     # one parser can see a different host than the other.

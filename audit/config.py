@@ -18,7 +18,7 @@ KNOWN_TOOLS = frozenset(
 # The SDK's permission modes. `bypassPermissions` is deliberately excluded:
 # stages.yaml has always carried "# never bypassPermissions" as a comment, and a
 # comment is not an invariant.
-KNOWN_PERMISSION_MODES = frozenset({"default", "acceptEdits", "plan", "dontAsk"})
+KNOWN_PERMISSION_MODES = frozenset({"default", "acceptEdits", "plan", "dontAsk", "auto"})
 FORBIDDEN_PERMISSION_MODES = {"bypassPermissions"}
 
 
@@ -87,6 +87,17 @@ def _validate_stage(name: str, spec: dict, defaults: dict) -> None:
             f"stage {name!r}: unknown permission_mode {mode!r}. Known: "
             f"{sorted(KNOWN_PERMISSION_MODES)}"
         )
+    # The confinement switch is the one key whose silent misparse removes the
+    # boundary rather than tightening it. YAML is helpful enough that
+    # `sandbox:` (null), `0`, `[]` and `{}` all coerce to False through bool(),
+    # and a quoted "false" coerces to True: both directions are wrong and
+    # neither said anything. Require a real boolean.
+    for where, block in (("defaults", defaults), (f"stage {name!r}", spec)):
+        if "sandbox" in block and not isinstance(block["sandbox"], bool):
+            raise ValueError(
+                f"{where}: sandbox must be an unquoted true or false, got "
+                f"{block['sandbox']!r}. A quoted \"false\" does not disable it."
+            )
 
 
 def load_config(path: Path | None = None) -> HarnessConfig:

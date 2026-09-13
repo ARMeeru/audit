@@ -86,15 +86,19 @@ def test_guard_denies_harness_state_references(command: str) -> None:
 
 @pytest.mark.parametrize(
     "tool_name",
-    ["Write", "Edit", "Read"],
+    ["Write", "Edit", "Read", "Grep"],
 )
 def test_guard_denies_structured_paths_into_harness_state(tool_name: str) -> None:
-    """Write/Edit/Read carry a real path in tool_input, so those are matched by
-    containment rather than by string search."""
+    """Write/Edit/Read/Grep carry a real path in tool_input, so those are
+    matched by containment rather than by string search. Read matters most: it
+    is granted to every stage, and it reads file CONTENTS, so it is the route
+    that can pull the subscription credential into a finding's evidence."""
     guard = _guard()
     assert _denied(_decide(guard, tool_name,
                            {"file_path": str(RESULTS / "r" / "report" / "report.json")}))
     assert _denied(_decide(guard, tool_name, {"file_path": str(STATE_DB)}))
+    assert _denied(_decide(guard, tool_name,
+                           {"file_path": str(Path.home() / ".claude" / ".credentials.json")}))
 
 
 def test_denial_message_says_why() -> None:
@@ -197,13 +201,39 @@ def test_options_install_the_pre_tool_use_guard() -> None:
     assert any(m.hooks for m in matchers), "matcher carries no callback"
 
 
-def test_options_leave_read_only_calls_out_of_the_hook_path() -> None:
-    """The guard only pays a callback round trip on Bash-family tools: a hunt
-    wave is 50 concurrent agents and their Read/Grep calls are the majority."""
+def test_matcher_covers_every_tool_the_guard_inspects() -> None:
+    """The wiring, not just the callback. A matcher that omits Read means the
+    CLI never invokes the callback for a Read, so the check exists in the code
+    and can never fire: narrowing the matcher to "Bash" used to leave all 290
+    tests green while silently un-hooking every path-bearing Read call."""
     opts = _options()
     matcher = opts.hooks["PreToolUse"][0].matcher or ""
-    assert "Bash" in matcher
-    assert "Read" not in matcher
+    for tool in ("Bash", "Write", "Edit", "Read", "Grep", "Glob"):
+        assert tool in matcher, (
+            f"the guard inspects {tool} input but the matcher never fires for it"
+        )
+
+
+def test_guard_does_not_match_a_grep_pattern() -> None:
+    """A hunter grepping the TARGET for the string "state.db" is doing its job.
+    Only path-bearing keys are inspected, so a pattern is not a denial."""
+    out = _decide(_guard(), "Grep", {"pattern": "state\\.db", "path": "/tmp/target"})
+    assert not _denied(out), "a grep pattern was treated as a path"
+
+
+def test_write_guard_protects_prompts_and_schemas_but_reads_still_work() -> None:
+    """Prompts become the next stages' system prompts and schemas decide what
+    counts as valid, so a mid-run rewrite redirects the pipeline's judgement.
+    They must stay READABLE, though: auditing this repository means reading
+    them."""
+    guard = _guard()
+    prompts = HARNESS_ROOT / "prompts" / "08-report.md"
+    schemas = HARNESS_ROOT / "schemas" / "report.schema.json"
+    for tool in ("Write", "Edit"):
+        assert _denied(_decide(guard, tool, {"file_path": str(prompts)})), tool
+        assert _denied(_decide(guard, tool, {"file_path": str(schemas)})), tool
+    assert not _denied(_decide(guard, "Read", {"file_path": str(prompts)}))
+    assert not _denied(_decide(guard, "Read", {"file_path": str(schemas)}))
 
 
 def test_sandbox_can_be_switched_off_by_config() -> None:
@@ -229,11 +259,28 @@ def test_self_audit_warns_that_the_boundary_is_unavailable(
     )
 
 
+@pytest.mark.parametrize("geometry", ["parent", "descendant"])
+def test_self_audit_warning_covers_containing_and_contained_directories(
+    caplog: pytest.LogCaptureFixture, geometry: str
+) -> None:
+    """The warning used to fire only on exact equality, so `--repo <the parent
+    of the checkout>` handed the agent a directory containing state.db with no
+    warning at all. The sandbox's write scope is the working directory PLUS
+    added directories, so a containing directory is exactly as unconfined as the
+    checkout itself."""
+    target = HARNESS_ROOT.parent if geometry == "parent" else HARNESS_ROOT / "audit"
+    with caplog.at_level("WARNING"):
+        _options(cwd=Path("/tmp/elsewhere"), add_dirs=[target])
+    assert any("self-audit" in r.message.lower() for r in caplog.records), (
+        f"no warning for {geometry} directory {target}"
+    )
+
+
 def test_normal_run_does_not_warn_about_self_audit(
     caplog: pytest.LogCaptureFixture, tmp_path: Path
 ) -> None:
-    """Control for the test above: the warning is about the target being the
-    harness, so an ordinary target must stay quiet."""
+    """Control for the test above: the warning is about the target overlapping
+    the harness, so an ordinary target must stay quiet."""
     with caplog.at_level("WARNING"):
         _options(cwd=tmp_path, add_dirs=[tmp_path])
     assert not [r for r in caplog.records if "self-audit" in r.message.lower()]
@@ -314,3 +361,50 @@ stages:
     cfg = load_config(p)
     assert cfg.get("hunt").sandbox is False
     assert cfg.get("trace").sandbox is True, "per-stage override ignored"
+
+
+@pytest.mark.parametrize("value", ["null", "0", "[]", "{}", "'false'", "'off'"])
+def test_config_refuses_a_non_boolean_sandbox(tmp_path: Path, value: str) -> None:
+    """The one consumed key whose silent misparse removes the boundary instead
+    of tightening it. bool() coerces `sandbox:` (null), 0, [] and {} to False
+    and a quoted "false" to True, so both a typo and an attempt to disable it
+    did the wrong thing without saying so."""
+    p = _write_cfg(tmp_path, f"""
+defaults:
+  sandbox: {value}
+stages:
+  hunt:
+    model: m
+    concurrency: 1
+    tools: [Read]
+""")
+    with pytest.raises(ValueError, match="sandbox must be"):
+        load_config(p)
+
+
+def test_config_accepts_an_unquoted_false(tmp_path: Path) -> None:
+    """Control for the test above: the honest way to disable it keeps working."""
+    p = _write_cfg(tmp_path, """
+defaults:
+  sandbox: false
+stages:
+  hunt:
+    model: m
+    concurrency: 1
+    tools: [Read]
+""")
+    assert load_config(p).get("hunt").sandbox is False
+
+
+def test_config_accepts_the_sdk_auto_permission_mode(tmp_path: Path) -> None:
+    """The pinned SDK's PermissionMode includes "auto". Refusing it would print
+    "unknown permission_mode" at an operator who had used a real one."""
+    p = _write_cfg(tmp_path, """
+stages:
+  hunt:
+    model: m
+    concurrency: 1
+    tools: [Read]
+    permission_mode: auto
+""")
+    assert load_config(p).get("hunt").permission_mode == "auto"

@@ -41,11 +41,16 @@ ESCAPES = [
     "a\x00b",
     "a\nb",
     "",
-    "x" * 65,
+    "x" * 129,
     "é",
 ]
 
-GOOD = ["run_ab12cd34", "r", "f_1", "task-01", "a.b_c-d", "x" * 64]
+# The shapes the harness itself generates, including the longest id the schemas
+# permit: finding.schema.json allows `f_` plus 64 characters, and
+# _resolve_finding_id appends `_2` on a collision, so the ceiling has to clear
+# 66. It used to be 64, which made a schema-legal id raise inside the runner.
+GOOD = ["run_ab12cd34", "r", "f_1", "task-01", "a.b_c-d", "x" * 64,
+        "f_" + "a" * 64, "f_" + "a" * 60 + "_2"]
 
 
 def _ctx(run_id: str, repo: Path) -> StageContext:
@@ -119,6 +124,38 @@ def test_schema_already_blocks_a_traversing_task_id_on_the_agent_path() -> None:
         "hunt_task.schema.json no longer rejects a traversing task_id, so the "
         f"storage-side backstop is the only defence left: {errors[:2]}"
     )
+
+
+def test_schema_legal_long_finding_id_survives_the_artifact_path() -> None:
+    """The ceiling must clear the schemas it validates against. finding_id is
+    `^f_[a-z0-9_-]{1,64}$`, so a legal id reaches 66 characters, and a
+    collision-suffixed one more; a 64-character ceiling turned a schema-valid
+    finding into a ValueError inside the runner, which validate/trace did not
+    catch, which failed the whole run after the exploration spend was sunk."""
+    from audit.json_utils import validate_schema
+    from audit.paths import safe_component
+
+    longest = "f_" + "a" * 64
+    hunt_output = {
+        "task_id": "t_core_auth_1",
+        "gaps_observed": [],
+        "findings": [{
+            "finding_id": longest,
+            "file": "app.py",
+            "line_start": 1,
+            "line_end": 2,
+            "vuln_class": "sql_injection",
+            "severity": "high",
+            "description": "tainted input reaches a raw SQL sink",
+            "evidence_snippet": "cursor.execute(q)",
+            "confidence": 0.8,
+        }],
+    }
+    assert validate_schema(
+        hunt_output, SCHEMAS / "finding.schema.json"
+    ) == [], "the fixture is no longer schema-legal, so this proves nothing"
+    assert safe_component(longest, kind="artifact name") == longest
+    assert safe_component(longest + "_2", kind="artifact name") == longest + "_2"
 
 
 def test_safe_component_is_the_single_chokepoint() -> None:

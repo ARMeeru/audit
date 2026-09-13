@@ -454,6 +454,25 @@ def test_empty_base_url_is_not_a_rejection(url: str) -> None:
     assert auth_mod._base_url_rejection_reason(url) == ""
 
 
+@pytest.mark.parametrize("url", [
+    "https://api.anthropic.com:abc",
+    "https://api.anthropic.com:99999",
+    "https://api.anthropic.com:",
+])
+def test_base_url_with_a_broken_port_is_rejected(url: str) -> None:
+    """`parts.port` raises for a non-numeric, empty or out-of-range port, and
+    that raise is not the same thing as an unparseable authority: it must be
+    refused here rather than falling through as a valid Anthropic URL."""
+    reason = auth_mod._base_url_rejection_reason(url)
+    assert reason, f"a broken port was accepted: {url!r}"
+
+
+@pytest.mark.parametrize("url", ["https://api.anthropic.com:443", "http://localhost:8080"])
+def test_valid_ports_are_still_accepted(url: str) -> None:
+    """Control: the port branch must not swallow correct ports."""
+    assert auth_mod._base_url_rejection_reason(url) == ""
+
+
 def test_backslash_base_url_reason_names_the_character() -> None:
     """The message has to name the problem: this is a config error an operator
     has to fix, and "invalid URL" sends them hunting."""

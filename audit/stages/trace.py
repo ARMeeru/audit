@@ -87,6 +87,15 @@ async def run_trace(ctx: StageContext, db: StateDB) -> int:
                 # real API spend still gets recorded.
                 return
 
+            except ValueError as e:
+                # An identifier that cannot become a filename. Fail this
+                # finding, not the run: an exception escaping the gather marks
+                # every other trace as lost too. No row, so --resume retries it.
+                log.warning("[%s] trace %s unusable identifier: %s",
+                            ctx.run_id, f.finding_id, e)
+                counters["failed"] += 1
+                return
+
             db.add_trace(ctx.run_id, f.finding_id, result.payload)
             db.add_artifact(ctx.run_id, "trace", f.finding_id, "jsonl",
                             str(result.artifact_path))

@@ -38,7 +38,7 @@ from claude_agent_sdk import (
 )
 
 from audit.json_utils import extract_json, validate_schema
-from audit.paths import REPO_ROOT, guard_hit, safe_component
+from audit.paths import REPO_ROOT, guard_hit, safe_component, write_guard_hit
 
 log = logging.getLogger(__name__)
 
@@ -155,13 +155,21 @@ _SANDBOX_SETTINGS: dict[str, Any] = {
     "allowUnsandboxedCommands": False,
 }
 
-# Bash-family tools only. A hunt wave is 50 concurrent agents and the bulk of
-# their calls are Read/Grep, which have nothing to deny and would otherwise each
-# pay a callback round trip.
-_GUARD_MATCHER = "Bash|Write|Edit|NotebookEdit"
+# Every tool whose input the guard inspects, Bash included. It has to name all
+# of them: a matcher that omits Read means the CLI never calls the callback for
+# a Read, so the check exists in the code and cannot fire in production. The
+# cost is a callback round trip on Read/Grep/Glob too, which is why the keys
+# inspected are path-bearing ones only.
+_GUARD_MATCHER = "Bash|Write|Edit|NotebookEdit|Read|Grep|Glob"
 
-# Where a tool keeps the path it is about to touch.
-_PATH_KEYS = ("command", "file_path", "notebook_path", "path", "pattern")
+# Where a tool keeps the path or command it is about to use. Deliberately not
+# `pattern`: a Grep pattern of "state.db" is a hunter looking for that string in
+# the target, not an attempt to touch the harness's own file.
+_PATH_KEYS = ("command", "file_path", "notebook_path", "path")
+
+# Tools that write. Only these get the extended, write-only guard set (prompts,
+# schemas, stage config), because a self-audit may legitimately READ those.
+_WRITE_TOOLS = ("Write", "Edit", "NotebookEdit")
 
 
 def _make_tool_guard():
@@ -174,11 +182,12 @@ def _make_tool_guard():
     """
 
     async def _guard(input: dict, tool_use_id: str | None, context: dict) -> dict:
+        tool_name = input.get("tool_name", "")
         tool_input = input.get("tool_input") or {}
         text = " ".join(
             str(tool_input[key]) for key in _PATH_KEYS if tool_input.get(key)
         )
-        hit = guard_hit(text)
+        hit = write_guard_hit(text) if tool_name in _WRITE_TOOLS else guard_hit(text)
         if hit is None:
             return {}
         return {
@@ -225,16 +234,24 @@ def _build_options(
     """
     cwd = Path(cwd)
     dirs = [Path(p) for p in (add_dirs or [])]
-    if any(p.resolve() == REPO_ROOT for p in (cwd, *dirs)):
-        # Self-audit: the target repo is the harness checkout, so cwd/add_dirs
-        # grant the agent its own state directory and no path-based boundary can
-        # separate the two. Only the filter stands in the way, and a filter is
-        # not a boundary. Say so once per dispatch rather than assuming it away.
+    # Overlap in EITHER direction: the agent was handed the harness checkout
+    # itself, a directory containing it, or a directory inside it. Equality
+    # alone missed the containing case, and the containing case is exactly as
+    # unconfined: the sandbox's write scope is the working directory PLUS
+    # added directories, so a parent directory confers write access to
+    # state.db, results/ and .env just as directly.
+    if any(
+        p.resolve() == REPO_ROOT
+        or p.resolve().is_relative_to(REPO_ROOT)
+        or REPO_ROOT.is_relative_to(p.resolve())
+        for p in (cwd, *dirs)
+    ):
         log.warning(
-            "[confinement] self-audit: the target repo is the harness checkout, so "
-            "the OS sandbox cannot separate them. The sandbox still blocks writes "
-            "outside the checkout, but state.db sits inside it and is protected only "
-            "by the tool filter, which obfuscation can walk past."
+            "[confinement] self-audit: the target repo is (or contains, or sits "
+            "inside) the harness checkout, so the OS sandbox cannot separate them. "
+            "The sandbox still blocks writes outside the checkout, but state.db "
+            "sits inside it and is protected only by the tool filter, which "
+            "obfuscation can walk past."
         )
     return ClaudeAgentOptions(
         system_prompt=system_prompt,

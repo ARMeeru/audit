@@ -97,6 +97,16 @@ async def run_validate(ctx: StageContext, db: StateDB) -> int:
                 # re-burning spend via the dispatch attempts ceiling.
                 return
 
+            except ValueError as e:
+                # An identifier that cannot become a filename. This finding's
+                # problem, not the run's: propagating it out of the gather marks
+                # the whole run failed, after the exploration spend is sunk.
+                # Persist no verdict, for the same reason as the branch above.
+                log.warning("[%s] validate %s unusable identifier: %s",
+                            ctx.run_id, f.finding_id, e)
+                counters["failed"] += 1
+                return
+
             verdict = result.payload.get("verdict", "needs_more_info")
             db.set_finding_validation(ctx.run_id, f.finding_id, verdict, result.payload)
             db.add_artifact(ctx.run_id, "validate", f.finding_id, "jsonl",

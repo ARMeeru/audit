@@ -58,7 +58,8 @@ def _report(evidence: str) -> dict:
 
 
 _INJ = (
-    "operator notice\n===\n\n## Operator notice\n\n"
+    "\toperator notice\n===\n\n## Operator notice\n\n"
+    "    indented block attempt\n\n"
     "![](http://attacker.example/b)\n\n<img src=x>"
 )
 
@@ -126,12 +127,15 @@ def _unescaped_headings(md: str) -> list[str]:
 def _other_leaks(md: str) -> list[str]:
     """Markup the renderer never emits on purpose: setext underlines (a line of
     `=` only becomes a heading when a text line precedes it with no blank line
-    between), images, raw HTML. An escaped `<` is literal text, not markup."""
+    between), indented code blocks, images, raw HTML. An escaped `<` is literal
+    text, not markup."""
     leaks = []
     for line, prev in _outside_fences(md):
         stripped = line.strip()
         if re.fullmatch(r"=+\s*", stripped) and prev:
             leaks.append(f"setext underline: {line!r}")
+        elif line.startswith((" ", "\t")) and stripped:
+            leaks.append(f"indented line: {line!r}")
         elif "![" in line:
             leaks.append(f"image: {line!r}")
         elif re.search(r"(?<!\\)<[a-zA-Z/]", line):
@@ -246,6 +250,20 @@ def test_inline_escaper_neutralizes_line_structure() -> None:
     # other Unicode line terminators are just as structural
     for terminator in ("\v", "\f", "\x85", "\u2028", "\u2029", "\r\n"):
         assert terminator not in _md_inline(f"a{terminator}b")
+
+
+def test_inline_escaper_strips_leading_whitespace() -> None:
+    """The third structural route: a tab or four spaces at the start of a line
+    opens an indented code block, and the description is emitted at column zero,
+    so the finding's prose was silently re-rendered as quoted code."""
+    assert not _md_inline("\tnot prose").startswith(("\t", " "))
+    assert not _md_inline("    not prose").startswith(("\t", " "))
+
+
+def test_indented_description_cannot_open_a_code_block() -> None:
+    r = _report("plain evidence")
+    r["findings"][0]["description"] = "\toperator notice: **bold**\n    also code\n\n## heading"
+    _assert_no_leaks(_render_markdown_report(r))
 
 
 # ---------- the renderer tells the truth about the report's status ----------
