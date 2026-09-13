@@ -8,7 +8,6 @@ import re
 import logging
 import os
 import sys
-import uuid
 from pathlib import Path
 
 import click
@@ -20,6 +19,20 @@ from audit.auth import AuthError, configure_auth
 
 
 _FALSY_ENV = {"", "0", "false", "no", "off"}
+
+from audit.config import load_config
+from audit.json_utils import validate_schema
+from audit.orchestrator import CostExceeded, run_pipeline
+from audit.paths import (
+    RESULTS as RESULTS_ROOT,
+    SCHEMAS,
+    STATE_DB,
+    new_run_id,
+    safe_component,
+)
+from audit.state import StateDB
+
+DB_PATH = STATE_DB
 
 
 def _allow_api_key_from_env_or_flag(flag: bool) -> bool:
@@ -42,14 +55,7 @@ def _require_run_id(run_id: str) -> str:
         return safe_component(run_id, kind="--run-id")
     except ValueError as e:
         raise click.BadParameter(str(e)) from None
-from audit.config import load_config
-from audit.json_utils import validate_schema
-from audit.orchestrator import CostExceeded, run_pipeline
-from audit.paths import RESULTS as RESULTS_ROOT, STATE_DB, safe_component
-from audit.state import StateDB
-from audit.stages._common import SCHEMAS
 
-DB_PATH = STATE_DB
 
 console = Console()
 
@@ -199,7 +205,7 @@ def run(repo: str, run_id: str | None, resume: bool, max_cost_usd: float | None,
         scope_notes = Path(scope_notes_path).read_text()
         console.print(f"[cyan]scope notes loaded:[/cyan] {scope_notes_path} ({len(scope_notes)} chars)")
 
-    run_id = _require_run_id(run_id or f"run_{uuid.uuid4().hex[:8]}")
+    run_id = _require_run_id(run_id or new_run_id())
     repo_path = Path(repo).resolve()
 
     db = StateDB(DB_PATH)
@@ -341,28 +347,61 @@ def _show_run_detail(db: StateDB, run_id: str) -> None:
                       "run the pipeline (or --resume --finalize) to grade them[/yellow]")
 
 
-def _md_inline(s: str) -> str:
-    r"""Escape markdown control characters for interpolation into a line.
+def _fold_line_terminators(value) -> str:
+    """Collapse every line terminator to a space.
+
+    A single newline is what setext headings, indented blocks and HTML blocks
+    all need to start, and every field here is interpolated into one line.
+    """
+    return re.sub(r"[\r\n\v\f\x85\u2028\u2029]+", " ", str(value))
+
+
+def _md_inline(s) -> str:
+    r"""Escape a field for interpolation into PROSE (outside any code span).
 
     Taint is per-report, not per-field: finding fields come from a model
     reading attacker-influenced target code, so a field added later must be
-    safe by default. Code fences still use _code_fence.
+    safe by default.
 
-    Two structural escapes had to be closed beyond the character class:
+    The character class alone is not enough, which is what the earlier version
+    of this function got wrong:
 
     * line terminators fold to spaces, because `=` is not in the class and a
       field carrying a newline followed by `===` turned the preceding line into
       a setext heading;
     * leading whitespace is stripped, because a field emitted at column zero
       (the description) with a leading tab or four spaces opened an indented
-      code block, which silently re-rendered the finding's prose as quoted code.
+      code block;
+    * `~` is in the class, because a tilde fence's info string may contain
+      anything, so after folding, `~~~ x ~~~` opened a fence that swallowed
+      every later finding.
 
-    With both, a single-line interpolation cannot start a block. `_other_leaks`
-    in the tests polices all three routes.
+    Escapes are inert inside a code span, so anything that goes between
+    backticks must use _md_code instead. `_other_leaks` in the tests polices
+    headings, setext, indentation, both fence characters, images and raw HTML.
     """
-    text = re.sub(r"[\r\n\v\f\x85\u2028\u2029]+", " ", str(s))
-    text = text.lstrip(" \t")
-    return re.sub(r"([\\`*_{}\[\]()#+\-.!|<>])", r"\\\1", text)
+    text = _fold_line_terminators(s).lstrip(" \t")
+    return re.sub(r"([\\`*_{}\[\]()#+\-.!|<>~])", r"\\\1", text)
+
+
+def _md_code(v) -> str:
+    r"""Render a field as a code span, delimiters included.
+
+    Escaping is the wrong tool inside a span: CommonMark does not process
+    backslash escapes there, so `_md_inline`'s output rendered with visible
+    backslashes (`run_ab\-12`) and a backtick in the value still terminated the
+    span and spilled the rest out as prose. The only thing that can escape a
+    span is a longer run of backticks, so the delimiter is padded past the
+    longest run in the value. Per CommonMark, a span whose content begins or
+    ends with a backtick also needs one space of padding, which the renderer
+    strips.
+    """
+    text = _fold_line_terminators(v)
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    delimiter = "`" * (longest + 1)
+    if text.startswith("`") or text.endswith("`"):
+        text = f" {text} "
+    return f"{delimiter}{text}{delimiter}"
 
 
 def _code_fence(content: str) -> str:
@@ -381,8 +420,7 @@ def _code_fence(content: str) -> str:
 def _render_markdown_report(report: dict) -> str:
     # The bytes here are untrusted input, not "the report we just wrote":
     # _write_report deliberately writes payloads that fail validation (flagged
-    # degraded) and a report.json on disk can predate the current schema. Warn
-    # rather than refuse, because a flagged invalid report beats no report.
+    # degraded) and a report.json on disk can predate the current schema.
     errors = validate_schema(report, SCHEMAS / "report.schema.json")
     if errors:
         click.echo(
@@ -390,6 +428,25 @@ def _render_markdown_report(report: dict) -> str:
             f"({len(errors)} error(s); first: {errors[0]})",
             err=True,
         )
+    # A warning the operator sees immediately before a traceback is worse than
+    # either on its own, so the required top-level keys are checked rather than
+    # indexed. A payload missing them is exactly the class the warning above
+    # exists to describe: hand-edited or pre-schema files.
+    required = ("run_id", "target", "summary", "findings")
+    missing = [k for k in required if k not in report]
+    if missing:
+        stub = [
+            "# Vulnerability report — UNRENDERABLE",
+            "",
+            "The report file is missing required top-level keys: "
+            + ", ".join(_md_code(k) for k in missing)
+            + ".",
+            "",
+        ]
+        if report.get("degraded_reason"):
+            stub.append(f"Reason: {_md_inline(report['degraded_reason'])}")
+        stub.append("")
+        return "\n".join(stub)
 
     lines: list[str] = []
     if report.get("degraded"):
@@ -400,11 +457,11 @@ def _render_markdown_report(report: dict) -> str:
         if report.get("degraded_reason"):
             lines.append(f"Reason: {_md_inline(report['degraded_reason'])}")
         lines.append("")
-    lines.append(f"# Vulnerability report — `{_md_inline(report['run_id'])}`")
-    lines.append(f"Target: `{_md_inline(report['target']['repo_path'])}`  ")
+    lines.append(f"# Vulnerability report — {_md_code(report['run_id'])}")
+    lines.append(f"Target: {_md_code(report['target']['repo_path'])}  ")
     s = report["summary"]
     by = s.get("by_severity", {})
-    total = _md_inline(s["total"])
+    total = _md_inline(s.get("total", 0))
     counts = ", ".join(f"{_md_inline(k)}: {_md_inline(v)}" for k, v in by.items())
     lines.append(f"**Total findings: {total}** — {counts}" if by
                  else f"**Total findings: {total}**")
@@ -415,8 +472,9 @@ def _render_markdown_report(report: dict) -> str:
         lines.append(f"- **Class**: {_md_inline(f['vuln_class'])}"
                      + (f" ({_md_inline(f['cwe'])})" if f.get("cwe") else ""))
         lines.append(
-            f"- **Location**: `{_md_inline(f['file'])}:"
-            f"{_md_inline(f['line_start'])}-{_md_inline(f['line_end'])}`  "
+            "- **Location**: "
+            + _md_code(f"{f['file']}:{f['line_start']}-{f['line_end']}")
+            + "  "
         )
         lines.append("")
         # description is prose from the target-influenced model output:
@@ -433,16 +491,15 @@ def _render_markdown_report(report: dict) -> str:
         if ep:
             lines.append("**Entry points**:")
             for e in ep:
-                lines.append(f"- `{_md_inline(e['kind'])}` at `{_md_inline(e['location'])}`")
+                lines.append(f"- {_md_code(e['kind'])} at {_md_code(e['location'])}")
             lines.append("")
         cc = f["trace"].get("call_chain", [])
         if cc:
             lines.append("**Call chain**:")
             for frame in cc:
-                lines.append(
-                    f"1. `{_md_inline(frame['file'])}:{_md_inline(frame['line'])}`"
-                    f" — `{_md_inline(frame['function'])}()`"
-                )
+                where = _md_code("{}:{}".format(frame["file"], frame["line"]))
+                call = _md_code("{}()".format(frame["function"]))
+                lines.append(f"1. {where} — {call}")
             lines.append("")
         lines.append(f"**Recommendation**: {_md_inline(f['recommendation'])}")
         lines.append("")
