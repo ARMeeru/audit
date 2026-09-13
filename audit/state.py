@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
+from audit.paths import safe_component
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -412,7 +414,10 @@ class StateDB:
     # ---------- runs ----------
 
     def create_run(self, repo_path: str, run_id: str | None = None) -> str:
-        run_id = run_id or f"run_{uuid.uuid4().hex[:8]}"
+        # A run id names directories under results/ and work/. Validating here
+        # as well as at the call sites means no path can be built from an
+        # unvalidated id even if a future caller forgets.
+        run_id = safe_component(run_id or f"run_{uuid.uuid4().hex[:8]}", kind="run_id")
         self._conn.execute(
             "INSERT INTO runs (run_id, repo_path, started_at, status) VALUES (?, ?, ?, ?)",
             (run_id, repo_path, time.time(), "running"),
