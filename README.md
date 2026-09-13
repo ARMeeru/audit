@@ -195,11 +195,18 @@ Hunt cooperatively aborts rather than running 30 more tasks past the cap.
 
 ## Live-target reproduction (optional)
 
-If the target has a running deployment, point the agents at it. Hunt now
+If the target has a running deployment, point the agents at it. Hunt
 **reproduces** each finding against the live service instead of compiling
-a local PoC, Validate **rejects** findings that don't reproduce, and Trace
-**confirms** reachability with real HTTP round-trips. The static path
-remains available — these flags are opt-in.
+a local PoC, and Trace **confirms** reachability with real HTTP
+round-trips. Validate has no Bash in any mode: it judges reproduction from
+the code and from what Hunt recorded. The static path remains available,
+and these flags are opt-in.
+
+Egress is not a prompt instruction any more. The sandbox refuses every
+outbound connection by default, and `--target-url` adds that host to the
+allowlist for the run, so a static run reaches nothing at all and a
+live-target run reaches only its target. A target that redirects to a
+third-party host needs that stage's `sandbox` switched off.
 
 ```bash
 audit run --repo /path/to/target --run-id live \
@@ -302,6 +309,38 @@ host during PoC compilation, which is outside anything the harness can enforce.
 The agent reads everything you `--add-dir`, including any `.env` or
 `secrets/` directories in the target. Outputs land in `results/<run-id>/`
 which is `.gitignore`d but **not** scrubbed of those reads.
+
+### What the confinement does not cover
+
+Written down because the alternative is an operator assuming a guarantee they do
+not have. `scripts/mutation-check.py` is the executable form of the claims above:
+it breaks one protection at a time and fails if the sensor that should notice
+stays green.
+
+- **Bash commands are filtered by string, not by structure.** A path built at
+  runtime (`p=$(printf %s <base64> | base64 -d); sqlite3 "$p" ...`), a variable
+  or any other indirection walks past the filter. Structured tools are checked by
+  resolving the path and comparing containment, so those are exact.
+- **A self-audit is unconfined by construction.** `--repo` pointing at this
+  checkout, or at a directory containing it, hands the agent the tree the
+  harness keeps `state.db` and `results/` in. The run logs a warning. Keeping
+  those paths outside the audited tree is the structural fix and is not done yet.
+- **A platform where the sandbox cannot start** leaves the filter alone. That is
+  the one case where `sandbox: false` is the honest setting.
+- **Prompt files can still be rewritten by a shell command in self-audit
+  geometry.** Write and Edit are refused for the prompts, schemas and stage
+  config, and Bash is refused by name, but a Bash command that builds the path at
+  runtime is not caught. Prompts and schemas are re-read per dispatch, so a
+  rewrite lands in a later stage's system prompt within the same run.
+- **Reads are not restricted at all in a normal run.** An agent can read any file
+  the user can, including anything under `--add-dir`. The filter covers the
+  harness's own secrets and state, not the rest of the filesystem.
+- **`--run-id` must match `[A-Za-z0-9._-]{1,128}`** and is rejected at the CLI
+  otherwise. It becomes a directory name, so a run id with a colon or a space
+  will not resolve.
+- **Case-only differences collide.** macOS and Windows fold case, so `Foo` and
+  `foo` share one directory while SQLite keeps two rows; `create_run` refuses the
+  second one.
 
 ## License
 

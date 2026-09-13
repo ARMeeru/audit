@@ -35,17 +35,15 @@ you considered.
 this finding's attack class or code region out of scope, **reject the
 finding** with `rationale` citing the scope rule.
 
-If `live_target` is present, you have read-only Bash with `curl` /
-`python3` available against that URL (and only that URL — no other
-external network). Use it to *try to make the bug reproduce*; a finding
-that doesn't reproduce against the live target is a strong rejection
-signal.
+If `live_target` is present, a read-only HTTP route to that host exists
+in the pipeline, but it is not yours: this stage has no Bash. You judge
+reproduction from the code and from what Hunt recorded, and you reject a
+finding whose own evidence does not support the claim.
 
 # Tools available
 
-Read, Grep, Glob. Bash is available **only** when `live_target` is
-present in input, and only for HTTP traffic to that host. Pure-analysis
-mode (no Bash) otherwise.
+Read, Grep, Glob. No Bash, in any mode. Reproduction by execution happens
+in Hunt and Trace, which have it.
 
 # Output
 
