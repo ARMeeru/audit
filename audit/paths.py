@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from fnmatch import fnmatch
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -343,9 +344,14 @@ def expand_braces(pattern: str) -> list[str]:
 def _pattern_names_guarded(pattern: str, *, contents: bool) -> str | None:
     """Does this file-selection pattern name a guarded file?
 
-    `contents` is True for Grep, where reading a guarded file leaks it, and
-    False for Glob, where a name comes back and a bare wildcard is ordinary
-    enumeration: only a pattern that names something more specific counts.
+    Matched with a real glob matcher, not by string comparison: `[s]tate.db` and
+    `?tate.db` are the same file to fnmatch, ripgrep and the CLI, and comparing
+    names literally let both through.
+
+    `contents` is True for Grep, where reading a guarded file leaks it, so a
+    pattern that matches every file counts as naming one. For Glob only a pattern
+    that names something more specific counts: a bare wildcard there is ordinary
+    enumeration, and denying it would refuse the most common listing call.
     """
     if not pattern:
         return None
@@ -355,15 +361,19 @@ def _pattern_names_guarded(pattern: str, *, contents: bool) -> str | None:
         for meta in ("*", "?", "[", "{"):
             literal = literal.split(meta, 1)[0]
         for label, entry in _sensitive_files().items():
-            target = entry.name.casefold()
-            if name.casefold() == target:
+            if not contents and name.casefold() in _MATCH_EVERYTHING:
+                # Enumeration, not a name: Glob returns paths, and a bare
+                # wildcard is the most ordinary listing call there is.
+                continue
+            if fnmatch(entry.name, name):
                 return f"{label} (matched {pattern!r})"
-            # `state.db-*` names the WAL sidecars through their stem.
-            if literal and target.startswith(literal.casefold()) and len(literal) > 3:
+            # `state.db-*` names the WAL sidecars through the stem, which a glob
+            # match against `state.db` alone cannot see.
+            if literal and entry.name.casefold().startswith(literal.casefold()) and len(literal) > 3:
                 return f"{label} (matched {pattern!r})"
             if contents and name.casefold() in _MATCH_EVERYTHING:
                 return f"{label} (a pattern that matches every file)"
-    if "{" in pattern and pattern.count("{") != pattern.count("}"):
+    if pattern.count("{") != pattern.count("}"):
         # A form this module cannot expand: fail closed rather than guess.
         return "a search pattern in a form this guard cannot parse"
     return None

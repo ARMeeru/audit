@@ -885,3 +885,18 @@ def test_grep_with_no_glob_cannot_read_a_guarded_file() -> None:
     assert _denied(
         _decide(guard, "Grep", {"path": str(RESULTS), "pattern": "severity"})
     )
+
+
+def test_glob_syntax_cannot_hide_a_guarded_name() -> None:
+    """`[s]tate.db` and `?tate.db` are the same file to fnmatch, ripgrep and the
+    CLI. Comparing names literally let both through, the same class as the brace
+    form, so the name rule matches with a real glob matcher."""
+    guard = _guard(cwd=HARNESS_ROOT, workspace=[HARNESS_ROOT])
+    for pattern in ("[s]tate.db", "?tate.db", "state.d[b]", "{.credentials.json,zzz}"):
+        assert _denied(_decide(guard, "Grep",
+                               {"path": str(HARNESS_ROOT), "glob": pattern,
+                                "pattern": "x"})), pattern
+    for pattern in ("[s]tate.db", "?tate.db"):
+        assert _denied(_decide(guard, "Glob", {"pattern": pattern})), pattern
+    # and the enumeration case stays allowed for Glob
+    assert not _denied(_decide(guard, "Glob", {"pattern": "*"}))

@@ -413,3 +413,14 @@ def test_markdown_render_is_silent_on_a_valid_payload(
     the warning is noise nobody reads."""
     _render_markdown_report(_report("plain evidence"))
     assert capsys.readouterr().err == ""
+
+
+def test_wrong_typed_field_renders_a_stub() -> None:
+    """A payload whose `findings` is a string has every required key and still
+    cannot be indexed. The stub covered only missing keys, so this crashed with
+    a TypeError after warning, and the length check reported a count derived from
+    the string's length."""
+    md = _render_markdown_report({
+        "run_id": "r", "target": {}, "summary": {}, "findings": "not-a-list",
+    })
+    assert "UNRENDERABLE" in md

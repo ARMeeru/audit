@@ -483,12 +483,17 @@ def _render_markdown_report(report: dict) -> str:
     # required key that is absent, at the top level and inside a finding, so the
     # stub lists those rather than indexing twelve fields a four-key check did not
     # cover.
-    missing = sorted({
+    # Missing keys AND wrong types: a payload whose `findings` is a string has
+    # every required key and still cannot be indexed, and the list-length check
+    # below then reports a nonsense count from the string's length.
+    broken = sorted({
         m.group(1) for m in (
-            re.search(r": '([\w]+)' is a required property$", e) for e in errors
+            re.search(r": '([\w]+)' (?:is a required property|is not of type)", e)
+            for e in errors
         ) if m
     })
-    if missing:
+    if broken or not isinstance(report.get("findings"), list):
+        missing = broken or ["findings"]
         stub = [
             "# Vulnerability report — UNRENDERABLE",
             "",

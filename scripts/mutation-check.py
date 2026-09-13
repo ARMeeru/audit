@@ -231,9 +231,14 @@ MUTATIONS = [
      'delimiter = "`" * (_longest_backtick_run(text) + 1)', 'delimiter = "`"',
      [f"{CLI}::test_a_backtick_in_a_field_cannot_end_its_code_span"], []),
     ("missing-key guard removed", "audit/cli.py",
-     're.search(r": \'([\\w]+)\' is a required property$", e)',
-     're.search(r": \'([\\w]+)\' is NOT a required property$", e)',
-     [f"{CLI}::test_unrenderable_report_says_what_is_missing"], []),
+     '    if broken or not isinstance(report.get("findings"), list):',
+     "    if False:",
+     [f"{CLI}::test_unrenderable_report_says_what_is_missing",
+      f"{CLI}::test_wrong_typed_field_renders_a_stub"], []),
+    ("pattern name rule literal again", "audit/paths.py",
+     "            if fnmatch(entry.name, name):",
+     "            if entry.name == name:",
+     [f"{CONF}::test_glob_syntax_cannot_hide_a_guarded_name"], []),
     ("degraded not surfaced", "audit/cli.py",
      '    if report.get("degraded"):', "    if False:",
      [f"{CLI}::test_markdown_report_marks_a_degraded_report"],
@@ -292,6 +297,9 @@ def run(tests: list[str]) -> set[str]:
         "sys.meta_path = [f for f in sys.meta_path "
         "if type(f).__name__ != '_EditableFinder']; "
         f"sys.path.insert(0, {str(COPY)!r}); "
+        "import audit; "
+        f"assert audit.__file__.startswith({str(COPY)!r}), ("
+        "'imported the live checkout, not the copy: ' + audit.__file__); "
         "import pytest, sys as _s; "
         f"_s.exit(pytest.main(['-q', '--no-header', '-p', 'no:cacheprovider', *{tests!r}]))"
     )
