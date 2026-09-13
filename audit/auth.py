@@ -55,6 +55,8 @@ from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
+from audit.paths import CREDENTIALS_FILE
+
 
 @dataclass
 class AuthStatus:
@@ -72,7 +74,71 @@ class AuthError(RuntimeError):
     pass
 
 
-CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
+CREDENTIALS_PATH = CREDENTIALS_FILE
+
+
+def _base_url_rejection_reason(url: str) -> str:
+    """Why `url` is unusable as ANTHROPIC_BASE_URL, or "" when it is fine.
+
+    Judged on the raw string, deliberately independent of what any one parser
+    decides, because the two parsers in play do not agree. For
+    `https://evil.com\\@api.anthropic.com`:
+
+      * Python's urlparse splits userinfo on the LAST "@" and reports the
+        hostname as api.anthropic.com, so this module classified the value as
+        the canonical Anthropic API and the fail-closed guard never fired, while
+      * the WHATWG parser the Claude CLI consumes turns the backslash into a
+        path separator and connects to evil.com.
+
+    The subscription token would have gone to the attacker's host. A
+    classification that both parsers must agree on cannot be assembled out of
+    one parser's opinion, so anything that is not a boring URL is refused here
+    instead. Only string-shape problems are handled: a value that fails to parse
+    at all is left to _is_gateway_base, which already fails closed on it.
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    if "\\" in raw:
+        return (
+            "it contains a backslash. Python and WHATWG URL parsers disagree "
+            "about one in the authority (path separator vs. userinfo), which is "
+            "how a host you did not choose receives your credentials"
+        )
+    if not raw.isascii():
+        return "it contains non-ASCII characters, which IDNA may reinterpret as another host"
+    control = sorted({f"U+{ord(c):04X}" for c in raw if c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F})
+    if control:
+        return f"it contains whitespace or control characters ({', '.join(control)})"
+
+    candidate = raw if "://" in raw else f"https://{raw}"
+    try:
+        parts = urlparse(candidate)
+        host = parts.hostname or ""
+        port = parts.port
+    except ValueError:
+        # Unparseable: _is_gateway_base catches this case and fails closed.
+        return ""
+    if parts.username is not None or parts.password is not None:
+        return (
+            "it carries userinfo (user[:password]@host). Credentials in a URL "
+            "get logged, and the parsers disagree about where the host begins"
+        )
+    if not host:
+        return "it has no host"
+    # The authority must be exactly host[:port]. Anything else (the '@' Python
+    # already split off, percent-encoding, a stray character) is a place where
+    # one parser can see a different host than the other.
+    if ":" in host:  # IPv6 literal, which urlparse keeps bracketed in netloc
+        expected = f"[{host}]:{port}" if port is not None else f"[{host}]"
+    else:
+        expected = f"{host}:{port}" if port is not None else host
+    if parts.netloc.lower() != expected.lower():
+        return (
+            f"its authority {parts.netloc!r} is not exactly the host "
+            f"{expected!r}"
+        )
+    return ""
 
 
 def _is_gateway_base(url: str) -> bool:
@@ -123,6 +189,20 @@ def configure_auth(
         load_dotenv(env_file)
     else:
         load_dotenv()
+
+    # Before anything else, and before any mode is chosen: this value decides
+    # which host receives a credential. Every mode below is downstream of it,
+    # so a value the parsers can disagree about is refused for all of them
+    # rather than only where the gateway guard happens to sit.
+    base_url_raw = os.environ.get("ANTHROPIC_BASE_URL", "")
+    url_problem = _base_url_rejection_reason(base_url_raw)
+    if url_problem:
+        raise AuthError(
+            f"ANTHROPIC_BASE_URL is unusable: {url_problem}.\n"
+            f"  value: {base_url_raw!r}\n"
+            "Refusing to start: unset ANTHROPIC_BASE_URL to use subscription "
+            "billing, or set it to a plain https://host[:port] form."
+        )
 
     cli_path = shutil.which("claude")
     if cli_path is None:

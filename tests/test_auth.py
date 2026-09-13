@@ -367,3 +367,101 @@ def test_unparseable_base_url_fails_closed(
     _force_non_macos(monkeypatch)
     with pytest.raises(auth_mod.AuthError, match="non-Anthropic host"):
         auth_mod.configure_auth()
+
+
+# ---------- the BASE_URL is judged as a string, not by one parser ----------
+
+# `https://evil.com\@api.anthropic.com` is the demonstrated leak: Python's
+# urlparse splits userinfo on the last "@" and reports hostname
+# "api.anthropic.com", while the WHATWG parser the CLI consumes turns the
+# backslash into a path separator and connects to "evil.com". The harness read
+# it as Anthropic, skipped the fail-closed guard, and handed the subscription
+# token to evil.com.
+#
+# The rest of the table is the surrounding class: hosts the two parsers can
+# disagree about. The property under test is not "the backslash is blocked" but
+# "no URL naming a foreign transport host is ever classified as Anthropic".
+FOREIGN_HOST_BASE_URLS = [
+    "https://evil.com\\@api.anthropic.com",
+    "https://api.anthropic.com\\@evil.com",
+    "https://user@api.anthropic.com",
+    "https://user:pass@api.anthropic.com",
+    "https://api.anthropic.com\t.evil.com",
+    "https://api.anthropic.com\n.evil.com",
+    "https://api.anthropic.com\r.evil.com",
+    "https://api.anthropic.com .evil.com",
+    "https://\u0430pi.anthropic.com",  # Cyrillic a: IDNA reinterprets the host
+    "https://api.anthropic.com%2e.evil.com",
+    "https://api.anthropic.com.evil.net",
+    "http://[",
+]
+
+# A NUL cannot be stored in os.environ at all (setenv raises ValueError), so it
+# can only be exercised at the string level. The validator still refuses it, in
+# case a future config path hands it one.
+STRING_LEVEL_REJECTIONS = FOREIGN_HOST_BASE_URLS + [
+    "https://api.anthropic.com\x00.evil.com",
+]
+
+LEGIT_BASE_URLS = [
+    "https://api.anthropic.com",
+    "https://api.anthropic.com/v1",
+    "https://api.anthropic.com:443",
+    "https://openrouter.ai/api",
+    "api.z.ai/api/anthropic",
+    "http://localhost:8080",
+    "https://gw.example.com:8443/api",
+    "https://[::1]:8080",
+]
+
+
+@pytest.mark.parametrize("url", STRING_LEVEL_REJECTIONS)
+def test_foreign_host_base_url_is_never_classified_as_anthropic(url: str) -> None:
+    """A URL naming a foreign host must come out of classification as a gateway
+    (so the no-token guard fires) or be rejected outright. Silence here is what
+    leaked a credential."""
+    reason = auth_mod._base_url_rejection_reason(url)
+    assert reason or auth_mod._is_gateway_base(url), (
+        f"hostile BASE_URL passed as Anthropic: {url!r}"
+    )
+
+
+@pytest.mark.parametrize("url", FOREIGN_HOST_BASE_URLS)
+def test_foreign_host_base_url_fails_closed_end_to_end(
+    monkeypatch: pytest.MonkeyPatch, url: str
+) -> None:
+    """Same values through the real entry point, with every auth path that could
+    carry a credential available. None of them may proceed."""
+    _require_claude_cli()
+    _clear_all_auth_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", url)
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-subscription-token")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-REAL-USER-KEY")
+    with pytest.raises(auth_mod.AuthError):
+        auth_mod.configure_auth(allow_api_key=True)
+
+
+@pytest.mark.parametrize("url", LEGIT_BASE_URLS)
+def test_legitimate_base_urls_are_still_accepted(url: str) -> None:
+    """The anti-overblocking direction: gateways, ports and IPv6 literals are
+    normal configurations, and a validator that rejects them is a breakage."""
+    assert auth_mod._base_url_rejection_reason(url) == ""
+
+
+@pytest.mark.parametrize("url", ["", "   "])
+def test_empty_base_url_is_not_a_rejection(url: str) -> None:
+    """No BASE_URL set is the common case (subscription billing)."""
+    assert auth_mod._base_url_rejection_reason(url) == ""
+
+
+def test_backslash_base_url_reason_names_the_character() -> None:
+    """The message has to name the problem: this is a config error an operator
+    has to fix, and "invalid URL" sends them hunting."""
+    reason = auth_mod._base_url_rejection_reason("https://evil.com\\@api.anthropic.com")
+    assert "backslash" in reason.lower(), reason
+
+
+def test_userinfo_base_url_reason_names_userinfo() -> None:
+    reason = auth_mod._base_url_rejection_reason("https://user@api.anthropic.com")
+    assert "userinfo" in reason.lower() or "credential" in reason.lower(), reason
+
