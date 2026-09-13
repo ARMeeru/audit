@@ -31,13 +31,25 @@ def _allow_api_key_from_env_or_flag(flag: bool) -> bool:
     if flag:
         return True
     return os.environ.get("AUDIT_ALLOW_API_KEY", "").strip().lower() not in _FALSY_ENV
-from audit.config import load_config
-from audit.orchestrator import CostExceeded, run_pipeline
-from audit.state import StateDB
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-DB_PATH = REPO_ROOT / "state.db"
-RESULTS_ROOT = REPO_ROOT / "results"
+
+def _require_run_id(run_id: str) -> str:
+    """A run id names directories under results/ and work/, so reject anything
+    that is not a plain path component before it is used at all. The state layer
+    validates too; this exists so the operator gets a usage error naming the
+    flag instead of a ValueError traceback."""
+    try:
+        return safe_component(run_id, kind="--run-id")
+    except ValueError as e:
+        raise click.BadParameter(str(e)) from None
+from audit.config import load_config
+from audit.json_utils import validate_schema
+from audit.orchestrator import CostExceeded, run_pipeline
+from audit.paths import REPO_ROOT, RESULTS as RESULTS_ROOT, STATE_DB, safe_component
+from audit.state import StateDB
+from audit.stages._common import SCHEMAS
+
+DB_PATH = STATE_DB
 
 console = Console()
 
@@ -187,7 +199,7 @@ def run(repo: str, run_id: str | None, resume: bool, max_cost_usd: float | None,
         scope_notes = Path(scope_notes_path).read_text()
         console.print(f"[cyan]scope notes loaded:[/cyan] {scope_notes_path} ({len(scope_notes)} chars)")
 
-    run_id = run_id or f"run_{uuid.uuid4().hex[:8]}"
+    run_id = _require_run_id(run_id or f"run_{uuid.uuid4().hex[:8]}")
     repo_path = Path(repo).resolve()
 
     db = StateDB(DB_PATH)
@@ -233,6 +245,7 @@ def status(run_id: str | None) -> None:
         if run_id is None:
             _show_runs_table(db)
             return
+        run_id = _require_run_id(run_id)
         run = db.get_run(run_id)
         if run is None:
             console.print(f"[red]unknown run_id {run_id!r}[/red]")
@@ -249,7 +262,7 @@ def report(run_id: str, fmt: str) -> None:
     """Print (or generate) the final report."""
     db = StateDB(DB_PATH)
     try:
-        report_path = RESULTS_ROOT / run_id / "report" / "report.json"
+        report_path = RESULTS_ROOT / _require_run_id(run_id) / "report" / "report.json"
         if not report_path.exists():
             console.print(f"[red]no report at {report_path}[/red]")
             sys.exit(1)
@@ -333,14 +346,21 @@ def _md_inline(s: str) -> str:
 
     Taint is per-report, not per-field: finding fields come from a model
     reading attacker-influenced target code, so a field added later must be
-    safe by default. Code fences still use _code_fence."""
-    return re.sub(r"([\\`*_{}\[\]()#+\-.!|<>])", r"\\\1", str(s))
+    safe by default. Code fences still use _code_fence.
+
+    Line terminators are folded to spaces. Escaping the character class alone
+    was not enough: `=` is not in it, so a field carrying a newline followed by
+    `===` turned the preceding line into a setext heading. Every caller
+    interpolates into a single line by construction, so folding loses nothing
+    and removes the whole class of block-level injection."""
+    text = re.sub(r"[\r\n\v\f\x85\u2028\u2029]+", " ", str(s))
+    return re.sub(r"([\\`*_{}\[\]()#+\-.!|<>])", r"\\\1", text)
 
 
 def _code_fence(content: str) -> str:
     """A backtick fence long enough to survive any run of backticks inside
-    `content`: target-influenced evidence that contains ``` must not be
-    able to close the code block early and inject markdown into the
+    `content`: target-influenced evidence that contains ``` must not be able
+    to close the code block early and inject markdown into the
     rendered report."""
     longest = 0
     run = 0
@@ -351,21 +371,45 @@ def _code_fence(content: str) -> str:
 
 
 def _render_markdown_report(report: dict) -> str:
+    # The bytes here are untrusted input, not "the report we just wrote":
+    # _write_report deliberately writes payloads that fail validation (flagged
+    # degraded) and a report.json on disk can predate the current schema. Warn
+    # rather than refuse, because a flagged invalid report beats no report.
+    errors = validate_schema(report, SCHEMAS / "report.schema.json")
+    if errors:
+        click.echo(
+            "warning: report does not validate against report.schema.json "
+            f"({len(errors)} error(s); first: {errors[0]})",
+            err=True,
+        )
+
     lines: list[str] = []
-    lines.append(f"# Vulnerability report — `{report['run_id']}`")
-    lines.append(f"Target: `{report['target']['repo_path']}`  ")
+    if report.get("degraded"):
+        # Without this the markdown of a degraded run is byte-identical in
+        # shape to a clean one, so a consumer reading stdout cannot tell that
+        # the finding set is incomplete.
+        lines.append("**DEGRADED REPORT** — the finding set below is incomplete.")
+        if report.get("degraded_reason"):
+            lines.append(f"Reason: {_md_inline(report['degraded_reason'])}")
+        lines.append("")
+    lines.append(f"# Vulnerability report — `{_md_inline(report['run_id'])}`")
+    lines.append(f"Target: `{_md_inline(report['target']['repo_path'])}`  ")
     s = report["summary"]
     by = s.get("by_severity", {})
-    lines.append(f"**Total findings: {s['total']}** — "
-                 + ", ".join(f"{k}: {v}" for k, v in by.items()) if by
-                 else f"**Total findings: {s['total']}**")
+    total = _md_inline(s["total"])
+    counts = ", ".join(f"{_md_inline(k)}: {_md_inline(v)}" for k, v in by.items())
+    lines.append(f"**Total findings: {total}** — {counts}" if by
+                 else f"**Total findings: {total}**")
     lines.append("")
     for f in report["findings"]:
         lines.append(f"## {_md_inline(f['title'])}")
         lines.append(f"- **Severity**: {_md_inline(f['severity'])}  ")
         lines.append(f"- **Class**: {_md_inline(f['vuln_class'])}"
-                     + (f" ({f['cwe']})" if f.get("cwe") else ""))
-        lines.append(f"- **Location**: `{_md_inline(f['file'])}:{f['line_start']}-{f['line_end']}`  ")
+                     + (f" ({_md_inline(f['cwe'])})" if f.get("cwe") else ""))
+        lines.append(
+            f"- **Location**: `{_md_inline(f['file'])}:"
+            f"{_md_inline(f['line_start'])}-{_md_inline(f['line_end'])}`  "
+        )
         lines.append("")
         # description is prose from the target-influenced model output:
         # escaped like every other inline field, so headings, images and
@@ -387,7 +431,10 @@ def _render_markdown_report(report: dict) -> str:
         if cc:
             lines.append("**Call chain**:")
             for frame in cc:
-                lines.append(f"1. `{_md_inline(frame['file'])}:{frame['line']}` — `{_md_inline(frame['function'])}()`")
+                lines.append(
+                    f"1. `{_md_inline(frame['file'])}:{_md_inline(frame['line'])}`"
+                    f" — `{_md_inline(frame['function'])}()`"
+                )
             lines.append("")
         lines.append(f"**Recommendation**: {_md_inline(f['recommendation'])}")
         lines.append("")
@@ -395,6 +442,21 @@ def _render_markdown_report(report: dict) -> str:
             lines.append(f"_Variants_: {', '.join(_md_inline(v) for v in f['variants'])}")
             lines.append("")
         lines.append("---")
+        lines.append("")
+    untraced = report.get("untraced_findings") or []
+    if untraced:
+        # Confirmed but never traced. Naming them here matters because an
+        # omission reads as "nothing found", when the truth is "never assessed".
+        lines.append("## Confirmed findings never traced")
+        lines.append("")
+        lines.append(
+            "The tracer failed or quota ended the stage before these were "
+            "assessed, so they are neither reported as reachable nor cleared. "
+            "Re-run with --resume --finalize to grade them."
+        )
+        lines.append("")
+        for fid in untraced:
+            lines.append(f"- `{_md_inline(fid)}`")
         lines.append("")
     return "\n".join(lines)
 
