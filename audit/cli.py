@@ -250,6 +250,11 @@ def run(repo: str, run_id: str | None, resume: bool, max_cost_usd: float | None,
 
     db = StateDB(DB_PATH)
     try:
+        # A cased spelling of an existing run must resume that run, not fall into
+        # create_run and raise on the collision check.
+        canonical = db.resolve_run_id(run_id)
+        if canonical is not None:
+            run_id = canonical
         report = asyncio.run(run_pipeline(
             repo_path=repo_path,
             run_id=run_id,

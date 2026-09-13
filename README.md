@@ -355,6 +355,11 @@ stays green.
   loopback interface, so a stage whose PoC needs a local server must run with
   `sandbox: false`. Note that the port is not part of the allowlist either: a
   target is allowlisted by host.
+- **MCP suppression can refuse to start on a managed machine.** Sessions pass
+  `--strict-mcp-config`, and the CLI treats that as a startup error when an
+  enterprise MCP config is present. `strict_mcp_config: false` in
+  `config/stages.yaml` is the way out, and it re-opens the route above, so prefer
+  fixing the enterprise config.
 - **Reads are not restricted at all in a normal run.** An agent can read any file
   the user can, including anything under `--add-dir`. The filter covers the
   harness's own secrets and state, not the rest of the filesystem.
