@@ -4,8 +4,22 @@
 
 defaults:
   max_turns: 25
-  permission_mode: acceptEdits   # never bypassPermissions
+  permission_mode: acceptEdits   # validated at load: bypassPermissions is refused
   repair_attempts: 1             # one re-emit chance on schema-validation failure
+  # Run agents under the SDK's OS sandbox (macOS/Linux). This is the boundary
+  # between an agent's Bash and the harness's own state.db and results/ tree: a
+  # command reaching outside the agent's working directory fails inside the
+  # sandbox, so a hunter influenced by the code it is reading cannot forge a
+  # finding. runner.py also installs a PreToolUse filter, but a filter over a
+  # command string is not a boundary. README's Safety section records what each
+  # layer is worth and what the confinement does not cover. Turn this off only
+  # where the sandbox cannot start.
+  sandbox: true
+  # Ignore MCP servers the operator's own configuration would otherwise load.
+  # Those clients run inside the harness process, outside the sandbox, so a
+  # write-capable one is an exfiltration route the sandbox cannot see. Turn this
+  # off only where an enterprise MCP config makes the CLI refuse to start.
+  strict_mcp_config: true
   # Per-task cost reserved against --max-cost-usd while agents are in flight.
   # Upper bound by intent: 1.5 sits above the highest single task cost ever
   # recorded on the live runs (hunt max $0.676, validate max $1.26,
@@ -18,13 +32,15 @@ stages:
   recon:
     model: claude-opus-4-7
     concurrency: 1
-    tools: [Read, Grep, Glob, Bash]
+    # BashOutput and KillShell ride along with Bash: a long compile or test can
+    # background on timeout, and without them its output is unreachable.
+    tools: [Read, Grep, Glob, Bash, BashOutput, KillShell]
     max_turns: 60                # recon can be long
     repair_attempts: 2           # critical one-shot; spend a second repair turn if needed
   hunt:
     model: claude-sonnet-4-6
     concurrency: 50
-    tools: [Read, Grep, Glob, Bash]
+    tools: [Read, Grep, Glob, Bash, BashOutput, KillShell]
   validate:
     model: claude-opus-4-7        # different from hunt — deliberate disagreement
     concurrency: 10
@@ -41,7 +57,7 @@ stages:
   trace:
     model: claude-opus-4-7        # most critical stage
     concurrency: 10
-    tools: [Read, Grep, Glob, Bash]
+    tools: [Read, Grep, Glob, Bash, BashOutput, KillShell]
   feedback:
     model: claude-sonnet-4-6
     concurrency: 1

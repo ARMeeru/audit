@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from audit.paths import UnsafeIdentifier
 from audit.runner import AgentRunError, QuotaExhaustedError, TransientAgentError, run_agent
 from audit.state import Finding, StateDB
 from audit.stages._common import StageContext
@@ -62,6 +63,9 @@ async def run_validate(ctx: StageContext, db: StateDB) -> int:
                     add_dirs=[ctx.repo_path],
                     max_turns=sc.max_turns,
                     permission_mode=sc.permission_mode,
+                    sandbox=sc.sandbox,
+                    network_allow=ctx.network_allow(),
+                    strict_mcp_config=sc.strict_mcp_config,
                     artifact_dir=ctx.results_dir("validate"),
                     artifact_name=f.finding_id,
                     repair_attempts=sc.repair_attempts,
@@ -94,6 +98,16 @@ async def run_validate(ctx: StageContext, db: StateDB) -> int:
                 # confirmed either — "avoid silently confirming" still
                 # holds. A deterministically failing validation stops
                 # re-burning spend via the dispatch attempts ceiling.
+                return
+
+            except UnsafeIdentifier as e:
+                # An identifier that cannot become a filename. This finding's
+                # problem, not the run's: propagating it out of the gather marks
+                # the whole run failed, after the exploration spend is sunk.
+                # Persist no verdict, for the same reason as the branch above.
+                log.warning("[%s] validate %s unusable identifier: %s",
+                            ctx.run_id, f.finding_id, e)
+                counters["failed"] += 1
                 return
 
             verdict = result.payload.get("verdict", "needs_more_info")

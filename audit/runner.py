@@ -29,6 +29,7 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    HookMatcher,
     ResultMessage,
     TextBlock,
     ThinkingBlock,
@@ -37,6 +38,15 @@ from claude_agent_sdk import (
 )
 
 from audit.json_utils import extract_json, validate_schema
+from audit.paths import (
+    GUARDED_TOOLS,
+    REPO_ROOT,
+    _TOOL_INPUTS,
+    bash_guard_hit,
+    canonical_path,
+    safe_component,
+    structured_path_hit,
+)
 
 log = logging.getLogger(__name__)
 
@@ -124,6 +134,193 @@ def _classify_api_error(
     return "unknown_api_error", TransientAgentError
 
 
+# ---------- confinement ----------
+#
+# Two layers, and they are not equivalent.
+#
+# The sandbox (SDK `sandbox` settings) is the boundary. Commands run inside the
+# OS sandbox, which allows writes under the agent's own working directory and the
+# directories it was granted, and refuses them elsewhere, so a hunter that has
+# been talked into rewriting state.db cannot: the syscall fails.
+#
+# The tool guard below is a FILTER. For structured tools it resolves the path and
+# compares containment, which is exact. For Bash there is no structure to
+# resolve, so it is a string match, and a path built at runtime
+# (`p=$(printf %s <b64>|base64 -d); sqlite3 "$p" ...`) walks past it. It is the
+# only layer in the two geometries where no sandbox can separate harness from
+# target: a self-audit, and a platform where the sandbox cannot start. Defence in
+# depth, never the boundary, and it must not be described as one.
+
+_SANDBOX_SETTINGS: dict[str, Any] = {
+    "enabled": True,
+    # Bash is auto-approved once sandboxed: the sandbox, not an interactive
+    # prompt, is what makes running a PoC safe.
+    "autoAllowBashIfSandboxed": True,
+    # The escape hatch stays shut. Left open, the model can pass
+    # dangerouslyDisableSandbox and reach the harness tree again, which makes
+    # everything above decorative.
+    "allowUnsandboxedCommands": False,
+}
+
+# Which tool_input fields carry a path, and which tools the matcher must name,
+# both come from audit.paths so the vocabulary cannot drift: a tool the guard
+# inspects but the matcher omits is a check that can never fire, which is what
+# the Read, Grep and Glob entries were before this was centralised.
+_GUARD_MATCHER = "|".join(sorted(GUARDED_TOOLS))
+
+
+def _make_tool_guard(cwd: Path | None = None, workspace: list[Path] | None = None):
+    """Build the PreToolUse callback that refuses harness-file tool calls.
+
+    PreToolUse rather than `can_use_tool`: the SDK documents that a whole-tool
+    `allowed_tools` entry plus `permission_mode="acceptEdits"` shadows the
+    permission callback entirely, so `can_use_tool` would never fire for the
+    tools that matter here. PreToolUse fires for every call.
+
+    `cwd` is the session's working directory and `workspace` the directories a
+    bare pattern resolves against. Built without them, the guard assumes the
+    harness root, which fails closed.
+    """
+    session_cwd = Path(cwd) if cwd is not None else REPO_ROOT
+    workspace_dirs = [Path(p) for p in (workspace or [session_cwd])]
+
+    async def _guard(input: dict, tool_use_id: str | None, context: dict) -> dict:
+        tool_name = input.get("tool_name", "")
+        tool_input = input.get("tool_input") or {}
+        if tool_name == "Bash":
+            hit = bash_guard_hit(str(tool_input.get("command", "")), cwd=session_cwd)
+        elif tool_name in _TOOL_INPUTS:
+            hit = structured_path_hit(
+                tool_name, tool_input, cwd=session_cwd, workspace=workspace_dirs
+            )
+        else:
+            hit = None
+        if hit is None:
+            return {}
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    f"Blocked: this call reaches for {hit}. The harness's own state "
+                    "is off limits: findings are recorded by the pipeline, not by an "
+                    "agent, and a direct write would forge a result. Use Read, Grep "
+                    "or Glob to inspect the target, and run PoCs inside your scratch "
+                    "directory."
+                ),
+            }
+        }
+
+    return _guard
+
+
+def _artifact_path(artifact_dir: Path, artifact_name: str) -> Path:
+    """Where an agent's JSONL transcript goes.
+
+    `artifact_name` is a hunt task id or a finding id: the first comes from
+    recon's output, so it is derived from the target repo, and it used to be
+    interpolated into the filename unchecked."""
+    return artifact_dir / f"{safe_component(artifact_name, kind='artifact name')}.jsonl"
+
+
+def _build_options(
+    *,
+    system_prompt: str,
+    allowed_tools: list[str],
+    model: str,
+    max_turns: int,
+    cwd: Path,
+    add_dirs: list[Path] | None,
+    permission_mode: str,
+    sandbox: bool = True,
+    network_allow: list[str] | None = None,
+    strict_mcp_config: bool = True,
+) -> ClaudeAgentOptions:
+    """Assemble the SDK options, confinement included.
+
+    Split out of _run_agent_once so the confinement can be asserted without an
+    API call (and without pytest-asyncio, which the suite does not install).
+
+    `network_allow` is the sandbox's egress allowlist, normally just the host of
+    the operator's `--target-url`. Measured, not assumed: with the sandbox on and
+    no network config, every outbound connection is refused, loopback included,
+    with `deny network-outbound <host>:443` in the transcript. A static run
+    therefore has no egress at all, which is a property worth having; a
+    live-target run needs its target named here or its reproduce step cannot
+    reach it.
+    """
+    cwd = Path(cwd)
+    dirs = [Path(p) for p in (add_dirs or [])]
+    # The agent was handed a directory that encloses the harness checkout, which
+    # is the only overlap that matters: the sandbox's write scope is the working
+    # directory PLUS the added directories, so a directory containing the
+    # checkout confers access to state.db, results/ and .env. A harness-chosen
+    # cwd that merely sits inside the checkout (hunt's scratch dir is
+    # REPO_ROOT/work/<run>/hunt/<task>) is not this case and must not be
+    # reported as one, or the warning fires on every task of every run and stops
+    # meaning anything.
+    granted = (cwd, *dirs)
+    if any(
+        canonical_path(p) == REPO_ROOT or REPO_ROOT.is_relative_to(canonical_path(p))
+        for p in granted
+    ):
+        log.warning(
+            "[confinement] self-audit: the target was granted the harness checkout "
+            "itself or a directory containing it, so the OS sandbox cannot separate "
+            "them. state.db and results/ sit inside it and are then protected only "
+            "by the tool filter, which obfuscation can walk past."
+        )
+    sandbox_settings: dict[str, Any] | None = None
+    if sandbox:
+        # A fresh dict per dispatch: one shared mutable literal would be written
+        # through by any SDK version that normalizes sandbox settings in place,
+        # reconfiguring confinement for every agent already in flight.
+        sandbox_settings = dict(_SANDBOX_SETTINGS)
+        if network_allow:
+            sandbox_settings["network"] = {"allowedDomains": list(network_allow)}
+    return ClaudeAgentOptions(
+        system_prompt=system_prompt,
+        # `tools` is the set that EXISTS among the CLI's built-in tools;
+        # `allowed_tools` only pre-approves. Setting both to the configured list
+        # means a stage configured with no Bash does not have Bash at all, rather
+        # than merely failing to pre-approve it and falling through to whatever
+        # permission_mode allows. Probed rather than assumed: a session declaring
+        # tools=["Read"] reports BASH=absent.
+        #
+        # It does NOT cover MCP tools. A session with a two-name built-in list
+        # still carried the operator's own `mcp__claude_ai_Google_Drive__*`
+        # servers, because setting_sources=[] disables settings files but not the
+        # MCP configuration the CLI loads separately. Those clients run inside
+        # this process, so they sit outside the sandbox, and an MCP server with
+        # write access is an exfiltration route the sandbox cannot see.
+        # `--strict-mcp-config` plus `--setting-sources=` is what closes it. An
+        # empty `mcp_servers` would read as if it did, but the SDK only emits
+        # `--mcp-config` for a non-empty mapping, so it is dead weight.
+        #
+        # Caveat worth knowing (README): the CLI refuses to start with
+        # `--strict-mcp-config` when an enterprise MCP config is present, which
+        # is why this is a config key rather than a constant.
+        tools=list(allowed_tools),
+        allowed_tools=list(allowed_tools),
+        strict_mcp_config=strict_mcp_config,
+        model=model,
+        max_turns=max_turns,
+        cwd=str(cwd),
+        add_dirs=[str(p) for p in dirs],
+        permission_mode=permission_mode,
+        setting_sources=[],
+        sandbox=sandbox_settings,
+        hooks={
+            "PreToolUse": [
+                HookMatcher(
+                    matcher=_GUARD_MATCHER,
+                    hooks=[_make_tool_guard(cwd, [cwd, *dirs])],
+                )
+            ]
+        },
+    )
+
+
 async def run_agent(
     *,
     stage: str,
@@ -136,6 +333,9 @@ async def run_agent(
     add_dirs: list[Path] | None = None,
     max_turns: int = 25,
     permission_mode: str = "acceptEdits",
+    sandbox: bool = True,
+    network_allow: list[str] | None = None,
+    strict_mcp_config: bool = True,
     artifact_dir: Path,
     artifact_name: str,
     repair_attempts: int = 1,
@@ -150,6 +350,11 @@ async def run_agent(
     backoff retries are exhausted. Raises `AgentRunError` if the model
     produced parseable output that doesn't match the schema even after
     repair turns.
+
+    `sandbox` is threaded from the stage config (default true). It is the
+    boundary that keeps an agent's Bash out of the harness's own state; the
+    PreToolUse filter installed alongside it is defence in depth, not a
+    substitute.
 
     `on_attempt` is invoked ONCE per SDK session with that session's
     final result-message dict, whether the session succeeded or raised.
@@ -174,6 +379,9 @@ async def run_agent(
                 add_dirs=add_dirs,
                 max_turns=max_turns,
                 permission_mode=permission_mode,
+                sandbox=sandbox,
+                network_allow=network_allow,
+                strict_mcp_config=strict_mcp_config,
                 artifact_dir=artifact_dir,
                 artifact_name=artifact_name,
                 repair_attempts=repair_attempts,
@@ -208,6 +416,9 @@ async def _run_agent_once(
     add_dirs: list[Path] | None,
     max_turns: int,
     permission_mode: str,
+    sandbox: bool,
+    network_allow: list[str] | None,
+    strict_mcp_config: bool,
     artifact_dir: Path,
     artifact_name: str,
     repair_attempts: int,
@@ -216,7 +427,7 @@ async def _run_agent_once(
     """Single attempt. Raises TransientAgentError / QuotaExhaustedError
     before schema validation if the API returned is_error=True."""
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    artifact_path = artifact_dir / f"{artifact_name}.jsonl"
+    artifact_path = _artifact_path(artifact_dir, artifact_name)
     cwd.mkdir(parents=True, exist_ok=True)
 
     system_prompt = prompt_file.read_text()
@@ -232,15 +443,17 @@ async def _run_agent_once(
         "`additionalProperties: false`.\n\n"
         f"```json\n{schema_text}\n```\n"
     )
-    options = ClaudeAgentOptions(
+    options = _build_options(
         system_prompt=system_prompt,
         allowed_tools=allowed_tools,
         model=model,
         max_turns=max_turns,
-        cwd=str(cwd),
-        add_dirs=[str(p) for p in (add_dirs or [])],
+        cwd=cwd,
+        add_dirs=add_dirs,
         permission_mode=permission_mode,
-        setting_sources=[],
+        sandbox=sandbox,
+        network_allow=network_allow,
+        strict_mcp_config=strict_mcp_config,
     )
 
     initial_prompt = json.dumps(user_input, ensure_ascii=False)

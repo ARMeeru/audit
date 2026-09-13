@@ -27,8 +27,10 @@
 >   without an auth token.
 > - **Report evidence is fence-safe**: target-influenced evidence renders inside
 >   a fence it cannot break; `AUDIT_ALLOW_API_KEY=no/off` parse as opt-out.
-> - **Egress correction**: network egress is NOT restricted to the target host
->   by any enforced mechanism. It is a prompt-level instruction only; recon
+> - **Egress**: the sandbox refuses every outbound connection unless a host is
+>   allowlisted, and `--target-url` allowlists that host for the run, so egress is
+>   enforced rather than prompted. Within a stage that has the sandbox off, the
+>   old caveat applies: recon
 >   credentials are stored plaintext in result artifacts. Run in a disposable
 >   VM or container when the target is sensitive.
 >
@@ -195,11 +197,18 @@ Hunt cooperatively aborts rather than running 30 more tasks past the cap.
 
 ## Live-target reproduction (optional)
 
-If the target has a running deployment, point the agents at it. Hunt now
+If the target has a running deployment, point the agents at it. Hunt
 **reproduces** each finding against the live service instead of compiling
-a local PoC, Validate **rejects** findings that don't reproduce, and Trace
-**confirms** reachability with real HTTP round-trips. The static path
-remains available — these flags are opt-in.
+a local PoC, and Trace **confirms** reachability with real HTTP
+round-trips. Validate has no Bash in any mode: it judges reproduction from
+the code and from what Hunt recorded. The static path remains available,
+and these flags are opt-in.
+
+Egress is not a prompt instruction any more. The sandbox refuses every
+outbound connection by default, and `--target-url` adds that host to the
+allowlist for the run, so a static run reaches nothing at all and a
+live-target run reaches only its target. A target that redirects to a
+third-party host needs that stage's `sandbox` switched off.
 
 ```bash
 audit run --repo /path/to/target --run-id live \
@@ -210,10 +219,11 @@ audit run --repo /path/to/target --run-id live \
 ```
 
 Rules the agents follow when `--target-url` is set:
-- Network egress is NOT enforced to that host: it is a prompt-level
-  instruction only, and the CLI itself contacts isbndb/OpenLibrary-style
-  services and your gateway. Run sensitive targets inside a disposable VM
-  or container.
+- Network egress is enforced by the sandbox to that host: a static run reaches
+  nothing at all, and a live-target run reaches its target host. A target that
+  redirects to a third-party host needs that stage's `sandbox` switched off, and
+  the CLI's own bookkeeping (your gateway) happens outside the sandboxed command.
+  Run sensitive targets inside a disposable VM or container regardless.
 - A finding that doesn't reproduce against the live target is dropped or
   rejected (depending on stage) — "no fabrication".
 - Credentials flow into every relevant stage's user_input as a dict.
@@ -274,14 +284,78 @@ state.db        SQLite (gitignored)
 
 ## Safety
 
-Hunt agents have Bash and run inside per-task scratch dirs. They are **not**
-sandboxed at the OS level. Run the audit inside a disposable VM or container
-when you don't trust the target source — a target with malicious build
-scripts could otherwise execute on your host during PoC compilation.
+Hunt agents have Bash and run inside per-task scratch dirs. They also run under
+the SDK's OS sandbox (macOS and Linux), enabled by default and configurable per
+stage via `sandbox` in `config/stages.yaml`:
+
+- writes outside the agent's working directory and the directories you add with
+  `--add-dir` are refused by the sandbox, so an agent cannot rewrite `state.db`
+  or the `results/` tree even when the code it is reading talks it into trying.
+  The audited source itself IS inside that scope (it is added as a directory),
+  so a hunter can write to the target it is reading;
+- a PreToolUse hook additionally refuses tool calls whose own path lands in the
+  harness's files. For the structured tools it resolves that path and compares by
+  filesystem identity, so case-folded spellings, hardlinks, symlinks, `..` and
+  `~` need no pattern matching. For Bash it is a **speed bump**, not a boundary:
+  it expands the shell's home spellings and refuses the guarded names, and it
+  does not model globbing, quoting, `cd`, `--flag=<path>` or a path built at
+  runtime.
+
+Two cases are worth knowing before you rely on either layer, and both are in the
+register below rather than repeated here.
+
+For an untrusted target, run the audit inside a disposable VM or container
+anyway: a target with malicious build scripts could otherwise execute on your
+host during PoC compilation, which is outside anything the harness can enforce.
 
 The agent reads everything you `--add-dir`, including any `.env` or
 `secrets/` directories in the target. Outputs land in `results/<run-id>/`
 which is `.gitignore`d but **not** scrubbed of those reads.
+
+### What the confinement does not cover
+
+Written down because the alternative is an operator assuming a guarantee they do
+not have. `scripts/mutation-check.py` is the executable form of the claims above:
+it breaks one protection at a time and fails if the sensor that should notice
+stays green.
+
+- **The Bash filter is a speed bump with a written scope.** It does not model
+  globbing (`cat .cla*/.creden*`), quoting (`cat .cla""ude/x`), `--flag=<path>`,
+  `cd`, or a path built at runtime. It also does not stop `cp -R .` or a similar
+  directory-level copy, which puts a copy of the checkout (including `.env`) in
+  the scratch dir where Read can reach it. It matches the harness database by
+  basename, so a target shipping its own `state.db` cannot be reached by a shell
+  command; the structured tools compare by identity and do allow it. Three review
+  rounds tried to make this filter sound by adding rules and produced eight
+  bypasses, two regressions and a hook that could block every concurrent agent
+  for 41 seconds, so the rules came out and the scope went in here.
+- **A self-audit is still unconfined by construction.** `--repo` pointing at this
+  checkout, or at a directory containing it, hands the agent the tree the harness
+  keeps `state.db`, `results/` and `.env` in. The run logs a warning. Moving
+  those three paths outside the audited tree is the fix, and it is the reason the
+  paragraph above can stay this short: with them outside, the sandbox separates
+  harness from target in every geometry and most of the filter has no reason to
+  exist.
+- **Reading is not sandboxed at all.** The sandbox scopes writes and network. A
+  Grep rooted above a guarded file is refused by the hook, because ripgrep passes
+  `--hidden` with only VCS directories excluded, but an agent can still read
+  anything else the user can, including anything under `--add-dir`.
+- **MCP servers are suppressed, not filtered.** Sessions pass
+  `--strict-mcp-config` with no server config, because the CLI otherwise loads
+  the operator's own user, project and plugin servers, and those clients run
+  inside the harness process, outside the sandbox. The CLI treats that flag as a
+  startup error when an enterprise MCP config is present, which is why
+  `strict_mcp_config: false` exists per stage; it re-opens the route.
+- **Loopback is not available under the sandbox, whatever the allowlist says.**
+  Measured: with `allowedDomains` set to `127.0.0.1`, `localhost` or
+  `127.0.0.1:<port>`, a connection to a local server is still refused with
+  `deny network-outbound`. A stage whose PoC needs a local server must run with
+  `sandbox: false`. A static run has no egress at all, and `--target-url` adds
+  exactly that host.
+- **`--run-id` must match `[A-Za-z0-9._-]{1,128}`** and is rejected at the CLI
+  otherwise. It becomes a directory name, so a run id with a colon or a space
+  will not resolve. Case-only differences collide on a case-folding filesystem
+  and are refused.
 
 ## License
 

@@ -102,7 +102,9 @@ prose, no markdown fence, no commentary — just the JSON.
 # Constraints
 
 - Each `initial_tasks[*].task_id` must be unique and stable
-  (`t_<subsystem>_<attack_class>_<n>`).
+  (`t_<subsystem>_<attack_class>_<n>`). Lowercase letters, digits, `_` and `-`
+  only: the id becomes a directory name, so the schema rejects anything else
+  and a rejected id costs you a repair turn.
 - `scope_hint` must name the trust boundary above the sink — e.g.
   "HTTP POST /api/import reads `filename` from JSON body, passes to
   `zipfile.ZipFile.extractall()` in services/importer.py:42". Vague

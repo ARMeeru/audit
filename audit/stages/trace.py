@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from audit.paths import UnsafeIdentifier
 from audit.runner import AgentRunError, QuotaExhaustedError, TransientAgentError, run_agent
 from audit.state import Finding, StateDB
 from audit.stages._common import StageContext, truncated_recon_summary
@@ -56,6 +57,9 @@ async def run_trace(ctx: StageContext, db: StateDB) -> int:
                     add_dirs=[ctx.repo_path],
                     max_turns=sc.max_turns,
                     permission_mode=sc.permission_mode,
+                    sandbox=sc.sandbox,
+                    network_allow=ctx.network_allow(),
+                    strict_mcp_config=sc.strict_mcp_config,
                     artifact_dir=ctx.results_dir("trace"),
                     artifact_name=f.finding_id,
                     repair_attempts=sc.repair_attempts,
@@ -84,6 +88,15 @@ async def run_trace(ctx: StageContext, db: StateDB) -> int:
                 # report (resume skips findings that already have a trace
                 # row). Leaving no trace lets --resume re-attempt it. The
                 # real API spend still gets recorded.
+                return
+
+            except UnsafeIdentifier as e:
+                # An identifier that cannot become a filename. Fail this
+                # finding, not the run: an exception escaping the gather marks
+                # every other trace as lost too. No row, so --resume retries it.
+                log.warning("[%s] trace %s unusable identifier: %s",
+                            ctx.run_id, f.finding_id, e)
+                counters["failed"] += 1
                 return
 
             db.add_trace(ctx.run_id, f.finding_id, result.payload)

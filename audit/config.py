@@ -7,6 +7,23 @@ from pathlib import Path
 
 import yaml
 
+from audit.paths import CONFIG
+
+# The tools a stage may be granted. An unknown name used to be forwarded
+# verbatim into ClaudeAgentOptions.allowed_tools, so a typo'd or invented entry
+# silently became an approved tool.
+KNOWN_TOOLS = frozenset(
+    {"Read", "Write", "Edit", "NotebookEdit", "Bash", "BashOutput", "KillShell",
+     "Grep", "Glob", "WebFetch", "WebSearch", "Task", "TodoWrite"}
+)
+
+
+# The SDK's permission modes. `bypassPermissions` is deliberately excluded:
+# stages.yaml has always carried "# never bypassPermissions" as a comment, and a
+# comment is not an invariant.
+KNOWN_PERMISSION_MODES = frozenset({"default", "acceptEdits", "plan", "dontAsk", "auto"})
+FORBIDDEN_PERMISSION_MODES = {"bypassPermissions"}
+
 
 @dataclass
 class StageConfig:
@@ -21,6 +38,16 @@ class StageConfig:
     # Must be an UPPER BOUND on observed per-task cost: reserving less than
     # actual makes the cap permissive rather than conservative.
     est_cost_usd: float = 1.5
+    # Whether to run this stage's agents under the SDK's OS sandbox. On by
+    # default because the sandbox is the only real boundary between an agent's
+    # Bash and the harness's own state.db; turn it off only on a platform where
+    # it cannot start, and read the residual-risk register in README.md first.
+    sandbox: bool = True
+    # Whether to ignore MCP servers the operator's own configuration would load.
+    # On by default: those clients run inside the harness process, outside the
+    # sandbox, so a write-capable one is an exfiltration route. Turn it off on a
+    # machine where an enterprise MCP config makes the CLI refuse to start.
+    strict_mcp_config: bool = True
 
 
 @dataclass
@@ -46,18 +73,97 @@ class HarnessConfig:
             sc.concurrency = min(sc.concurrency, cap)
 
 
+def _validate_stage(name: str, spec: dict, defaults: dict) -> None:
+    """Fail loudly on a stage that would run with a tool set or permission mode
+    nobody intended. Unknown keys are still ignored (forward compatibility), but
+    the keys we do consume are checked."""
+    # `tools:` with no value is None in YAML, and dict.get returns the stored
+    # None rather than the default, so this used to raise TypeError instead of
+    # the intended message.
+    # `defaults.tools` falls back like every other key, and a stage that ends up
+    # with no tools at all is refused: an empty list disables every built-in tool,
+    # so the stage would silently produce nothing while the run completed clean.
+    tools = spec.get("tools", defaults.get("tools"))
+    if not isinstance(tools, list):
+        # A bare `tools:` key is None in YAML, and dict.get returns the stored
+        # None rather than the default, which used to raise a TypeError.
+        raise ValueError(
+            f"stage {name!r}: tools must be a list of tool names, got {tools!r}"
+        )
+    if not tools:
+        raise ValueError(
+            f"stage {name!r}: tools is empty. An empty list disables every "
+            "built-in tool, so name the tools or give the stage a `tools:` "
+            "value under `defaults:`."
+        )
+    for tool in tools:
+        if tool not in KNOWN_TOOLS:
+            raise ValueError(
+                f"stage {name!r}: unknown tool {tool!r}. Known tools: "
+                f"{sorted(KNOWN_TOOLS)}"
+            )
+    mode = spec.get("permission_mode", defaults.get("permission_mode", "acceptEdits"))
+    if mode in FORBIDDEN_PERMISSION_MODES:
+        raise ValueError(
+            f"stage {name!r}: permission_mode {mode!r} is never allowed — every "
+            "permission check is what keeps an agent inside its scratch dir."
+        )
+    if mode not in KNOWN_PERMISSION_MODES:
+        raise ValueError(
+            f"stage {name!r}: unknown permission_mode {mode!r}. Known: "
+            f"{sorted(KNOWN_PERMISSION_MODES)}"
+        )
+    # The confinement switch is the one key whose silent misparse removes the
+    # boundary rather than tightening it. YAML is helpful enough that
+    # `sandbox:` (null), `0`, `[]` and `{}` all coerce to False through bool(),
+    # and a quoted "false" coerces to True: both directions are wrong and
+    # neither said anything. Require a real boolean. The defaults block is
+    # checked by _validate_defaults, separately, so it is covered on a config
+    # with no stages at all.
+    _check_bool(f"stage {name!r}", spec, "sandbox")
+    _check_bool(f"stage {name!r}", spec, "strict_mcp_config")
+
+
+def _check_bool(where: str, block: dict, key: str) -> None:
+    """A confinement switch must be a real boolean.
+
+    YAML resolves `key:` with no value to None, and bool(None), bool(0), bool([])
+    and bool({}) are all False while bool("false") is True: a typo removed the
+    protection and an attempt to disable it kept it, both silently.
+    """
+    if key in block and not isinstance(block[key], bool):
+        raise ValueError(
+            f"{where}: {key} must be an unquoted true or false, got "
+            f"{block[key]!r}. A quoted \"false\" does not disable it."
+        )
+
+
+def _validate_defaults(defaults: dict) -> None:
+    """Validate the defaults block on its own.
+
+    The sandbox check used to live inside _validate_stage, which load_config only
+    calls from the stage loop, so a config with no stages at all accepted exactly
+    the quoted "false" the check exists to refuse. The guard has to run whether
+    or not there is a stage to hang it on.
+    """
+    _check_bool("defaults", defaults, "sandbox")
+    _check_bool("defaults", defaults, "strict_mcp_config")
+
+
 def load_config(path: Path | None = None) -> HarnessConfig:
     if path is None:
-        path = Path(__file__).resolve().parent.parent / "config" / "stages.yaml"
+        path = CONFIG / "stages.yaml"
     raw = yaml.safe_load(path.read_text())
     defaults = raw.get("defaults", {}) or {}
+    _validate_defaults(defaults)
     stages: dict[str, StageConfig] = {}
     for name, spec in (raw.get("stages") or {}).items():
+        _validate_stage(name, spec, defaults)
         stages[name] = StageConfig(
             name=name,
             model=spec["model"],
             concurrency=int(spec["concurrency"]),
-            tools=list(spec["tools"]),
+            tools=list(spec.get("tools", defaults.get("tools")) or []),
             max_turns=int(spec.get("max_turns", defaults.get("max_turns", 25))),
             permission_mode=spec.get(
                 "permission_mode", defaults.get("permission_mode", "acceptEdits")
@@ -67,6 +173,13 @@ def load_config(path: Path | None = None) -> HarnessConfig:
             ),
             est_cost_usd=float(
                 spec.get("est_cost_usd", defaults.get("est_cost_usd", 1.5))
+            ),
+            sandbox=bool(spec.get("sandbox", defaults.get("sandbox", True))),
+            strict_mcp_config=bool(
+                spec.get(
+                    "strict_mcp_config",
+                    defaults.get("strict_mcp_config", True),
+                )
             ),
         )
     loops = raw.get("loops", {}) or {}

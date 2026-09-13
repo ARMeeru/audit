@@ -45,9 +45,12 @@ Read, Grep, Glob, Bash.
 
 Bash usage: you may `cd $scratch_dir` and compile / run PoCs there. You
 may invoke compilers / interpreters / linters available on `$PATH`. You
-must **not** write files outside `$scratch_dir`. You must not run
-network calls against external hosts. Local network (`127.0.0.1`,
-ephemeral local servers) is fine.
+must **not** write files outside `$scratch_dir`. Do not run network calls:
+the sandbox refuses every outbound connection, loopback included, so a PoC
+that stands up a local server and talks to it will fail here. Use a PoC
+that runs in-process or reads a file. If a finding genuinely needs an
+HTTP round-trip, say so in the finding and leave the PoC unrun rather than
+recording a failure as evidence that the bug is absent.
 
 # Output
 

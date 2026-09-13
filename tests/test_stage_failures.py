@@ -497,3 +497,88 @@ def test_all_three_report_shapes_validate(stage_env, monkeypatch):
     errors = validate_schema(payload, SCHEMAS / "report.schema.json")
     assert errors == [], f"empty clean report must validate: {errors[:3]}"
     assert "degraded_reason" not in payload, "None optional key must be dropped"
+
+
+# ---------- identifier failure at the stage boundary ----------
+
+
+def test_trace_fails_one_finding_on_an_unusable_identifier(
+    stage_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The handler must be reachable and must not take the run with it. Before
+    this existed, a bad artifact name raised out of the gather and marked the
+    whole run failed; and a bare `except ValueError` also swallowed
+    JSONDecodeError from reading a schema, reporting a broken schema file as an
+    unusable identifier and sending the operator after the wrong thing."""
+    from audit.paths import UnsafeIdentifier
+
+    db, ctx = stage_env
+    _add_confirmed_canonical_finding(db, "f_1")
+    db.set_finding_validation("poc", "f_1", "confirmed", {"verdict": "confirmed"})
+    db.assign_finding_group("poc", "f_1", "g_1", True)
+    db.add_dedupe_group("poc", {
+        "group_id": "g_1", "root_cause": "rc",
+        "canonical_finding_id": "f_1", "member_finding_ids": ["f_1"],
+    })
+
+    async def boom(**_kwargs):
+        raise UnsafeIdentifier("unsafe artifact name 'f/_1'")
+
+    monkeypatch.setattr(trace_mod, "run_agent", boom)
+    reachable = asyncio.run(trace_mod.run_trace(ctx, db))
+    assert reachable == 0
+    assert db.get_trace("poc", "f_1") is None, "no verdict may be persisted"
+
+
+def test_trace_does_not_swallow_a_schema_error(
+    stage_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other direction of the same handler. A bare `except ValueError` ate
+    json.JSONDecodeError from reading a schema file and reported it as an unusable
+    identifier, so an operator went looking for an id that was fine."""
+    import json as _json
+
+    db, ctx = stage_env
+    _add_confirmed_canonical_finding(db, "f_1")
+    db.set_finding_validation("poc", "f_1", "confirmed", {"verdict": "confirmed"})
+    db.assign_finding_group("poc", "f_1", "g_1", True)
+    db.add_dedupe_group("poc", {
+        "group_id": "g_1", "root_cause": "rc",
+        "canonical_finding_id": "f_1", "member_finding_ids": ["f_1"],
+    })
+
+    async def boom(**_kwargs):
+        raise _json.JSONDecodeError("Expecting ',' delimiter", '{"type": "objec', 15)
+
+    monkeypatch.setattr(trace_mod, "run_agent", boom)
+    with pytest.raises(_json.JSONDecodeError):
+        asyncio.run(trace_mod.run_trace(ctx, db))
+
+
+def test_validate_fails_one_finding_on_an_unusable_identifier(
+    stage_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from audit.paths import UnsafeIdentifier
+
+    import audit.stages.validate as validate_mod
+
+    db, ctx = stage_env
+    _add_task(db)
+    db.add_finding("poc", "t_1", {
+        "finding_id": "f_1", "file": "a.py", "line_start": 1, "line_end": 2,
+        "vuln_class": "sqli", "severity": "high", "description": "d",
+        "evidence_snippet": "e", "confidence": 0.9,
+    })
+
+    async def boom(**_kwargs):
+        raise UnsafeIdentifier("unsafe artifact name 'f/_1'")
+
+    monkeypatch.setattr(validate_mod, "run_agent", boom)
+    confirmed = asyncio.run(validate_mod.run_validate(ctx, db))
+    assert confirmed == 0
+    row = db._conn.execute(
+        "SELECT validation_status FROM findings WHERE run_id='poc' AND finding_id='f_1'"
+    ).fetchone()
+    assert row["validation_status"] is None, (
+        "a resume must retry it: persisting a verdict buries the finding"
+    )

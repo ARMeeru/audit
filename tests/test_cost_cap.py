@@ -100,6 +100,12 @@ def test_finalize_still_closes_a_blown_budget(tmp_path: Path, monkeypatch):
 # Highest single-task cost ever recorded on the live runs (state.db, 410
 # cost rows): hunt $0.676 over 145 tasks, validate $1.26 over 222, trace
 # $0.95 over 43. These are the numbers the reservation has to clear.
+# Scope note: est_cost_usd has one reader, hunt (the only stage that passes an
+# in-flight figure to the budget check), so this table is a bound on HUNT's
+# per-task cost. The other stages recorded here do NOT reserve anything and can
+# exceed the constant per dispatch: recon's single-run maximum is $9.39. If
+# budget_check is ever wired into recon, report or feedback, the constant has to
+# rise in the same change, and this table is where that shows up.
 OBSERVED_STAGE_MAX_USD = {"hunt": 0.676, "validate": 1.26, "trace": 0.95}
 
 
