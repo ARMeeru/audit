@@ -7,6 +7,20 @@ from pathlib import Path
 
 import yaml
 
+# The tools a stage may be granted. An unknown name used to be forwarded
+# verbatim into ClaudeAgentOptions.allowed_tools, so a typo'd or invented entry
+# silently became an approved tool.
+KNOWN_TOOLS = frozenset(
+    {"Read", "Write", "Edit", "NotebookEdit", "Bash", "Grep", "Glob",
+     "WebFetch", "WebSearch", "Task", "TodoWrite"}
+)
+
+# The SDK's permission modes. `bypassPermissions` is deliberately excluded:
+# stages.yaml has always carried "# never bypassPermissions" as a comment, and a
+# comment is not an invariant.
+KNOWN_PERMISSION_MODES = frozenset({"default", "acceptEdits", "plan", "dontAsk"})
+FORBIDDEN_PERMISSION_MODES = {"bypassPermissions"}
+
 
 @dataclass
 class StageConfig:
@@ -21,6 +35,11 @@ class StageConfig:
     # Must be an UPPER BOUND on observed per-task cost: reserving less than
     # actual makes the cap permissive rather than conservative.
     est_cost_usd: float = 1.5
+    # Whether to run this stage's agents under the SDK's OS sandbox. On by
+    # default because the sandbox is the only real boundary between an agent's
+    # Bash and the harness's own state.db; turn it off only on a platform where
+    # it cannot start, and read the residual-risk note in FORK-NOTES.md first.
+    sandbox: bool = True
 
 
 @dataclass
@@ -46,6 +65,30 @@ class HarnessConfig:
             sc.concurrency = min(sc.concurrency, cap)
 
 
+def _validate_stage(name: str, spec: dict, defaults: dict) -> None:
+    """Fail loudly on a stage that would run with a tool set or permission mode
+    nobody intended. Unknown keys are still ignored (forward compatibility), but
+    the keys we do consume are checked."""
+    tools = spec.get("tools", [])
+    for tool in tools:
+        if tool not in KNOWN_TOOLS:
+            raise ValueError(
+                f"stage {name!r}: unknown tool {tool!r}. Known tools: "
+                f"{sorted(KNOWN_TOOLS)}"
+            )
+    mode = spec.get("permission_mode", defaults.get("permission_mode", "acceptEdits"))
+    if mode in FORBIDDEN_PERMISSION_MODES:
+        raise ValueError(
+            f"stage {name!r}: permission_mode {mode!r} is never allowed — every "
+            "permission check is what keeps an agent inside its scratch dir."
+        )
+    if mode not in KNOWN_PERMISSION_MODES:
+        raise ValueError(
+            f"stage {name!r}: unknown permission_mode {mode!r}. Known: "
+            f"{sorted(KNOWN_PERMISSION_MODES)}"
+        )
+
+
 def load_config(path: Path | None = None) -> HarnessConfig:
     if path is None:
         path = Path(__file__).resolve().parent.parent / "config" / "stages.yaml"
@@ -53,6 +96,7 @@ def load_config(path: Path | None = None) -> HarnessConfig:
     defaults = raw.get("defaults", {}) or {}
     stages: dict[str, StageConfig] = {}
     for name, spec in (raw.get("stages") or {}).items():
+        _validate_stage(name, spec, defaults)
         stages[name] = StageConfig(
             name=name,
             model=spec["model"],
@@ -68,6 +112,7 @@ def load_config(path: Path | None = None) -> HarnessConfig:
             est_cost_usd=float(
                 spec.get("est_cost_usd", defaults.get("est_cost_usd", 1.5))
             ),
+            sandbox=bool(spec.get("sandbox", defaults.get("sandbox", True))),
         )
     loops = raw.get("loops", {}) or {}
     return HarnessConfig(

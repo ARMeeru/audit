@@ -62,6 +62,7 @@ async def run_validate(ctx: StageContext, db: StateDB) -> int:
                     add_dirs=[ctx.repo_path],
                     max_turns=sc.max_turns,
                     permission_mode=sc.permission_mode,
+                    sandbox=sc.sandbox,
                     artifact_dir=ctx.results_dir("validate"),
                     artifact_name=f.finding_id,
                     repair_attempts=sc.repair_attempts,

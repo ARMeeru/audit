@@ -34,6 +34,7 @@ async def run_recon(ctx: StageContext, db: StateDB, max_tasks: int = DEFAULT_MAX
             add_dirs=[ctx.repo_path],
             max_turns=sc.max_turns,
             permission_mode=sc.permission_mode,
+            sandbox=sc.sandbox,
             artifact_dir=ctx.results_dir("recon"),
             artifact_name="recon",
             repair_attempts=sc.repair_attempts,

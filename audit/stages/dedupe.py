@@ -84,6 +84,7 @@ async def run_dedupe(ctx: StageContext, db: StateDB) -> int:
             add_dirs=[ctx.repo_path],
             max_turns=sc.max_turns,
             permission_mode=sc.permission_mode,
+            sandbox=sc.sandbox,
             artifact_dir=ctx.results_dir("dedupe"),
             artifact_name="dedupe",
             repair_attempts=sc.repair_attempts,
